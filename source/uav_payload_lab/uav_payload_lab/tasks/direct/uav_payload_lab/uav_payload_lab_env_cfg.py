@@ -4,8 +4,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-from isaaclab_assets import CRAZYFLIE_CFG
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -14,6 +12,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.envs.ui import BaseEnvWindow
+from isaaclab.actuators import ImplicitActuatorCfg
 
 class UavPayloadLabEnvWindow(BaseEnvWindow):
     """Window manager for the Quadcopter environment."""
@@ -33,6 +32,50 @@ class UavPayloadLabEnvWindow(BaseEnvWindow):
                 with self.ui_window_elements["debug_vstack"]:
                     # add command manager visualization
                     self._create_debug_vis_ui_element("targets", self.env)
+
+
+# === Iris + payload 机器人配置 ===
+IRIS_PAYLOAD_CFG = ArticulationCfg(
+    # 和 CRAZYFLIE 一样，用 ENV_REGEX_NS 作为模板，下面再用 replace 改成 /World/envs/env_.*/Robot
+    prim_path="{ENV_REGEX_NS}/Robot",
+    spawn=sim_utils.UsdFileCfg(
+        # TODO：如果你改过路径，这里换成你真实的 iris_payload.usd 路径
+        usd_path="/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/iris_payload.usd",
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            max_depenetration_velocity=10.0,
+            enable_gyroscopic_forces=True,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=4,
+            solver_velocity_iteration_count=0,
+            sleep_threshold=0.005,
+            stabilization_threshold=0.001,
+        ),
+        copy_from_source=False,
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        # 这里我按你之前 peg 项目约定：payload 初始大概在 z=0.4，绳长 0.8 ⇒ UAV z≈1.2
+        pos=(0.0, 0.0, 1.2),
+        # 所有关节初始角度 = 0
+        joint_pos={
+            ".*": 0.0,
+        },
+        # 所有关节初始角速度 = 0（不像 CRAZYFLIE 那样给螺旋桨预转速）
+        joint_vel={
+            ".*": 0.0,
+        },
+    ),
+    actuators={
+        # 和 CRAZYFLIE 一样，挂一个 dummy actuator，让 articulation 在 IsaacLab 里是“有执行器的”
+        "dummy": ImplicitActuatorCfg(
+            joint_names_expr=[".*"],
+            stiffness=0.0,
+            damping=0.0,
+        ),
+    },
+)
 
 @configclass
 class UavPayloadLabEnvCfg(DirectRLEnvCfg):
@@ -77,7 +120,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     )
 
     # robot（quadcopter）
-    robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
