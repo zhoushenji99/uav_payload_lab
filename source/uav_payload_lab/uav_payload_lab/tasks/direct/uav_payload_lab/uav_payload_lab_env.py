@@ -71,7 +71,18 @@ class UavPayloadLabEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+        # 期望角速度（rad/s）
+        body_rate_des = self.cfg.body_rate_max * self._actions[:, 1:]  # (num_envs, 3)
+
+        # P 环：τ_raw = Kp * (ω_des - ω_meas)
+        tau_raw = self.cfg.rate_kp * (body_rate_des - self._robot.data.root_ang_vel_b)
+
+        # 力矩限幅：|τ_i| <= moment_scale
+        self._moment[:, 0, :] = torch.clamp(
+            tau_raw,
+            -self.cfg.moment_scale,
+            self.cfg.moment_scale,
+        )
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
@@ -142,14 +153,18 @@ class UavPayloadLabEnv(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
         # Sample new commands
-        self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-2.0, 2.0)
-        self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
-        self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.5)
+        # self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-2.0, 2.0)
+        # self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
+        # self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.5)
+        
         # Reset robot state
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+        # ★ Stage0：目标点 = 当前 episode 的初始位置（悬停在起始点）
+        self._desired_pos_w[env_ids] = default_root_state[:, :3]
+        
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)

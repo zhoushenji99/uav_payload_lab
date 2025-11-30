@@ -121,12 +121,16 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
 
     # robot（quadcopter）
     robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    thrust_to_weight = 1.9
+    thrust_to_weight = 1.9 #无量纲参数，意思是“最大推力大概是机重的多少倍”
     moment_scale = 0.01
+
+    # CTBR 相关参数（body-rate 动作 → 力矩）
+    body_rate_max = 5.0             # rad/s，把 [-1,1] 的无量纲动作映射到 [-ω_max, +ω_max] 的物理角速度范围
+    rate_kp = 0.05                  # 简单 body-rate P 控制增益：τ = Kp (ω_des - ω)
 
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=24, #4096
+        num_envs=4096, #4096
         env_spacing=2.5,
         replicate_physics=True,
         clone_in_fabric=True,
