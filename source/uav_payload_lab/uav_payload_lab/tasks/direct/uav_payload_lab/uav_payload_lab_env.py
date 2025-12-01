@@ -47,6 +47,9 @@ class UavPayloadLabEnv(DirectRLEnv):
                 "time_penalty",  # 时间惩罚
                 "death_penalty", # 摔机惩罚
                 "total",         # 总 reward
+                "dist",          # ★ 新增：每步的 dist
+
+                
             ]
         }
         # Get specific body indices
@@ -211,10 +214,16 @@ class UavPayloadLabEnv(DirectRLEnv):
 
 
     def _get_rewards(self) -> torch.Tensor:
-        """基于 payload 位置 + 摆角 + 摆角速度的高斯 shaping reward."""
+        """案例风格 reward：位置 / 摆角 / 摆角速度 三项线性相加 + 时间惩罚 + 死亡惩罚。
 
-        # === 任务几何：payload 到目标点的距离 ===
-        # UAV / payload / 目标点
+        形式上接近 IsaacLab 官方示例：
+            r_pos   = 1 - tanh(dist / sigma_pos)
+            r_tilt  = 1 - tanh(theta_deg / sigma_tilt)
+            r_swing = 1 - tanh(swing_deg_s / sigma_swing)
+        reward = w_pos * r_pos + w_tilt * r_tilt + w_swing * r_swing - time_penalty*dt - death_penalty*died
+        """
+
+        # === 基本几何量：payload 到目标的距离 ===
         p_uav_w = self._robot.data.root_pos_w                          # (N, 3)
         p_load_w = self._robot.data.body_pos_w[:, self._payload_id, :] # (N, 3)
 
@@ -241,61 +250,72 @@ class UavPayloadLabEnv(DirectRLEnv):
         ty_deg = ty_rad * deg
         theta_deg = torch.sqrt(tx_deg * tx_deg + ty_deg * ty_deg)       # (N,)
 
-        # === 摆角角速度（deg/s）：直接用 _get_observations 差分出来的结果 ===
+        # === 摆角角速度（deg/s）：直接用差分结果 ===
         wx_deg = self._tilt_vel_deg[:, 0]
         wy_deg = self._tilt_vel_deg[:, 1]
         swing_deg_s = torch.sqrt(wx_deg * wx_deg + wy_deg * wy_deg)     # (N,)
 
-        # === 单维高斯打分 r_pos_raw / r_tilt_raw / r_swing_raw ===
+        # === 单项评分：1 - tanh(...)，范围大约在 (0, 1]，越小越差 ===
         eps = 1e-6
-        sigma_pos = max(float(self.cfg.sigma_pos), eps)
-        sigma_tilt = max(float(self.cfg.sigma_tilt_deg), eps)
+        sigma_pos   = max(float(self.cfg.sigma_pos), eps)
+        sigma_tilt  = max(float(self.cfg.sigma_tilt_deg), eps)
         sigma_swing = max(float(self.cfg.sigma_swing_deg_s), eps)
 
-        z_pos = dist / sigma_pos
-        z_tilt = theta_deg / sigma_tilt
-        z_swing = swing_deg_s / sigma_swing
+        r_pos   = 1.0 - torch.tanh(dist       / sigma_pos)
+        r_tilt  = 1.0 - torch.tanh(theta_deg  / sigma_tilt)
+        r_swing = 1.0 - torch.tanh(swing_deg_s / sigma_swing)
 
-        r_pos_raw = torch.exp(-0.5 * z_pos * z_pos)       # [0,1]
-        r_tilt_raw = torch.exp(-0.5 * z_tilt * z_tilt)    # [0,1]
-        r_swing_raw = torch.exp(-0.5 * z_swing * z_swing) # [0,1]
+        # 理论上 1 - tanh(x) ∈ (0,1]，数值上容错一下
+        r_pos   = torch.clamp(r_pos,   0.0, 1.0)
+        r_tilt  = torch.clamp(r_tilt,  0.0, 1.0)
+        r_swing = torch.clamp(r_swing, 0.0, 1.0)
 
-        # === FlyThrough 风格：pos + pos * (tilt + swing) ===
-        pos_w = float(self.cfg.pos_weight)
-        tilt_w = float(self.cfg.tilt_weight)
+        # === 线性权重 ===
+        w_pos   = float(self.cfg.pos_weight)
+        w_tilt  = float(self.cfg.tilt_weight)
+        # 保持之前的“0.5 * tilt_weight 给摆速”的语义
+        w_swing = 0.5 * float(self.cfg.tilt_weight)
 
-        shaping = tilt_w * r_tilt_raw + 0.5 * tilt_w * r_swing_raw
-        r_pos_term = pos_w * r_pos_raw
-        r_shape_term = pos_w * r_pos_raw * shaping
+        r_pos_term   = w_pos   * r_pos
+        r_tilt_term  = w_tilt  * r_tilt
+        r_swing_term = w_swing * r_swing
 
-        # 轻微时间惩罚：随 step_dt 缩放，保证不同 dt 下语义一致
+        # === 时间惩罚：按 dt 缩放，保证不同 dt 语义一致 ===
         time_penalty = float(self.cfg.time_penalty)
         r_time = -time_penalty * self.step_dt
         r_time_vec = torch.full_like(dist, r_time)
 
-        reward = r_pos_term + r_shape_term + r_time_vec
-        # ---- 死亡惩罚：高度 <0.1 或 >2.0 就一次性扣 death_penalty ----
+        # === 死亡惩罚：高度出界就一次性扣 death_penalty ===
         z = self._robot.data.root_pos_w[:, 2]
         died = torch.logical_or(z < 0.1, z > 5.0)
         death_penalty_vec = -self.cfg.death_penalty * died.float()
-        reward = reward + death_penalty_vec
+
+        # === 总 reward：简单线性叠加 ===
+        reward = (
+            r_pos_term
+            + r_tilt_term
+            + r_swing_term
+            + r_time_vec
+            + death_penalty_vec
+        )
 
         # === Logging：分项累计，便于 tensorboard / CSV ===
         rewards = {
             "r_pos": r_pos_term,
-            "r_tilt": pos_w * r_pos_raw * tilt_w * r_tilt_raw,
-            "r_swing": pos_w * r_pos_raw * (0.5 * tilt_w * r_swing_raw),
+            "r_tilt": r_tilt_term,
+            "r_swing": r_swing_term,
             "time_penalty": r_time_vec,
             "death_penalty": death_penalty_vec,
+            "dist": dist,           # ★ 每一步的 payload 距目标距离
 
         }
-        # 顺便记录总 reward
         rewards["total"] = reward
 
         for key, value in rewards.items():
             self._episode_sums[key] += value
 
         return reward
+
 
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
