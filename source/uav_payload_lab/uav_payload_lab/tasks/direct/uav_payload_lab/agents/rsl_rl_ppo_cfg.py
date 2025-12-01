@@ -11,8 +11,8 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
-    max_iterations = 3000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
-    save_interval = 1000  #多少个 iteration 存一次 model_*.pt
+    max_iterations = 150000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
+    save_interval = 15000  #多少个 iteration 存一次 model_*.pt
     experiment_name = "uav_payload_antisway" #日志目录名
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,     #动作高斯探索噪声初始 std

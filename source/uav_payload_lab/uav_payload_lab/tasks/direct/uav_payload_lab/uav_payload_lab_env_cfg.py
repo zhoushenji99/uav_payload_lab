@@ -83,7 +83,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     decimation = 2                      # 每执行一次 RL action，物理 step 多少次
     episode_length_s = 10.0             # 一局多长时间（秒）
     action_space = 4
-    observation_space = 12
+    observation_space = 13
     state_space = 0
     debug_vis = True
 
@@ -123,7 +123,10 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9 #无量纲参数，意思是“最大推力大概是机重的多少倍”
     moment_scale = 0.01
-
+    
+    # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
+    rope_length = 0.8
+    
     # CTBR 相关参数（body-rate 动作 → 力矩）
     body_rate_max = 5.0             # rad/s，把 [-1,1] 的无量纲动作映射到 [-ω_max, +ω_max] 的物理角速度范围
     rate_kp = 0.05                  # 简单 body-rate P 控制增益：τ = Kp (ω_des - ω)
@@ -131,12 +134,23 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=4096, #4096
-        env_spacing=2.5,
+        env_spacing=6,
         replicate_physics=True,
         clone_in_fabric=True,
     )
 
     # reward scales
-    lin_vel_reward_scale = -0.05
-    ang_vel_reward_scale = -0.01
-    distance_to_goal_reward_scale = 15.0
+    # === Reward 参数：payload 到点 + 消摆 ===
+    sigma_pos = 0.5            # 位置高斯尺度（m）
+    sigma_tilt_deg = 30.0       # 摆角高斯尺度（deg）
+    sigma_swing_deg_s = 30.0   # 摆角角速度高斯尺度（deg/s）
+    pos_weight = 2.0           # 位置主项权重
+    tilt_weight = 1.0          # 摆角 / 摆速 shaping 权重
+    time_penalty = 0.0         # 每秒时间惩罚系数（越大越鼓励快完成）
+    death_penalty = 300.0       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
+
+    # === 任务设置（相对每个 env 的原点，ENU）===
+    # UAV 起点：payload 初始大约在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
+    start_pos_w = (0.5, 1.0, 1.2)
+    # UAV 终点：水平移到 [-0.5, 0.0]，高度仍为 1.2
+    goal_pos_w = (-0.5, 0.0, 1.2)
