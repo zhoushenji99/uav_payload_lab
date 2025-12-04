@@ -96,18 +96,7 @@ class UavPayloadLabEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
-        # 期望角速度（rad/s）
-        body_rate_des = self.cfg.body_rate_max * self._actions[:, 1:]  # (num_envs, 3)
-
-        # P 环：τ_raw = Kp * (ω_des - ω_meas)
-        tau_raw = self.cfg.rate_kp * (body_rate_des - self._robot.data.root_ang_vel_b)
-
-        # 力矩限幅：|τ_i| <= moment_scale
-        self._moment[:, 0, :] = torch.clamp(
-            tau_raw,
-            -self.cfg.moment_scale,
-            self.cfg.moment_scale,
-        )
+        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
@@ -203,95 +192,98 @@ class UavPayloadLabEnv(DirectRLEnv):
 
 
     def _get_rewards(self) -> torch.Tensor:
-        """基于 payload 位置 + 摆角 + 摆角速度的高斯 shaping reward（线性加和版本）。"""
+        """
+        混合奖励函数：线性距离引导 + 高斯精度锁定 + 消摆惩罚
+        """
+        # === 1. 数据准备 ===
+        p_uav_w = self._robot.data.root_pos_w                          
+        p_load_w = self._robot.data.body_pos_w[:, self._payload_id, :] 
+        goal_payload_w = self._desired_pos_w                           
 
-        # === 1) 任务几何：payload 到目标点的距离 ===
-        # UAV / payload / 目标点
-        p_uav_w = self._robot.data.root_pos_w                          # (N, 3)
-        p_load_w = self._robot.data.body_pos_w[:, self._payload_id, :] # (N, 3)
+        # 距离误差 (m)
+        e_load = goal_payload_w - p_load_w                             
+        dist = torch.linalg.norm(e_load, dim=1)                        
 
-        # 现在约定：self._desired_pos_w 就是 payload 的目标点
-        goal_payload_w = self._desired_pos_w                           # (N, 3)
-
-        # payload 相对 payload 目标的误差
-        e_load = goal_payload_w - p_load_w                             # (N, 3)
-        dist = torch.linalg.norm(e_load, dim=1)                        # (N,)
-
-        # === 2) 摆角（deg）：与 _get_observations 保持一致 ===
-        # 近似：用 payload 相对 UAV 的向量来算
-        r = p_load_w - p_uav_w                                         # (N, 3)
-        dx = r[:, 0]
-        dy = r[:, 1]
-        dz = r[:, 2]
-
+        # === 2. 摆角与角速度计算 (使用更精确的几何方法) ===
+        # payload 相对 UAV 的向量
+        r = p_load_w - p_uav_w                                         
+        dx, dy, dz = r[:, 0], r[:, 1], r[:, 2]
+        
+        # [改进] 使用 atan2 计算真实的合摆角，比 sqrt(tx^2+ty^2) 更准
+        # den 取 -dz 是因为 z 轴向下为负，我们要算的是偏离垂直向下的角度
         den = torch.clamp(-dz, min=1e-3)
-        tx_rad = torch.atan2(dx, den)
-        ty_rad = torch.atan2(dy, den)
+        theta_rad = torch.atan2(torch.sqrt(dx*dx + dy*dy), den)
+        theta_deg = theta_rad * (180.0 / math.pi)
 
-        deg = 180.0 / math.pi
-        tx_deg = tx_rad * deg
-        ty_deg = ty_rad * deg
-        theta_deg = torch.sqrt(tx_deg * tx_deg + ty_deg * ty_deg)      # (N,)
-
-        # === 3) 摆角角速度（deg/s）：直接用 _get_observations 差分出来的结果 ===
+        # 摆动角速度 (deg/s) - 直接使用观测中计算好的差分速度
         wx_deg = self._tilt_vel_deg[:, 0]
         wy_deg = self._tilt_vel_deg[:, 1]
-        swing_deg_s = torch.sqrt(wx_deg * wx_deg + wy_deg * wy_deg)    # (N,)
+        swing_deg_s = torch.sqrt(wx_deg * wx_deg + wy_deg * wy_deg)    
 
-        # === 4) 单维高斯打分 r_pos_raw / r_tilt_raw / r_swing_raw ===
-        eps = 1e-6
-        sigma_pos   = max(float(self.cfg.sigma_pos), eps)
-        sigma_tilt  = max(float(self.cfg.sigma_tilt_deg), eps)
-        sigma_swing = max(float(self.cfg.sigma_swing_deg_s), eps)
+        # === 3. 计算各项奖励组件 ===
+        
+        # [A] 位置奖励 (r_pos)
+        # 逻辑：基础生存分(4.0) - 距离惩罚(dist) + 终点高斯奖励(gauss)
+        # 这样设计保证了：
+        # 1. 只要在 4m 内，分数 > 0，防止自杀 (4.0 - dist)
+        # 2. 远处有梯度 (dist 越小分越高)
+        # 3. 近处有诱惑 (进入 sigma 范围后由高斯项提供高分)
+        r_alive = 4.0
+        r_dist_dense = -1.0 * dist
+        r_dist_gauss = torch.exp(-0.5 * (dist / self.cfg.sigma_pos)**2)
+        
+        # 组合位置奖励
+        r_pos_val = float(self.cfg.pos_weight) * (r_alive + r_dist_dense + 2.0 * r_dist_gauss)
 
-        z_pos    = dist       / sigma_pos
-        z_tilt   = theta_deg  / sigma_tilt
-        z_swing  = swing_deg_s/ sigma_swing
+        # [B] 摆角惩罚 (r_tilt)
+        # 摆角越大扣分越多，平方项让大角度惩罚更重
+        r_tilt_val = -1.0 * float(self.cfg.tilt_weight) * (theta_deg / self.cfg.sigma_tilt_deg)**2
 
-        r_pos_raw   = torch.exp(-0.5 * z_pos   * z_pos)    # [0,1]
-        r_tilt_raw  = torch.exp(-0.5 * z_tilt  * z_tilt)   # [0,1]
-        r_swing_raw = torch.exp(-0.5 * z_swing * z_swing)  # [0,1]
+        # [C] 摆速惩罚 (r_swing)
+        # 摆动越快扣分越多 (注意权重系数我给小了一点，避免初期为了不摆动而不敢动)
+        r_swing_val = -0.1 * float(self.cfg.tilt_weight) * (swing_deg_s / self.cfg.sigma_swing_deg_s)**2
 
-        # === 5) 线性加和：位置 + 摆角 + 摆速 ===
-        pos_w  = float(self.cfg.pos_weight)
-        tilt_w = float(self.cfg.tilt_weight)
+        # [D] 动作平滑惩罚 (r_action) - 新增项，不算在 r_pos 里，算额外惩罚
+        # 防止力矩控制时电机高频震荡
+        r_action_val = -0.001 * torch.sum(torch.square(self._actions), dim=1)
 
-        r_pos   = pos_w       * r_pos_raw
-        r_tilt  = tilt_w      * r_tilt_raw
-        r_swing = 0.5 * tilt_w* r_swing_raw
-
-        reward = r_pos + r_pos_raw*r_tilt + r_pos_raw*r_swing
-
-        # ---- 死亡惩罚：高度 / 出盒子 超界就一次性扣 death_penalty ----
-        root_pos = self._robot.data.root_pos_w                          # (N,3)
-        z = root_pos[:, 2]
-        height_fail = torch.logical_or(z < 0.1, z > 6.0)
-
-        # 以各自 env 原点为参考框，加 xyz 5m 的包围盒
-        env_origins = self._terrain.env_origins.to(root_pos.device)     # (N,3)
+        # [E] 死亡惩罚 (death_penalty)
+        root_pos = self._robot.data.root_pos_w
+        env_origins = self._terrain.env_origins.to(root_pos.device)
+        
+        # 高度判定 (0.1 ~ 6.0m)
+        height_fail = torch.logical_or(root_pos[:, 2] < 0.1, root_pos[:, 2] > 6.0)
+        # 水平出界判定 (±6.0m)
         rel_pos = root_pos - env_origins
         out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
-
+        
         died = torch.logical_or(height_fail, out_of_box)
-        death_penalty_vec = -self.cfg.death_penalty * died.float()
-        reward = reward + death_penalty_vec
+        death_penalty_vec = -1.0 * float(self.cfg.death_penalty) * died.float()
 
-        # === Logging：分项累计，便于 tensorboard / CSV ===
-        rewards = {
-            "r_pos": r_pos,
-            "r_tilt": r_tilt,
-            "r_swing": r_swing,
+        # === 4. 总奖励汇总 ===
+        reward = r_pos_val + r_tilt_val + r_swing_val + r_action_val + death_penalty_vec
+
+        # === 5. Logging (完全兼容你原来的结构) ===
+        # 这里为了保持和你 __init__ 中的 keys 一致，我把各项归类
+        rewards_dict = {
+            "r_pos": r_pos_val,         # 包含生存、距离、高斯
+            "r_tilt": r_tilt_val,       # 仅包含角度惩罚
+            "r_swing": r_swing_val,     # 仅包含角速度惩罚
             "death_penalty": death_penalty_vec,
-            "dist": dist,                      # payload 到目标的距离（m）
-            "theta_deg": theta_deg,            # 合摆角（deg）
-            "swing_deg_s": swing_deg_s,        # 合角速度（deg/s）
+            "dist": dist,               # 纯粹的物理距离用于记录
+            "theta_deg": theta_deg,     # 纯粹的物理角度用于记录
+            "swing_deg_s": swing_deg_s, # 纯粹的物理角速度用于记录
+            # 原来代码里可能有 time_penalty，现在没用上，置0即可防止报错
+            "time_penalty": torch.zeros_like(reward), 
+            "total": reward
         }
-        # 顺便记录总 reward
-        rewards["total"] = reward
 
-        for key, value in rewards.items():
-            self._episode_sums[key] += value
-
+        # 遍历累加，这和你原来的逻辑一模一样
+        for key, value in rewards_dict.items():
+            # 确保 key 存在于 _episode_sums 中 (r_action 这种没定义的就不记了，或者加到 total 里了)
+            if key in self._episode_sums:
+                self._episode_sums[key] += value
+        
         return reward
 
 

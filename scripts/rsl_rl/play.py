@@ -9,7 +9,9 @@
 
 import argparse
 import sys
-
+# [修正1] 添加必要的库导入
+import csv
+import numpy as np
 from isaaclab.app import AppLauncher
 
 # local imports
@@ -173,9 +175,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
-
+    # [新增] 准备 CSV 数据存储
+    # 我们只记录第 0 个环境的数据，避免数据太多
+    csv_data = []
+    print("[INFO] Starting simulation loop and recording payload data...")
+    
     # reset environment
     obs = env.get_observations()
+    # [新增] 强制清零时间计数器，防止 play 时发生随机 reset
+    if hasattr(env.unwrapped, "episode_length_buf"):
+        env.unwrapped.episode_length_buf[:] = 0
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -186,22 +195,70 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            # [新增] 如果这一步触发了重置，就不记录数据了，直接退出或跳过
+            if dones.any():
+                print("[INFO] Episode finished (reset triggered). Stopping recording.")
+                break
+            # === [新增] 数据记录逻辑 ===
+            base_env = env.unwrapped
+            
+            # 1. 获取 Payload 真实位置 (World Frame)
+            if hasattr(base_env, "_payload_id"):
+                payload_idx = base_env._payload_id
+                # 取第 0 个环境的 payload 位置
+                p_load = base_env._robot.data.body_pos_w[0, payload_idx, :].cpu().numpy()
+            else:
+                p_load = np.array([0, 0, 0]) 
+            
+            # 2. 获取 Swing Angles (deg)
+            # [修正] 处理 TensorDict/Dict 类型的 obs
+            if isinstance(obs, dict) or hasattr(obs, "keys"):
+                # 从字典中提取 'policy' 对应的 tensor
+                obs_tensor = obs['policy']
+            else:
+                obs_tensor = obs
+            
+            # 现在的 obs_tensor 才是真正的 [num_envs, 17] 的 Tensor
+            tilt_deg = obs_tensor[0, 3:5].cpu().numpy() # [theta_x, theta_y]
+
+            # 3. 记录时间
+            current_time = timestep * dt
+
+            # 存入列表: [Time, Px, Py, Pz, AngX, AngY]
+            csv_data.append([current_time, p_load[0], p_load[1], p_load[2], tilt_deg[0], tilt_deg[1]])
+            # ==========================
+
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+            
         if args_cli.video:
             timestep += 1
-            # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        else:
+            timestep += 1
+            if timestep >= 2100: # 35秒
+                 print("[INFO] Reached max steps for recording.")
+                 break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    # [新增] 循环结束后写入 CSV
+    csv_filename = os.path.join(log_dir, "payload_data.csv")
+    print(f"[INFO] Saving payload data to: {csv_filename}")
+    with open(csv_filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        # 写入表头
+        writer.writerow(["Time", "Payload_X", "Payload_Y", "Payload_Z", "Swing_Deg_X", "Swing_Deg_Y"])
+        # 写入数据
+        writer.writerows(csv_data)
+    print("[INFO] Data saved successfully.")
+
     # close the simulator
     env.close()
-
 
 if __name__ == "__main__":
     # run the main function
