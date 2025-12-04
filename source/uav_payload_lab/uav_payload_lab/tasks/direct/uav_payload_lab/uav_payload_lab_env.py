@@ -37,19 +37,19 @@ class UavPayloadLabEnv(DirectRLEnv):
         # ★ 任务：起点 / 终点（相对 env_origin 的偏移）
         self._start_offset = torch.tensor(cfg.start_pos_w, dtype=torch.float, device=self.device)
         self._goal_offset  = torch.tensor(cfg.goal_pos_w,  dtype=torch.float, device=self.device)
-        # Logging
+                # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
                 "r_pos",         # 位置主项
                 "r_tilt",        # 摆角 shaping 项
                 "r_swing",       # 摆速 shaping 项
-                "time_penalty",  # 时间惩罚
+                "time_penalty",  # 时间惩罚（你现在 reward 里没用到的话，可以以后删掉）
                 "death_penalty", # 摔机惩罚
                 "total",         # 总 reward
-                "dist",          # ★ 新增：每步的 dist
-
-                
+                "dist",          # payload 到目标的距离（m）
+                "theta_deg",     # payload 合摆角（deg）
+                "swing_deg_s",   # payload 合角速度（deg/s）
             ]
         }
         # Get specific body indices
@@ -113,130 +113,113 @@ class UavPayloadLabEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
-        """构造 13 维 obs，语义尽量和老版 SimpleHoverEnv 对齐：
+        """构造 17 维的观察量:
 
         obs = [
-            0:3   r_load_uav = p_load - p_uav          （世界系）
-            3:6   e_load     = goal_payload - p_load   （世界系）
-            6:9   e_uav      = goal_uav     - p_uav    （世界系）
-            9:11  [tx_deg, ty_deg]                     （摆角，deg）
-            11:13[wx_deg_s, wy_deg_s]                  （摆角角速度，deg/s）
+            e_load[0:3],       # 0-2  payload 到目标位置误差 (世界系)
+            tilt_deg[0:2],     # 3-4  摆角 θx, θy (deg)
+            w_deg[0:2],        # 5-6  摆角角速度 θ̇x, θ̇y (deg/s)
+            root_quat_w[0:4],  # 7-10 UAV 根 body 姿态四元数 (世界系)
+            v_b[0:3],          # 11-13 UAV 根 body 线速度 (机体系)
+            w_b[0:3],          # 14-16 UAV 根 body 角速度 (机体系)
         ]
         """
-        # === UAV & payload 世界坐标 ===
-        # UAV 根（世界系）
-        p_uav_w = self._robot.data.root_pos_w              # (N,3)
+        # --- 1) 位置相关：UAV / payload / 目标 ------------------------------
+        body_pos_w = self._robot.data.body_pos_w  # (num_envs, num_bodies, 3)
+        # UAV 根 body 位置（这里 body 取第一个 body_id）
+        p_uav_w = body_pos_w[:, self._body_id[0], :]  # (num_envs, 3)
+        # payload 位置
+        p_load_w = body_pos_w[:, self._payload_id, :]  # (num_envs, 3)
 
-        # payload body（世界系）
-        # body_pos_w 形状通常为 (N, num_bodies, 3)，这里用你之前定义的 _payload_id
-        p_load_w = self._robot.data.body_pos_w[:, self._payload_id, :]  # (N,3)
+        # payload 到 UAV 的向量（世界系），用于计算摆角
+        r_load_uav = p_uav_w - p_load_w  # (num_envs, 3)
 
-        # (1) payload 相对 UAV
-        r_load_uav = p_load_w - p_uav_w                     # (N,3)
+        # payload 到目标点的误差（世界系）
+        e_load = self._desired_pos_w - p_load_w  # (num_envs, 3)
 
-        # === 目标点 ===
-        # 先沿用 Stage0：goal_uav = _desired_pos_w
-        goal_uav_w = self._desired_pos_w                    # (N,3)
+        # --- 2) 摆角 + 摆角角速度 ----------------------------------------
+        # rope 长度，用 cfg 中的参数（标量）
+        L = self.cfg.rope_length
 
-        # payload 目标点：简单假设在 UAV 目标点正下方 rope_length
-        goal_payload_w = goal_uav_w.clone()
-        goal_payload_w[:, 2] -= self.cfg.rope_length
+        # 近似：摆角 θx, θy（世界系）—— 和你原来的定义保持一致
+        ex = r_load_uav[:, 0]
+        ey = r_load_uav[:, 1]
+        ez = r_load_uav[:, 2].clamp(min=1e-6)
 
-        # (2) payload 相对 payload 目标
-        e_load = goal_payload_w - p_load_w                  # (N,3)
+        # 这里假设绳长 ≈ L，且摆角较小，用水平分量 / L 近似
+        theta_x = torch.asin((ex / L).clamp(-1.0, 1.0))
+        theta_y = torch.asin((ey / L).clamp(-1.0, 1.0))
 
-        # (3) UAV 相对 UAV 目标
-        e_uav = goal_uav_w - p_uav_w                        # (N,3)
+        tilt_rad = torch.stack([theta_x, theta_y], dim=-1)  # (num_envs, 2)
+        tilt_deg = tilt_rad * (180.0 / math.pi)
 
-        # === 摆角（deg）：由 UAV->payload 向量几何计算 ===
-        # r = p_load - p_uav，理想情况下 r ≈ (0, 0, -L)
-        r = p_load_w - p_uav_w                              # (N,3)
-        dx = r[:, 0]
-        dy = r[:, 1]
-        dz = r[:, 2]
-
-        # 避免除零：den ≈ -dz ≈ L (>0)
-        den = torch.clamp(-dz, min=1e-3)
-
-        # 定义：
-        #   tx = atan2(dx, -dz)
-        #   ty = atan2(dy, -dz)
-        # 小角度时 tx ≈ dx/L, ty ≈ dy/L，和你老工程保持一致
-        tx_rad = torch.atan2(dx, den)
-        ty_rad = torch.atan2(dy, den)
-
-        deg = 180.0 / math.pi
-        tx_deg = tx_rad * deg
-        ty_deg = ty_rad * deg
-
-        tilt_deg = torch.stack([tx_deg, ty_deg], dim=-1)    # (N,2)
-
-        dt = max(self.step_dt, 1e-6)
-
-        # lazy init / 形状自检：以当前 tilt_deg 的 shape 为准
-        if (
-            self._prev_tilt_deg is None
-            or self._prev_tilt_deg.shape != tilt_deg.shape
-        ):
+        # 初始化历史 buffer（第一次调用时）
+        if self._prev_tilt_deg is None:
             self._prev_tilt_deg = torch.zeros_like(tilt_deg)
             self._tilt_vel_deg = torch.zeros_like(tilt_deg)
             self._has_prev_tilt = torch.zeros(
-                tilt_deg.shape[0], dtype=torch.bool, device=self.device
+                self.num_envs, dtype=torch.bool, device=self.device
             )
 
-        delta_tilt = tilt_deg - self._prev_tilt_deg   # (N,2)
+        # 计算角速度（deg/s），用上一帧的摆角做差分
+        dt = self.step_dt  # DirectRLEnv 里定义好的 "每次 RL step 对应的物理时间"
+        mask_has_prev = self._has_prev_tilt
 
-        # 先全置零，再对 has_prev_tilt=True 的 env 用差分更新
-        w_deg = torch.zeros_like(delta_tilt)          # (N,2)
-        mask = self._has_prev_tilt                    # (N,)
-        if mask.any():
-            w_deg[mask] = delta_tilt[mask] / dt       # 只对 True 的 env 算角速度
+        delta_tilt = tilt_deg - self._prev_tilt_deg  # (num_envs, 2)
+        w_deg = torch.where(
+            mask_has_prev.unsqueeze(-1),
+            delta_tilt / max(dt, 1e-6),
+            torch.zeros_like(delta_tilt),
+        )
 
         # 更新历史
-        self._prev_tilt_deg = tilt_deg
-        self._tilt_vel_deg = w_deg
+        self._prev_tilt_deg = tilt_deg.clone()
+        self._tilt_vel_deg = w_deg.clone()
         self._has_prev_tilt[:] = True
 
-        # === 拼 obs 向量 ===
+        # --- 3) UAV 姿态 + 线速度 + 角速度 -------------------------------
+        # 姿态四元数（世界系）
+        root_quat_w = self._robot.data.root_quat_w  # (num_envs, 4)
+
+        # 线速度、角速度（机体系）
+        v_b = self._robot.data.root_lin_vel_b  # (num_envs, 3)
+        w_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
+
+        # --- 4) 打包 obs ---------------------------------------------------
         obs = torch.cat(
             [
-                r_load_uav,          # 0:3
-                e_load,              # 3:6
-                e_uav,               # 6:9
-                tilt_deg,            # 9:11
-                w_deg,               # 11:13
+                e_load,       # 0-2
+                tilt_deg,     # 3-4
+                w_deg,        # 5-6
+                root_quat_w,  # 7-10
+                v_b,          # 11-13
+                w_b,          # 14-16
             ],
             dim=-1,
         )
 
-        observations = {"policy": obs}
-        return observations
+        return {"policy": obs}
+
 
 
     def _get_rewards(self) -> torch.Tensor:
-        """案例风格 reward：位置 / 摆角 / 摆角速度 三项线性相加 + 时间惩罚 + 死亡惩罚。
+        """基于 payload 位置 + 摆角 + 摆角速度的高斯 shaping reward（线性加和版本）。"""
 
-        形式上接近 IsaacLab 官方示例：
-            r_pos   = 1 - tanh(dist / sigma_pos)
-            r_tilt  = 1 - tanh(theta_deg / sigma_tilt)
-            r_swing = 1 - tanh(swing_deg_s / sigma_swing)
-        reward = w_pos * r_pos + w_tilt * r_tilt + w_swing * r_swing - time_penalty*dt - death_penalty*died
-        """
-
-        # === 基本几何量：payload 到目标的距离 ===
+        # === 1) 任务几何：payload 到目标点的距离 ===
+        # UAV / payload / 目标点
         p_uav_w = self._robot.data.root_pos_w                          # (N, 3)
         p_load_w = self._robot.data.body_pos_w[:, self._payload_id, :] # (N, 3)
 
-        goal_uav_w = self._desired_pos_w                               # (N, 3)
-        goal_payload_w = goal_uav_w.clone()
-        goal_payload_w[:, 2] -= self.cfg.rope_length
+        # 现在约定：self._desired_pos_w 就是 payload 的目标点
+        goal_payload_w = self._desired_pos_w                           # (N, 3)
 
-        # payload 相对 payload 目标
-        e_load = goal_payload_w - p_load_w                              # (N, 3)
-        dist = torch.linalg.norm(e_load, dim=1)                         # (N,)
+        # payload 相对 payload 目标的误差
+        e_load = goal_payload_w - p_load_w                             # (N, 3)
+        dist = torch.linalg.norm(e_load, dim=1)                        # (N,)
 
-        # === 摆角（deg）：和 _get_observations 保持一致 ===
-        r = p_load_w - p_uav_w                                          # (N, 3)
+        # === 2) 摆角（deg）：与 _get_observations 保持一致 ===
+        # 近似：用 payload 相对 UAV 的向量来算
+        r = p_load_w - p_uav_w                                         # (N, 3)
         dx = r[:, 0]
         dy = r[:, 1]
         dz = r[:, 2]
@@ -248,67 +231,62 @@ class UavPayloadLabEnv(DirectRLEnv):
         deg = 180.0 / math.pi
         tx_deg = tx_rad * deg
         ty_deg = ty_rad * deg
-        theta_deg = torch.sqrt(tx_deg * tx_deg + ty_deg * ty_deg)       # (N,)
+        theta_deg = torch.sqrt(tx_deg * tx_deg + ty_deg * ty_deg)      # (N,)
 
-        # === 摆角角速度（deg/s）：直接用差分结果 ===
+        # === 3) 摆角角速度（deg/s）：直接用 _get_observations 差分出来的结果 ===
         wx_deg = self._tilt_vel_deg[:, 0]
         wy_deg = self._tilt_vel_deg[:, 1]
-        swing_deg_s = torch.sqrt(wx_deg * wx_deg + wy_deg * wy_deg)     # (N,)
+        swing_deg_s = torch.sqrt(wx_deg * wx_deg + wy_deg * wy_deg)    # (N,)
 
-        # === 单项评分：1 - tanh(...)，范围大约在 (0, 1]，越小越差 ===
+        # === 4) 单维高斯打分 r_pos_raw / r_tilt_raw / r_swing_raw ===
         eps = 1e-6
         sigma_pos   = max(float(self.cfg.sigma_pos), eps)
         sigma_tilt  = max(float(self.cfg.sigma_tilt_deg), eps)
         sigma_swing = max(float(self.cfg.sigma_swing_deg_s), eps)
 
-        r_pos   = 1.0 - torch.tanh(dist       / sigma_pos)
-        r_tilt  = 1.0 - torch.tanh(theta_deg  / sigma_tilt)
-        r_swing = 1.0 - torch.tanh(swing_deg_s / sigma_swing)
+        z_pos    = dist       / sigma_pos
+        z_tilt   = theta_deg  / sigma_tilt
+        z_swing  = swing_deg_s/ sigma_swing
 
-        # 理论上 1 - tanh(x) ∈ (0,1]，数值上容错一下
-        r_pos   = torch.clamp(r_pos,   0.0, 1.0)
-        r_tilt  = torch.clamp(r_tilt,  0.0, 1.0)
-        r_swing = torch.clamp(r_swing, 0.0, 1.0)
+        r_pos_raw   = torch.exp(-0.5 * z_pos   * z_pos)    # [0,1]
+        r_tilt_raw  = torch.exp(-0.5 * z_tilt  * z_tilt)   # [0,1]
+        r_swing_raw = torch.exp(-0.5 * z_swing * z_swing)  # [0,1]
 
-        # === 线性权重 ===
-        w_pos   = float(self.cfg.pos_weight)
-        w_tilt  = float(self.cfg.tilt_weight)
-        # 保持之前的“0.5 * tilt_weight 给摆速”的语义
-        w_swing = 0.5 * float(self.cfg.tilt_weight)
+        # === 5) 线性加和：位置 + 摆角 + 摆速 ===
+        pos_w  = float(self.cfg.pos_weight)
+        tilt_w = float(self.cfg.tilt_weight)
 
-        r_pos_term   = w_pos   * r_pos
-        r_tilt_term  = w_tilt  * r_tilt
-        r_swing_term = w_swing * r_swing
+        r_pos   = pos_w       * r_pos_raw
+        r_tilt  = tilt_w      * r_tilt_raw
+        r_swing = 0.5 * tilt_w* r_swing_raw
 
-        # === 时间惩罚：按 dt 缩放，保证不同 dt 语义一致 ===
-        time_penalty = float(self.cfg.time_penalty)
-        r_time = -time_penalty * self.step_dt
-        r_time_vec = torch.full_like(dist, r_time)
+        reward = r_pos + r_pos_raw*r_tilt + r_pos_raw*r_swing
 
-        # === 死亡惩罚：高度出界就一次性扣 death_penalty ===
-        z = self._robot.data.root_pos_w[:, 2]
-        died = torch.logical_or(z < 0.1, z > 5.0)
+        # ---- 死亡惩罚：高度 / 出盒子 超界就一次性扣 death_penalty ----
+        root_pos = self._robot.data.root_pos_w                          # (N,3)
+        z = root_pos[:, 2]
+        height_fail = torch.logical_or(z < 0.1, z > 6.0)
+
+        # 以各自 env 原点为参考框，加 xyz 5m 的包围盒
+        env_origins = self._terrain.env_origins.to(root_pos.device)     # (N,3)
+        rel_pos = root_pos - env_origins
+        out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
+
+        died = torch.logical_or(height_fail, out_of_box)
         death_penalty_vec = -self.cfg.death_penalty * died.float()
-
-        # === 总 reward：简单线性叠加 ===
-        reward = (
-            r_pos_term
-            + r_tilt_term
-            + r_swing_term
-            + r_time_vec
-            + death_penalty_vec
-        )
+        reward = reward + death_penalty_vec
 
         # === Logging：分项累计，便于 tensorboard / CSV ===
         rewards = {
-            "r_pos": r_pos_term,
-            "r_tilt": r_tilt_term,
-            "r_swing": r_swing_term,
-            "time_penalty": r_time_vec,
+            "r_pos": r_pos,
+            "r_tilt": r_tilt,
+            "r_swing": r_swing,
             "death_penalty": death_penalty_vec,
-            "dist": dist,           # ★ 每一步的 payload 距目标距离
-
+            "dist": dist,                      # payload 到目标的距离（m）
+            "theta_deg": theta_deg,            # 合摆角（deg）
+            "swing_deg_s": swing_deg_s,        # 合角速度（deg/s）
         }
+        # 顺便记录总 reward
         rewards["total"] = reward
 
         for key, value in rewards.items():
@@ -319,23 +297,39 @@ class UavPayloadLabEnv(DirectRLEnv):
 
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        died = torch.logical_or(self._robot.data.root_pos_w[:, 2] < 0.1, self._robot.data.root_pos_w[:, 2] > 5.0)
-        return died, time_out
+            # 时间到：和原来一样
+            time_out = self.episode_length_buf >= self.max_episode_length - 1
+
+            # UAV 当前世界坐标
+            root_pos = self._robot.data.root_pos_w  # (num_envs, 3)
+
+            # 1) 高度越界：低于 0.1 或 高于 5.0（保留原规则）
+            height_fail = torch.logical_or(root_pos[:, 2] < 0.1, root_pos[:, 2] > 6.0)
+
+            # 2) 相对各自 env 原点的越界：任一坐标绝对值 > 5.0 m
+            #    env_spacing = 6.0，因此 ±5m 仍然在自己这一格内
+            env_origins = self._terrain.env_origins.to(root_pos.device)  # (num_envs, 3)
+            rel_pos = root_pos - env_origins                              # 以各自 env 原点为参考
+            out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
+
+            # died = 高度越界 或 出盒子
+            died = torch.logical_or(height_fail, out_of_box)
+
+            return died, time_out
+
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
+        # 计算本局的步数 / 时间（每个 env 自己的）
+        ep_steps = self.episode_length_buf[env_ids].float().clamp(min=1.0)
+        ep_time  = ep_steps * self.step_dt  # 单位：秒
 
         # Logging
         p_load_w = self._robot.data.body_pos_w[env_ids, self._payload_id, :]
-        goal_uav_w = self._desired_pos_w[env_ids]
-        goal_payload_w = goal_uav_w.clone()
-        goal_payload_w[:, 2] -= self.cfg.rope_length
+        goal_payload_w = self._desired_pos_w[env_ids]
+        final_distance_to_goal = torch.linalg.norm(goal_payload_w - p_load_w, dim=1).mean()
 
-        final_distance_to_goal = torch.linalg.norm(
-            goal_payload_w - p_load_w, dim=1
-        ).mean()
         extras = dict()
         for key in self._episode_sums.keys():
             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
@@ -347,6 +341,9 @@ class UavPayloadLabEnv(DirectRLEnv):
         extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+        # 时间平均距离（m）
+        dist_per_sec = self._episode_sums["dist"][env_ids] / ep_time
+        extras["Metrics/avg_dist"] = dist_per_sec.mean().item()
         self.extras["log"].update(extras)
 
         self._robot.reset(env_ids)
@@ -399,5 +396,3 @@ class UavPayloadLabEnv(DirectRLEnv):
     def _debug_vis_callback(self, event):
         # update the markers
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
-
-

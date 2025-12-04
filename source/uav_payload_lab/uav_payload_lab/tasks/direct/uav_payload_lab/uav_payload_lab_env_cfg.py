@@ -81,9 +81,9 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
 class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2                      # 每执行一次 RL action，物理 step 多少次
-    episode_length_s = 10.0             # 一局多长时间（秒）
+    episode_length_s = 35.0             # 一局多长时间（秒）
     action_space = 4
-    observation_space = 13
+    observation_space = 17
     state_space = 0
     debug_vis = True
 
@@ -141,16 +141,16 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
 
     # reward scales
     # === Reward 参数：payload 到点 + 消摆 ===
-    sigma_pos = 0.5            # 位置高斯尺度（m）
-    sigma_tilt_deg = 30.0       # 摆角高斯尺度（deg）
-    sigma_swing_deg_s = 30.0   # 摆角角速度高斯尺度（deg/s）
-    pos_weight = 2.0           # 位置主项权重
-    tilt_weight = 1.0          # 摆角 / 摆速 shaping 权重
-    time_penalty = 0.1         # 每秒时间惩罚系数（越大越鼓励快完成）
-    death_penalty = 100.0       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
+    sigma_pos = 0.8125            # 位置高斯尺度（m）
+    sigma_tilt_deg = 20.0       # 摆角高斯尺度（deg）
+    sigma_swing_deg_s = 45.0   # 摆角角速度高斯尺度（deg/s）
+    pos_weight = 1.0           # 位置主项权重
+    tilt_weight = 0.5          # 摆角 / 摆速 shaping 权重
+    time_penalty = 0.02         # 每秒时间惩罚系数（越大越鼓励快完成）
+    death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
 
     # === 任务设置（相对每个 env 的原点，ENU）===
-    # UAV 起点：payload 初始大约在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
+    # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     start_pos_w = (0.5, 1.0, 1.2)
-    # UAV 终点：水平移到 [-0.5, 0.0]，高度仍为 1.2
+    # payload 终点用于reward：0.5 1 0.4 → -0.5 0 1.2
     goal_pos_w = (-0.5, 0.0, 1.2)
