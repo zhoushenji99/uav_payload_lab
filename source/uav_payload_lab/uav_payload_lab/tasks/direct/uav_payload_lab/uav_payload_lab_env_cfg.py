@@ -139,10 +139,10 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     # reward scales
     # === Reward 参数：payload 到点 + 消摆 ===
     sigma_pos = 0.2            # 位置高斯尺度（m）
-    sigma_tilt_deg = 40.0       # 摆角高斯尺度（deg）
-    sigma_swing_deg_s = 45.0   # 摆角角速度高斯尺度（deg/s）
+    sigma_tilt_deg = 30.0       # 摆角高斯尺度（deg）
+    sigma_swing_deg_s = 30.0   # 摆角角速度高斯尺度（deg/s）
     pos_weight = 0.3           # 位置主项权重
-    tilt_weight = 0.05          # 摆角 / 摆速 shaping 权重
+    tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
 
