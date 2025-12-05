@@ -1,0 +1,74 @@
+--- git status ---
+On branch master
+Your branch is up to date with 'origin/master'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/agents/rsl_rl_ppo_cfg.py
+	modified:   source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env.py
+	modified:   source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env_cfg.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/agents/rsl_rl_ppo_cfg.py b/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/agents/rsl_rl_ppo_cfg.py
+index 6d13597..4b5dc4b 100644
+--- a/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/agents/rsl_rl_ppo_cfg.py
++++ b/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/agents/rsl_rl_ppo_cfg.py
+@@ -11,8 +11,8 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
+ @configclass
+ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     num_steps_per_env = 256  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
+-    max_iterations = 900  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
+-    save_interval = 50  #多少个 iteration 存一次 model_*.pt
++    max_iterations = 10000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
++    save_interval = 500  #多少个 iteration 存一次 model_*.pt
+     experiment_name = "uav_payload_antisway" #日志目录名
+     policy = RslRlPpoActorCriticCfg(
+         init_noise_std=1.0,     #动作高斯探索噪声初始 std
+diff --git a/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env.py b/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env.py
+index b190e31..f91d1b4 100644
+--- a/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env.py
++++ b/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env.py
+@@ -245,7 +245,7 @@ class UavPayloadLabEnv(DirectRLEnv):
+ 
+         # [D] 动作平滑惩罚 (r_action) - 新增项，不算在 r_pos 里，算额外惩罚
+         # 防止力矩控制时电机高频震荡
+-        r_action_val = -0.001 * torch.sum(torch.square(self._actions), dim=1)
++        r_action_val = -0.0 * torch.sum(torch.square(self._actions), dim=1)
+ 
+         # [E] 死亡惩罚 (death_penalty)
+         root_pos = self._robot.data.root_pos_w
+diff --git a/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env_cfg.py b/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env_cfg.py
+index 51c6436..f0f2b22 100644
+--- a/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env_cfg.py
++++ b/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/uav_payload_lab_env_cfg.py
+@@ -122,7 +122,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
+     # robot（quadcopter）
+     robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+     thrust_to_weight = 1.9 #无量纲参数，意思是“最大推力大概是机重的多少倍”
+-    moment_scale = 0.3 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
++    moment_scale = 0.4 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
+     
+     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
+     rope_length = 0.8
+@@ -138,12 +138,12 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
+ 
+     # reward scales
+     # === Reward 参数：payload 到点 + 消摆 ===
+-    sigma_pos = 0.3            # 位置高斯尺度（m）
+-    sigma_tilt_deg = 10.0       # 摆角高斯尺度（deg）
++    sigma_pos = 0.2            # 位置高斯尺度（m）
++    sigma_tilt_deg = 40.0       # 摆角高斯尺度（deg）
+     sigma_swing_deg_s = 45.0   # 摆角角速度高斯尺度（deg/s）
+-    pos_weight = 1.5           # 位置主项权重
+-    tilt_weight = 2          # 摆角 / 摆速 shaping 权重
+-    time_penalty = 0.02         # 每秒时间惩罚系数（越大越鼓励快完成）
++    pos_weight = 0.3           # 位置主项权重
++    tilt_weight = 0.05          # 摆角 / 摆速 shaping 权重
++    time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
+     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
+ 
+     # === 任务设置（相对每个 env 的原点，ENU）===

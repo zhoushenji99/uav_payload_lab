@@ -245,7 +245,7 @@ class UavPayloadLabEnv(DirectRLEnv):
 
         # [D] 动作平滑惩罚 (r_action) - 新增项，不算在 r_pos 里，算额外惩罚
         # 防止力矩控制时电机高频震荡
-        r_action_val = -0.001 * torch.sum(torch.square(self._actions), dim=1)
+        r_action_val = -0.0 * torch.sum(torch.square(self._actions), dim=1)
 
         # [E] 死亡惩罚 (death_penalty)
         root_pos = self._robot.data.root_pos_w
