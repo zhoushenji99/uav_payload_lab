@@ -59,7 +59,7 @@ class UavPayloadLabEnv(DirectRLEnv):
         self._body_id = body_ids  # list[int]，用于 set_external_force_and_torque 的 body_ids
 
         # payload 刚体：这里只需要「一个具体 body index」用于 body_pos_w 的第二维索引
-        payload_ids, payload_names = self._robot.find_bodies("link")
+        payload_ids, payload_names = self._robot.find_bodies("link7")
         if len(payload_ids) == 0:
             raise RuntimeError("UavPayloadLabEnv: cannot find payload body named 'link'.")
         self._payload_id = payload_ids[0]  # int，用来写 p_load_w = body_pos_w[:, self._payload_id, :]
@@ -369,7 +369,25 @@ class UavPayloadLabEnv(DirectRLEnv):
             self._prev_tilt_deg[env_ids] = 0.0
             self._tilt_vel_deg[env_ids] = 0.0
             self._has_prev_tilt[env_ids] = False
-
+        # === [新增] 质量自检代码 (只在第一次 Reset 时运行) ===
+        if not hasattr(self, "_mass_checked"):
+            print("\n" + "="*30)
+            print("[Physics Check] Link Masses (Env 0):")
+            for i in range(8):
+                link_name = f"link{i}"  # 根据之前的报错，你的名字是 link0, link1... (无下划线)
+                try:
+                    ids, _ = self._robot.find_bodies(link_name)
+                    if ids:
+                        # 获取第 0 个环境的对应 Link 质量
+                        # default_mass 存储了 USD 解析后的物理质量
+                        mass = self._robot.data.default_mass[0, ids[0]].item()
+                        print(f"  {link_name:<6} : {mass:.5f} kg")
+                    else:
+                        print(f"  {link_name:<6} : Not Found!")
+                except Exception as e:
+                    print(f"  {link_name:<6} : Error {e}")
+            print("="*30 + "\n")
+            self._mass_checked = True
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first time
         if debug_vis:

@@ -40,7 +40,7 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
     spawn=sim_utils.UsdFileCfg(
         # TODO：如果你改过路径，这里换成你真实的 iris_payload.usd 路径
-        usd_path="/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/iris_payload.usd",
+        usd_path="/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/iris_payload_8links.usd",
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=10.0,
@@ -48,8 +48,8 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
-            solver_position_iteration_count=4,
-            solver_velocity_iteration_count=0,
+            solver_position_iteration_count=32,
+            solver_velocity_iteration_count=16,
             sleep_threshold=0.005,
             stabilization_threshold=0.001,
         ),
@@ -72,7 +72,7 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
         "dummy": ImplicitActuatorCfg(
             joint_names_expr=[".*"],
             stiffness=0.0,
-            damping=0.0,
+            damping=0.05,
         ),
     },
 )
@@ -130,7 +130,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
 
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, #4096
+        num_envs=116, #4096
         env_spacing=6,
         replicate_physics=True,
         clone_in_fabric=True,
@@ -144,7 +144,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     pos_weight = 0.3           # 位置主项权重
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
-    death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
+    death_penalty = 5       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
 
     # === 任务设置（相对每个 env 的原点，ENU）===
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
