@@ -18,9 +18,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=1.0,     #动作高斯探索噪声初始 std
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[128, 128,128],     #MLP 的层数和宽度
-        critic_hidden_dims=[128, 128,128],
-        activation="tanh",
+        actor_hidden_dims=[128, 128],     #MLP 的层数和宽度
+        critic_hidden_dims=[128, 128],
+        activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
@@ -28,11 +28,11 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         clip_param=0.2,
         entropy_coef=0.01,
         num_learning_epochs=5,
-        num_mini_batches=8,
-        learning_rate=5.0e-5,
+        num_mini_batches=4,
+        learning_rate=3.0e-4,
         schedule="adaptive",
         gamma=0.995,
         lam=0.95,
         desired_kl=0.01,
-        max_grad_norm=0.3,
+        max_grad_norm=1.0,
     )

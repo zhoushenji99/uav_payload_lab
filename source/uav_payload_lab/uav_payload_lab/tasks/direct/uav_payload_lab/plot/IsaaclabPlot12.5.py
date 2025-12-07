@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # --- 1. 配置 ---
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/payload_data_increaseV.csv"
+simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/payload_data copy.csv"
 paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
 
 # 坐标系校正 (World -> Task)
