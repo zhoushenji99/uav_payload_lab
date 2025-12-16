@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
-    max_iterations = 10000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
+    max_iterations = 20000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
     save_interval = 500  #多少个 iteration 存一次 model_*.pt
     experiment_name = "uav_payload_antisway" #日志目录名
     policy = RslRlPpoActorCriticCfg(
@@ -26,11 +26,11 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=0.0,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,
-        schedule="adaptive",
+        schedule="fixed",
         gamma=0.995,
         lam=0.95,
         desired_kl=0.01,

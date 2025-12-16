@@ -37,7 +37,7 @@ class UavPayloadLabEnv(DirectRLEnv):
         # ★ 任务：起点 / 终点（相对 env_origin 的偏移）
         self._start_offset = torch.tensor(cfg.start_pos_w, dtype=torch.float, device=self.device)
         self._goal_offset  = torch.tensor(cfg.goal_pos_w,  dtype=torch.float, device=self.device)
-                # Logging
+        # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -50,6 +50,8 @@ class UavPayloadLabEnv(DirectRLEnv):
                 "dist",          # payload 到目标的距离（m）
                 "theta_deg",     # payload 合摆角（deg）
                 "swing_deg_s",   # payload 合角速度（deg/s）
+                "effort",
+                "action_smooth"
             ]
         }
         # Get specific body indices
@@ -74,6 +76,12 @@ class UavPayloadLabEnv(DirectRLEnv):
         self._prev_tilt_deg = None
         self._tilt_vel_deg = None
         self._has_prev_tilt = None
+        # raw action (unclipped) from policy
+        self._actions_raw = torch.zeros_like(self._actions)
+        # previous clipped action for smooth penalty
+        self._actions_prev = torch.zeros_like(self._actions)
+        # delta clipped action (current - prev)
+        self._actions_delta = torch.zeros_like(self._actions)
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
 
@@ -94,9 +102,29 @@ class UavPayloadLabEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self._actions = actions.clone().clamp(-1.0, 1.0)
-        self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+        # 1) store raw (unclipped) actions
+        self._actions_raw = actions.clone()
+
+        # 2) clip for execution
+        actions_clamped = self._actions_raw.clamp(-1.0, 1.0)
+
+        # 3) delta action for smooth penalty (use CLAMPED actions)
+        self._actions_delta = actions_clamped - self._actions_prev
+        self._actions_prev = actions_clamped
+        self._actions = actions_clamped
+
+        # 4) Hover-centered thrust mapping
+        # max thrust
+        max_thrust = float(self.cfg.thrust_to_weight) * self._robot_weight
+        hover_thrust = self._robot_weight
+        delta_thrust = max_thrust - hover_thrust  # requires thrust_to_weight > 1
+
+        thrust_cmd = hover_thrust + self._actions[:, 0] * delta_thrust
+        thrust_cmd = thrust_cmd.clamp(0.0, max_thrust)
+
+        self._thrust[:, 0, 2] = thrust_cmd
+        self._moment[:, 0, :] = float(self.cfg.moment_scale) * self._actions[:, 1:]
+
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
@@ -259,10 +287,23 @@ class UavPayloadLabEnv(DirectRLEnv):
         
         died = torch.logical_or(height_fail, out_of_box)
         death_penalty_vec = -1.0 * float(self.cfg.death_penalty) * died.float()
+        # effort penalty: MUST use RAW actions, not clamped actions
+        effort = torch.sum(torch.square(self._actions_raw), dim=1)
+        r_effort = -float(self.cfg.effort_weight) * effort
+
+        # smooth penalty: use delta of CLAMPED executed actions
+        smooth = torch.sum(torch.square(self._actions_delta), dim=1)
+        r_action_smooth = -float(self.cfg.action_smooth_weight) * smooth
 
         # === 4. 总奖励汇总 ===
-        reward = r_pos_val + r_tilt_val + r_swing_val + r_action_val + death_penalty_vec
-
+        reward = (
+            r_pos_val
+        + r_tilt_val
+        + r_swing_val
+        + r_effort
+        + r_action_smooth
+        + death_penalty_vec
+        )
         # === 5. Logging (完全兼容你原来的结构) ===
         # 这里为了保持和你 __init__ 中的 keys 一致，我把各项归类
         rewards_dict = {
@@ -275,6 +316,8 @@ class UavPayloadLabEnv(DirectRLEnv):
             "swing_deg_s": swing_deg_s, # 纯粹的物理角速度用于记录
             # 原来代码里可能有 time_penalty，现在没用上，置0即可防止报错
             "time_penalty": torch.zeros_like(reward), 
+            "effort": r_effort,        # raw-action effort penalty
+            "action_smooth": r_action_smooth,  # delta-action smooth penalty
             "total": reward
         }
 
@@ -313,30 +356,36 @@ class UavPayloadLabEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
-        # 计算本局的步数 / 时间（每个 env 自己的）
-        ep_steps = self.episode_length_buf[env_ids].float().clamp(min=1.0)
-        ep_time  = ep_steps * self.step_dt  # 单位：秒
 
-        # Logging
+        # --- episode length (per env) ---
+        ep_steps = self.episode_length_buf[env_ids].float().clamp(min=1.0)
+        ep_time = ep_steps * self.step_dt  # seconds
+
+        # --- metrics at termination (compute BEFORE clearing buffers) ---
         p_load_w = self._robot.data.body_pos_w[env_ids, self._payload_id, :]
         goal_payload_w = self._desired_pos_w[env_ids]
         final_distance_to_goal = torch.linalg.norm(goal_payload_w - p_load_w, dim=1).mean()
 
-        extras = dict()
+        log = {}
+
+        # Reward-like terms: report mean per-second (consistent across early terminations).
+        # Physical metrics: report mean per-step.
         for key in self._episode_sums.keys():
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            if key in ("dist", "theta_deg", "swing_deg_s"):
+                log[f"Episode_Metrics/{key}"] = torch.mean(self._episode_sums[key][env_ids] / ep_steps).item()
+            else:
+                log[f"Episode_Reward/{key}"] = torch.mean(self._episode_sums[key][env_ids] / ep_time).item()
+
+        log["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
+        log["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
+        log["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+
+        # clear per-episode accumulators
+        for key in self._episode_sums.keys():
             self._episode_sums[key][env_ids] = 0.0
-        self.extras["log"] = dict()
-        self.extras["log"].update(extras)
-        extras = dict()
-        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
-        # 时间平均距离（m）
-        dist_per_sec = self._episode_sums["dist"][env_ids] / ep_time
-        extras["Metrics/avg_dist"] = dist_per_sec.mean().item()
-        self.extras["log"].update(extras)
+
+        self.extras["log"] = log
+
 
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
@@ -369,6 +418,11 @@ class UavPayloadLabEnv(DirectRLEnv):
             self._prev_tilt_deg[env_ids] = 0.0
             self._tilt_vel_deg[env_ids] = 0.0
             self._has_prev_tilt[env_ids] = False
+        
+        self._actions[env_ids] = 0.0
+        self._actions_raw[env_ids] = 0.0
+        self._actions_prev[env_ids] = 0.0
+        self._actions_delta[env_ids] = 0.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first time
