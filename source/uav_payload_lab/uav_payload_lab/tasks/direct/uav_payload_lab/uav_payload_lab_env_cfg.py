@@ -122,7 +122,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     # robot（quadcopter）
     robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9 #无量纲参数，意思是“最大推力大概是机重的多少倍”
-    moment_scale = 0.3 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
+    moment_scale = 0.4 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
     
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
     rope_length = 0.8
@@ -145,8 +145,6 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
-    effort_weight = 1.0e-4          # 先从 1e-4 起步（raw 爆到几十/上百时也能压住）
-    action_smooth_weight = 1.0e-2   # 激进控制先用 1e-2；如果还抖再加到 2e-2
 
     # === 任务设置（相对每个 env 的原点，ENU）===
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
