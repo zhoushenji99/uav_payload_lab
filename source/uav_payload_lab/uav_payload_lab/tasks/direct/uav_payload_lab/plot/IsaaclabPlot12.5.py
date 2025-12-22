@@ -2,10 +2,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.transform import Rotation as R  # [新增] 用于四元数转欧拉角
-
+import math
 # --- 1. 配置 ---
 # [修改] 默认读取当前目录下的 payload_data.csv (根据你的实际文件名修改)
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/payload_data copy 5.csv" 
+
+# === Analysis window (seconds) ===
+TIME_WINDOW_S = 5.0   # set None to disable cropping
+
+simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/斜飞加速度.csv" 
 paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
 
 # 坐标系校正 (World -> Task)
@@ -238,6 +242,248 @@ if "UAV_a_wz" in df_sim.columns:
     print("  - plot_4_world_dynamics.png")
 else:
     print("[Info] CSV 中未发现加速度数据 (UAV_a_wz)，跳过 Figure 4。")
+
+
+# ------------------------------------------
+# [新增] Figure 5: Input Shaping Evidence (Tilt/Accel vs Swing)
+# ------------------------------------------
+def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
+    """Simple moving average (same length)."""
+    x = np.asarray(x, dtype=np.float32)
+    if win <= 1:
+        return x
+    kernel = np.ones(win, dtype=np.float32) / float(win)
+    return np.convolve(x, kernel, mode="same")
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson corr ignoring NaNs; returns nan if insufficient data."""
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    m = np.isfinite(a) & np.isfinite(b)
+    if int(m.sum()) < 10:
+        return float("nan")
+    aa = a[m] - float(np.mean(a[m]))
+    bb = b[m] - float(np.mean(b[m]))
+    sa = float(np.std(aa))
+    sb = float(np.std(bb))
+    if sa < 1e-9 or sb < 1e-9:
+        return float("nan")
+    return float(np.mean(aa * bb) / (sa * sb))
+
+# 只有当CSV包含世界系加速度 (UAV_a_wx/UAV_a_wy) 时才画
+if "UAV_a_wx" in df_sim.columns and "UAV_a_wy" in df_sim.columns:
+    # 1) 估计“任务主运动方向” (XY 平面)：从 UAV 起点到终点的位移方向
+    dx = float(df_sim["UAV_X"].iloc[-1] - df_sim["UAV_X"].iloc[0]) if "UAV_X" in df_sim.columns else 1.0
+    dy = float(df_sim["UAV_Y"].iloc[-1] - df_sim["UAV_Y"].iloc[0]) if "UAV_Y" in df_sim.columns else 0.0
+    dnorm = float(np.sqrt(dx * dx + dy * dy))
+    if dnorm < 1e-6:
+        d_xy = np.array([1.0, 0.0], dtype=np.float32)
+    else:
+        d_xy = np.array([dx / dnorm, dy / dnorm], dtype=np.float32)
+
+    a_wx = df_sim["UAV_a_wx"].to_numpy(dtype=np.float32)
+    a_wy = df_sim["UAV_a_wy"].to_numpy(dtype=np.float32)
+    a_parallel = a_wx * d_xy[0] + a_wy * d_xy[1]
+
+    # 2) 选择“更像沿运动方向倾斜”的欧拉角轴 (roll or pitch)
+    candidates = []
+    if "pitch" in df_sim.columns:
+        candidates.append(("pitch", df_sim["pitch"].to_numpy(dtype=np.float32)))
+    if "roll" in df_sim.columns:
+        candidates.append(("roll", df_sim["roll"].to_numpy(dtype=np.float32)))
+
+    if len(candidates) == 0:
+        print("[Warn] 未发现 roll/pitch（欧拉角列），跳过 Figure 5。")
+    else:
+        corr_list = [(name, _safe_corr(arr, a_parallel)) for name, arr in candidates]
+        best_name, best_corr = max(corr_list, key=lambda t: (abs(t[1]) if np.isfinite(t[1]) else -1))
+        tilt_deg = dict(candidates)[best_name]
+
+        # 3) 摆角投影到主运动方向（诊断用）：theta_parallel ≈ theta_x * dx + theta_y * dy
+        #    注意：这不是严格的坐标变换，但作为“相位证据”的可视化非常有用。
+        theta_parallel = None
+        if "theta_x_deg" in df_sim.columns and "theta_y_deg" in df_sim.columns:
+            thx = df_sim["theta_x_deg"].to_numpy(dtype=np.float32)
+            thy = df_sim["theta_y_deg"].to_numpy(dtype=np.float32)
+            theta_parallel = thx * d_xy[0] + thy * d_xy[1]
+
+        # 4) 平滑（避免差分加速度的噪声）—— 默认 0.15s 窗口
+        t_all = df_sim["time"].to_numpy(dtype=np.float32)
+        dt = float(np.median(np.diff(t_all))) if len(t_all) > 2 else 1 / 60.0
+
+        # --- Crop to early-window for input-shaping analysis (e.g., 0-5s) ---
+        if TIME_WINDOW_S is not None:
+            m_win = (t_all >= 0.0) & (t_all <= float(TIME_WINDOW_S))
+        else:
+            m_win = np.ones_like(t_all, dtype=bool)
+
+        win = max(1, int(round(0.15 / max(dt, 1e-6))))
+        a_parallel_f_all = _moving_average(a_parallel, win)
+        tilt_f_all = _moving_average(tilt_deg, win)
+        theta_parallel_f_all = _moving_average(theta_parallel, win) if theta_parallel is not None else None
+
+        # Apply window mask
+        t = t_all[m_win]
+        a_parallel_f = a_parallel_f_all[m_win]
+        tilt_f = tilt_f_all[m_win]
+        theta_parallel_f = theta_parallel_f_all[m_win] if theta_parallel_f_all is not None else None
+
+        # 5) 找到“明显的加速度符号翻转”（对应：加速→减速→再加速）
+        eps = 0.30  # m/s^2，小于这个认为是 0（过滤噪声）
+        s = np.sign(a_parallel_f)
+        s[np.abs(a_parallel_f) < eps] = 0
+        flip_idx = np.where((s[1:] * s[:-1] < 0))[0] + 1
+        flip_t = [float(t[i]) for i in flip_idx[:10]]  # 取前几个足够标注阶段
+
+        # 6) 估计绳长 L（若 CSV 有 UAV_Z & Payload_Z），用于半周期参考线
+        L_est = 0.8
+        if "UAV_Z" in df_sim.columns and "Payload_Z" in df_sim.columns:
+            dz = (df_sim["UAV_Z"].to_numpy(dtype=np.float32) - df_sim["Payload_Z"].to_numpy(dtype=np.float32))
+            dz_w = dz[m_win]
+            if np.isfinite(dz_w).sum() > 20:
+                L_est = float(np.median(dz_w[np.isfinite(dz_w)]))
+        g0 = 9.81
+        T_half = math.pi * math.sqrt(max(L_est, 1e-3) / g0)
+
+        # 7) “峰值对齐”的相位差标注：t_a_peak 与 t_theta_peak（直观证据，不是严格系统辨识）
+        t_a_peak = None
+        t_theta_peak = None
+        phase_lag = None
+
+        # a_peak：在 0-2s 内找第一段正加速度峰（更像“第一次加速脉冲”）
+        m_a = (t <= 2.0) & np.isfinite(a_parallel_f)
+        if int(m_a.sum()) >= 5:
+            a_seg = a_parallel_f[m_a]
+            t_seg = t[m_a]
+            if np.any(a_seg > 0):
+                j = int(np.argmax(a_seg))
+            else:
+                j = int(np.argmax(np.abs(a_seg)))
+            t_a_peak = float(t_seg[j])
+        else:
+            j = int(np.argmax(np.abs(a_parallel_f)))
+            t_a_peak = float(t[j])
+
+        # theta_peak：在 a_peak 之后 0~1.5s 内找 |theta| 最大点（响应滞后）
+        if theta_parallel_f is not None and t_a_peak is not None:
+            m_th = (t >= t_a_peak) & (t <= t_a_peak + 1.5) & np.isfinite(theta_parallel_f)
+            if int(m_th.sum()) >= 5:
+                th_seg = theta_parallel_f[m_th]
+                t_th = t[m_th]
+                k = int(np.argmax(np.abs(th_seg)))
+                t_theta_peak = float(t_th[k])
+                phase_lag = float(t_theta_peak - t_a_peak)
+
+        # 8) 绘图：只画 0-5s；并用竖线标注“阶段”与“相位差”
+        fig5, axs5 = plt.subplots(2, 1, figsize=(18, 8), constrained_layout=True, sharex=True)
+        fig5.suptitle("Figure 5 (0-5s): Input-Shaping Evidence (Tilt/Accel & Swing/Accel)", fontsize=16, weight="bold")
+
+        # (a) tilt(t) 与 a_parallel(t) 同相性检查
+        ax = axs5[0]
+        ax2 = ax.twinx()
+        ax.plot(t, tilt_f, label=f"{best_name}(t) [deg] (smoothed)", linewidth=2)
+        ax2.plot(t, a_parallel_f, label="a_parallel(t) [m/s^2] (smoothed)", linewidth=2, linestyle="--")
+        ax.set_title("1) tilt(t) vs a_parallel(t): should be roughly in-phase (small-angle approx)")
+        ax.set_ylabel("Tilt (deg)")
+        ax2.set_ylabel("a_parallel (m/s^2)")
+        ax.grid(True, linestyle=":", alpha=0.5)
+
+        # 阶段标注（由 a_parallel 的符号翻转定义）
+        stage_bounds = [float(t[0])] + flip_t + [float(t[-1])]
+        stage_labels = ["Accel", "Brake", "Catch", "Trim"]
+        for i in range(min(len(stage_bounds) - 1, len(stage_labels))):
+            t0, t1 = stage_bounds[i], stage_bounds[i + 1]
+            tm = 0.5 * (t0 + t1)
+            ax.text(tm, 0.95, stage_labels[i], transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=10, alpha=0.85)
+            ax.axvline(t0, color="k", alpha=0.20, linestyle=":")
+        ax.axvline(stage_bounds[-1], color="k", alpha=0.20, linestyle=":")
+        for tt in flip_t:
+            ax.axvline(tt, color="k", alpha=0.25, linestyle=":")
+
+        # 峰值/半周期参考线
+        if t_a_peak is not None:
+            ax.axvline(t_a_peak, alpha=0.45, linestyle="--")
+            ax2.axvline(t_a_peak, alpha=0.25, linestyle="--")
+            ax.text(t_a_peak, 0.02, "a_peak", transform=ax.get_xaxis_transform(),
+                    ha="center", va="bottom", fontsize=9, alpha=0.95)
+            t_half_ref = t_a_peak + T_half
+            if t_half_ref <= float(t[-1]):
+                ax.axvline(t_half_ref, alpha=0.35, linestyle="--")
+                ax.text(t_half_ref, 0.02, "a_peak + T/2", transform=ax.get_xaxis_transform(),
+                        ha="center", va="bottom", fontsize=9, alpha=0.95)
+
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, loc="upper right", fontsize="small")
+
+        # (b) theta(t) 与 a_parallel(t) 的“翻转 → 包络下降”现象
+        ax = axs5[1]
+        ax2 = ax.twinx()
+        if theta_parallel_f is not None:
+            ax.plot(t, theta_parallel_f, label="theta_parallel(t) [deg] (smoothed)", linewidth=2)
+            ax.set_ylabel("theta_parallel (deg)")
+            ax.set_title("2) swing vs a_parallel: braking (sign flips) should reduce swing envelope (input-shaping intuition)")
+        else:
+            if "theta_x_deg" in df_sim.columns:
+                ax.plot(t, df_sim["theta_x_deg"].to_numpy(dtype=np.float32)[m_win], label="theta_x_deg", linewidth=1.5)
+            if "theta_y_deg" in df_sim.columns:
+                ax.plot(t, df_sim["theta_y_deg"].to_numpy(dtype=np.float32)[m_win], label="theta_y_deg", linewidth=1.5)
+            ax.set_ylabel("theta (deg)")
+            ax.set_title("2) swing vs a_parallel: (theta_parallel missing; plotting theta_x/theta_y)")
+
+        ax2.plot(t, a_parallel_f, label="a_parallel(t) [m/s^2] (smoothed)", linewidth=2, linestyle="--")
+        ax2.set_ylabel("a_parallel (m/s^2)")
+
+        for tt in flip_t:
+            ax.axvline(tt, color="k", alpha=0.25, linestyle=":")
+
+        # 相位差（峰值对齐的直观标注）
+        if t_a_peak is not None:
+            ax.axvline(t_a_peak, alpha=0.35, linestyle="--")
+            ax2.axvline(t_a_peak, alpha=0.20, linestyle="--")
+        if t_theta_peak is not None:
+            ax.axvline(t_theta_peak, alpha=0.50, linestyle="-.")
+            ax.text(t_theta_peak, 0.02, "theta_peak", transform=ax.get_xaxis_transform(),
+                    ha="center", va="bottom", fontsize=9, alpha=0.95)
+        if phase_lag is not None and t_theta_peak is not None and t_a_peak is not None:
+            y0, y1 = ax.get_ylim()
+            y_arrow = y0 + 0.80 * (y1 - y0)
+            ax.annotate("", xy=(t_theta_peak, y_arrow), xytext=(t_a_peak, y_arrow),
+                        arrowprops=dict(arrowstyle="<->", alpha=0.75))
+            ax.text(0.5 * (t_a_peak + t_theta_peak), y_arrow, f"Δt≈{phase_lag:.2f}s",
+                    ha="center", va="bottom", fontsize=10, alpha=0.95)
+
+        ax.grid(True, linestyle=":", alpha=0.5)
+        ax.set_xlabel("Time (s)")
+        if TIME_WINDOW_S is not None:
+            ax.set_xlim(0.0, float(TIME_WINDOW_S))
+
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, loc="upper right", fontsize="small")
+
+        # 保存
+        print(f"[Figure5] travel_dir_xy=({d_xy[0]:+.3f},{d_xy[1]:+.3f}), best_tilt={best_name}, corr={best_corr:+.3f}, smooth_win={win} (~{win*dt:.3f}s)")
+        print(f"[Figure5] L_est≈{L_est:.3f} m => T/2≈{T_half:.3f} s; flip_t={flip_t}; phase_lag≈{phase_lag}")
+        plt.figure(fig5.number)
+        plt.savefig("plot_5_input_shaping_evidence_0_5s.png", dpi=300)
+        print("  - plot_5_input_shaping_evidence_0_5s.png")
+
+else:
+    print("[Info] CSV 中未发现 UAV_a_wx/UAV_a_wy，跳过 Figure 5。")
+
+# --- Crop view to TIME_WINDOW_S (if enabled) for other figures ---
+if TIME_WINDOW_S is not None:
+    for _fig in [fig1, fig2, fig3]:
+        for _ax in _fig.axes:
+            _ax.set_xlim(0.0, float(TIME_WINDOW_S))
+    # fig4 只在加速度数据存在时创建
+    if "fig4" in globals():
+        for _ax in fig4.axes:
+            _ax.set_xlim(0.0, float(TIME_WINDOW_S))
+
+
 
 # 保存其他图片
 plt.figure(fig1.number)
