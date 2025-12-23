@@ -267,9 +267,12 @@ class UavPayloadLabEnv(DirectRLEnv):
         
         died = torch.logical_or(height_fail, out_of_box)
         death_penalty_vec = -1.0 * float(self.cfg.death_penalty) * died.float()
-
+        # === [新增] 标准 Action L2 Penalty (Effort) ===
+        # 惩罚动作幅度的平方。鼓励 Agent 在不需要大机动时回归到 0 (即悬停状态)。
+        # 这就是 Omnidrones 和标准控制论文里的 "Control Cost"。
+        r_action_l2 = -self.cfg.action_l2_penalty_scale * (self._raw_actions ** 2).sum(dim=1)
         # === 4. 总奖励汇总 ===
-        reward = r_pos_val + r_tilt_val + r_swing_val + r_action_val + death_penalty_vec
+        reward = r_pos_val + r_tilt_val + r_swing_val + r_action_val + death_penalty_vec +r_action_l2
 
         # === 5. Logging (完全兼容你原来的结构) ===
         # 这里为了保持和你 __init__ 中的 keys 一致，我把各项归类

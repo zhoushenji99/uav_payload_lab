@@ -145,7 +145,7 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
-
+    action_l2_penalty_scale = 0.001
     # === 任务设置（相对每个 env 的原点，ENU）===
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     start_pos_w = (0.5, 1.0, 1.2)
