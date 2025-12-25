@@ -146,8 +146,14 @@ class UavPayloadLabEnvCfg(DirectRLEnvCfg):
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
     action_l2_penalty_scale = 0.001
+    spin_weight = 0.01   # 【新增】自旋惩罚权重
+    heading_weight = 0.5     # 【新增】航向对齐权重，用于抑制 Yaw 角度 (P控制)
     # === 任务设置（相对每个 env 的原点，ENU）===
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
-    start_pos_w = (0.5, 1.0, 1.2)
+    #斜飞start_pos_w = (0.5, 1.0, 1.2)
+    #平飞start_pos_w = (2.0, 0.0, 1.2)
+    start_pos_w = (-2.0, 0.0, 1.2)
     # payload 终点用于reward：0.5 1 0.4 → -0.5 0 1.2
-    goal_pos_w = (-0.5, 0.0, 1.2)
+    #斜飞goal_pos_w = (-0.5, 0.0, 1.2)
+    #平飞goal_pos_w = (-2.0, 0.0, 1.2)
+    goal_pos_w = (2.0, 0.0, 1.2)

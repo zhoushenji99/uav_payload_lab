@@ -267,18 +267,27 @@ class UavPayloadLabEnv(DirectRLEnv):
         
         died = torch.logical_or(height_fail, out_of_box)
         death_penalty_vec = -1.0 * float(self.cfg.death_penalty) * died.float()
+        # [新增] 自旋惩罚 (Spin Penalty)
+        # self._robot.data.root_ang_vel_b[:, 2] 是机体系下的 Z 轴角速度 (Yaw Rate)
+        # 我们希望它越接近 0 越好
+        # 1. 解算 Yaw 角 (Rad)
+        quat = self._robot.data.root_quat_w
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        yaw_angle = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        yaw_rate = self._robot.data.root_ang_vel_b[:, 2]
+        r_spin_val = -1.0 * float(self.cfg.spin_weight) * (torch.square(yaw_rate) + torch.square(yaw_angle))
         # === [新增] 标准 Action L2 Penalty (Effort) ===
         # 惩罚动作幅度的平方。鼓励 Agent 在不需要大机动时回归到 0 (即悬停状态)。
         # 这就是 Omnidrones 和标准控制论文里的 "Control Cost"。
-        r_action_l2 = -self.cfg.action_l2_penalty_scale * (self._raw_actions ** 2).sum(dim=1)
+        r_action_l2 = -self.cfg.action_l2_penalty_scale * (self._raw_actions ** 2).sum(dim=1)        
         # === 4. 总奖励汇总 ===
-        reward = r_pos_val + r_tilt_val + r_swing_val + r_action_val + death_penalty_vec +r_action_l2
-
+        reward = r_pos_val + r_tilt_val + r_swing_val + r_spin_val + r_action_val + death_penalty_vec + r_action_l2
         # === 5. Logging (完全兼容你原来的结构) ===
         # 这里为了保持和你 __init__ 中的 keys 一致，我把各项归类
         rewards_dict = {
             "r_pos": r_pos_val,         # 包含生存、距离、高斯
             "r_tilt": r_tilt_val,       # 仅包含角度惩罚
+            "r_spin": r_spin_val,
             "r_swing": r_swing_val,     # 仅包含角速度惩罚
             "death_penalty": death_penalty_vec,
             # [新增] 记录这两个数据
