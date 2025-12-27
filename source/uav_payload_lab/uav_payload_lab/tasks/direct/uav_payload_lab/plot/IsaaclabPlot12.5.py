@@ -1,15 +1,16 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 from scipy.spatial.transform import Rotation as R  # [新增] 用于四元数转欧拉角
 import math
 # --- 1. 配置 ---
 # [修改] 默认读取当前目录下的 payload_data.csv (根据你的实际文件名修改)
 
 # === Analysis window (seconds) ===
-TIME_WINDOW_S = 10.0   # set None to disable cropping
+TIME_WINDOW_S = 5.0   # set None to disable cropping
 
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/uav_payload_antisway/2025-12-25_11-23-43/payload_data.csv" 
+simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/uav_payload_antisway/2025-12-26_12-56-24/payload_data.csv" 
 paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
 
 # 坐标系校正 (World -> Task)
@@ -485,7 +486,152 @@ if TIME_WINDOW_S is not None:
 
 
 
-# 保存其他图片
+
+# ==========================================
+# [修改] Figure 6 Combined: 综合分析 (Style-Matched)
+# 风格已修正：统一使用点状网格(:)，调整线宽，对齐原图风格
+# ==========================================
+print("\n[Plotting] Figure 6 Combined (Mechanism + Energy Flow)...")
+
+# 检查所需列
+_need_cols = ["time", "theta_x_deg", "theta_y_deg", "SwingVel_DegS_X", "SwingVel_DegS_Y", "UAV_a_wx", "UAV_a_wy"]
+
+if all([c in df_sim.columns for c in _need_cols]):
+    # --- 1. 数据准备 (共用) ---
+    t_all = df_sim["time"].to_numpy(dtype=np.float32)
+    dt = float(np.median(np.diff(t_all))) if len(t_all) > 2 else 0.02
+
+    # Window
+    if TIME_WINDOW_S is not None:
+        m_win = (t_all >= 0.0) & (t_all <= float(TIME_WINDOW_S))
+    else:
+        m_win = np.ones_like(t_all, dtype=bool)
+
+    t = t_all[m_win]
+
+    # Rope length estimate
+    L_est = 0.8
+    if "UAV_Z" in df_sim.columns and "Payload_Z" in df_sim.columns:
+        dz = (df_sim["UAV_Z"].to_numpy(dtype=np.float32) - df_sim["Payload_Z"].to_numpy(dtype=np.float32))
+        L_est = float(np.median(np.abs(dz)))
+    g0 = 9.81
+
+    # --- 2. 计算部分 ---
+    
+    # (A) 投影与平滑 (Mechanism)
+    if "UAV_X" in df_sim.columns and "UAV_Y" in df_sim.columns:
+        dx = float(df_sim["UAV_X"].iloc[-1] - df_sim["UAV_X"].iloc[0])
+        dy = float(df_sim["UAV_Y"].iloc[-1] - df_sim["UAV_Y"].iloc[0])
+        dnorm = float(np.sqrt(dx*dx + dy*dy))
+        d_xy = np.array([dx/dnorm, dy/dnorm]) if dnorm > 1e-6 else np.array([1.0, 0.0])
+    else:
+        d_xy = np.array([1.0, 0.0])
+
+    v_swing_x = df_sim["SwingVel_DegS_X"].to_numpy(dtype=np.float32)
+    v_swing_y = df_sim["SwingVel_DegS_Y"].to_numpy(dtype=np.float32)
+    a_uav_x = df_sim["UAV_a_wx"].to_numpy(dtype=np.float32)
+    a_uav_y = df_sim["UAV_a_wy"].to_numpy(dtype=np.float32)
+
+    v_swing_parallel = v_swing_x * d_xy[0] + v_swing_y * d_xy[1]
+    a_uav_parallel   = a_uav_x * d_xy[0] + a_uav_y * d_xy[1]
+
+    win = max(1, int(round(0.15 / dt)))
+    def _smooth(arr, w):
+        return np.convolve(arr, np.ones(w)/w, mode='same')
+
+    v_plot = _smooth(v_swing_parallel, win)[m_win]
+    a_plot = _smooth(a_uav_parallel, win)[m_win]
+
+    # (B) 能量与功率 (Energy)
+    thx = df_sim["theta_x_deg"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+    thy = df_sim["theta_y_deg"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+    thdx = df_sim["SwingVel_DegS_X"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+    thdy = df_sim["SwingVel_DegS_Y"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+
+    th2 = thx*thx + thy*thy
+    thd2 = thdx*thdx + thdy*thdy
+
+    a_z = df_sim["UAV_a_wz"].to_numpy(dtype=np.float32) if "UAV_a_wz" in df_sim.columns else np.zeros_like(thx)
+    w2 = (g0 + a_z) / max(L_est, 1e-6)
+    w2 = np.clip(w2, 0.1, 200.0)
+
+    E_hat_all = 0.5 * (thd2 + w2 * th2)
+    E_hat_f = _smooth(E_hat_all, win)
+    E_dot = np.gradient(E_hat_f, t_all)
+
+    P_xy = (a_uav_x * thdx + a_uav_y * thdy) / max(L_est, 1e-6)
+    w2_f = _smooth(w2, win)
+    w2_dot = np.gradient(w2_f, t_all)
+    P_param = 0.5 * w2_dot * th2
+    P_model = P_xy + P_param
+
+    E_hat = E_hat_f[m_win]
+    E_dot_w = E_dot[m_win]
+    P_xy_w = _smooth(P_xy, win)[m_win]
+    P_param_w = _smooth(P_param, win)[m_win]
+    P_model_w = _smooth(P_model, win)[m_win]
+
+    # --- 3. 绘图 (合并) ---
+    fig6, axs6 = plt.subplots(4, 1, figsize=(18, 16), constrained_layout=True, sharex=True)
+    fig6.suptitle("Figure 6: Comprehensive Energy Analysis (Mechanism -> Result)", fontsize=16, weight="bold")
+
+    # [Subplot 1] Mechanism
+    ax1 = axs6[0]
+    color_vel = 'tab:blue'
+    ax1.set_title("1. Mechanism: In-Phase Coupling (UAV Accelerates with Swing)", fontsize=12, loc='left')
+    ax1.set_ylabel("Swing Vel (deg/s)", color=color_vel, weight='bold')
+    l1, = ax1.plot(t, v_plot, color=color_vel, linewidth=2.0, label="Swing Velocity ($v_{swing}$)")
+    ax1.tick_params(axis='y', labelcolor=color_vel)
+    ax1.grid(True, linestyle=":", alpha=0.5)  # 修正：使用冒号虚线
+
+    ax1_r = ax1.twinx()
+    color_acc = 'tab:red'
+    ax1_r.set_ylabel("UAV Accel (m/s$^2$)", color=color_acc, weight='bold')
+    l2, = ax1_r.plot(t, a_plot, color=color_acc, linestyle='--', linewidth=2.0, label="UAV Acceleration ($a_{uav}$)")
+    ax1_r.tick_params(axis='y', labelcolor=color_acc)
+    
+    lines = [l1, l2]
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+
+    # [Subplot 2] Energy State
+    axs6[1].set_title("2. Energy State: Monotonic Decay", fontsize=12, loc='left')
+    axs6[1].plot(t, E_hat, label="E_hat(t) (smoothed)", color='k', linewidth=2.0)
+    axs6[1].set_ylabel("E_hat [rad^2/s^2]")
+    axs6[1].grid(True, linestyle=":", alpha=0.5) # 修正
+    axs6[1].legend(loc="upper right")
+
+    # [Subplot 3] Verification
+    axs6[2].set_title("3. Verification: Power Matches Energy Rate", fontsize=12, loc='left')
+    axs6[2].plot(t, E_dot_w, label="dE_hat/dt (numeric)", color='gray', alpha=0.6)
+    axs6[2].plot(t, P_model_w, label="P_model (analytical)", color='tab:purple', linewidth=2.0)
+    axs6[2].axhline(0.0, linestyle="--", linewidth=1, color='k')
+    axs6[2].set_ylabel("Rate [rad^2/s^3]")
+    axs6[2].grid(True, linestyle=":", alpha=0.5) # 修正
+    axs6[2].legend(loc="upper right")
+
+    # [Subplot 4] Decomposition
+    axs6[3].set_title("4. Decomposition: Contribution of Horizontal Motion", fontsize=12, loc='left')
+    axs6[3].plot(t, P_xy_w, label="P_xy = -(a_xy·theta_dot)/L", color='tab:red', linewidth=2.0)
+    axs6[3].plot(t, P_param_w, label="P_param (Vertical/Gravity)", color='tab:green', alpha=0.7, linewidth=1.5)
+    axs6[3].plot(t, P_model_w, label="P_model (Total)", color='k', linestyle='--', alpha=0.5)
+    axs6[3].axhline(0.0, linestyle="--", linewidth=1, color='k')
+    axs6[3].set_xlabel("Time (s)")
+    axs6[3].set_ylabel("Power [rad^2/s^3]")
+    axs6[3].grid(True, linestyle=":", alpha=0.5) # 修正
+    axs6[3].legend(loc="upper right")
+
+    # 阴影标注
+    axs6[3].fill_between(t, 0.0, P_model_w, where=(P_model_w < 0.0), alpha=0.10, color='green', interpolate=True)
+    
+    # 保存
+    plt.figure(fig6.number)
+    plt.savefig("plot_6_combined.png", dpi=300)
+    print("  - plot_6_combined.png (Saved!)")
+
+else:
+    print(f"[Warn] 缺少必要列 {_need_cols}，跳过 Figure 6 Combined。")
+# 保存其他图片  
 plt.figure(fig1.number)
 plt.savefig("plot_1_payload.png", dpi=300)
 

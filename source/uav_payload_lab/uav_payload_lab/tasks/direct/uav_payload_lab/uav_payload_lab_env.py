@@ -53,6 +53,7 @@ class UavPayloadLabEnv(DirectRLEnv):
                 "swing_deg_s",   # payload 合角速度（deg/s）
                 "r_action_raw", 
                 "action_raw_sum",
+                "E_hat_mean",  # [新增] 摆能量(归一化)的时间积分，用于TB里做E_hat_mean
             ]
         }
         # Get specific body indices
@@ -223,7 +224,14 @@ class UavPayloadLabEnv(DirectRLEnv):
         wx_deg = self._tilt_vel_deg[:, 0]
         wy_deg = self._tilt_vel_deg[:, 1]
         swing_deg_s = torch.sqrt(wx_deg * wx_deg + wy_deg * wy_deg)    
-
+        # 归一化摆能量 E_hat（小角度线性摆近似，单位：rad^2/s^2）
+        # E_hat = 0.5*(||theta_dot||^2 + (g/L)*||theta||^2)，用于诊断/画图，不进入 reward
+        g = 9.81
+        L = float(self.cfg.rope_length)
+        theta_dot_rad_s = swing_deg_s * (math.pi / 180.0)
+        E_hat = 0.5 * (theta_dot_rad_s * theta_dot_rad_s + (g / max(L, 1e-6)) * (theta_rad * theta_rad))
+        # 记录时间平均：episode_sums 累加的是 ∑ E_hat * dt，reset 时再除以 T
+        E_hat_mean_dt = E_hat * self.step_dt
         # === 3. 计算各项奖励组件 ===
         
         # [A] 位置奖励 (r_pos)
@@ -296,6 +304,7 @@ class UavPayloadLabEnv(DirectRLEnv):
             "dist": dist,               # 纯粹的物理距离用于记录
             "theta_deg": theta_deg,     # 纯粹的物理角度用于记录
             "swing_deg_s": swing_deg_s, # 纯粹的物理角速度用于记录
+            "E_hat_mean": E_hat_mean_dt, # 纯粹的诊断量：E_hat 时间平均（不进 reward）
             # 原来代码里可能有 time_penalty，现在没用上，置0即可防止报错
             "time_penalty": torch.zeros_like(reward), 
             "total": reward
