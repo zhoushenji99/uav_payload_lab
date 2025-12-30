@@ -127,6 +127,8 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
     rope_length = 0.8
 
+    payload_mass_range = (0.05, 0.5)   # kg，每个episode随机
+    recompute_inertia = True         # 质量大改动时建议同步缩放惯量
 
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(

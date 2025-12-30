@@ -67,6 +67,13 @@ class UavPayloadMetaEnv(DirectRLEnv):
         if len(payload_ids) == 0:
             raise RuntimeError("UavPayloadLabEnv: cannot find payload body named 'link'.")
         self._payload_id = payload_ids[0]  # int，用来写 p_load_w = body_pos_w[:, self._payload_id, :]
+        
+        # 缓存默认 mass / inertia（用于每次reset从“默认值”开始随机）
+        self._default_masses_cpu = self._robot.root_physx_view.get_masses().clone()     # (num_envs, num_bodies) on CPU
+        self._default_inertias_cpu = self._robot.root_physx_view.get_inertias().clone() # (num_envs, num_bodies, 9) on CPU
+
+        # 记录每个env当前payload质量（放在env device上用于log）
+        self._payload_mass = torch.zeros(self.num_envs, device=self.device)
 
 
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
@@ -365,12 +372,33 @@ class UavPayloadMetaEnv(DirectRLEnv):
         extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
-        # 时间平均距离（m）
-        dist_per_sec = self._episode_sums["dist"][env_ids] / ep_time
-        extras["Metrics/avg_dist"] = dist_per_sec.mean().item()
         self.extras["log"].update(extras)
 
         self._robot.reset(env_ids)
+        
+        # --- Domain Randomization: payload mass (episode-level) ---
+        if hasattr(self.cfg, "payload_mass_range") and self.cfg.payload_mass_range is not None:
+            lo, hi = self.cfg.payload_mass_range
+            env_ids_cpu = env_ids.to("cpu")
+
+            # 从默认值拷贝再修改（避免“随机叠加到随机”）
+            masses = self._default_masses_cpu.clone()
+            new_mass = torch.empty((len(env_ids_cpu),), device="cpu").uniform_(float(lo), float(hi))
+            masses[env_ids_cpu, self._payload_id] = new_mass
+            self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
+
+            # 可选：按比例缩放 inertia（官方也是这么干的）
+            if getattr(self.cfg, "recompute_inertia", True):
+                inertias = self._default_inertias_cpu.clone()
+                default_mass = self._default_masses_cpu[env_ids_cpu, self._payload_id].clamp(min=1e-6)
+                ratio = (new_mass / default_mass).unsqueeze(-1)  # (N,1)
+                inertias[env_ids_cpu, self._payload_id] = self._default_inertias_cpu[env_ids_cpu, self._payload_id] * ratio
+                self._robot.root_physx_view.set_inertias(inertias, env_ids_cpu)
+
+            # 记录到 device tensor（便于log）
+            self._payload_mass[env_ids] = new_mass.to(self.device)
+
+        
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs:
             # Spread out the resets to avoid spikes in training when many environments reset at a similar time
