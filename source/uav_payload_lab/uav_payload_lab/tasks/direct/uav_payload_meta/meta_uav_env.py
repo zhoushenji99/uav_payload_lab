@@ -198,7 +198,14 @@ class UavPayloadMetaEnv(DirectRLEnv):
             ],
             dim=-1,
         )
-
+        # --- Oracle: append true payload mass (normalized to [0,1]) ---
+        if getattr(self.cfg, "use_oracle_mass_obs", False):
+            lo, hi = self.cfg.payload_mass_range
+            denom = max(float(hi) - float(lo), 1e-6)
+            m_norm = (self._payload_mass - float(lo)) / denom
+            m_norm = torch.clamp(m_norm, 0.0, 1.0).unsqueeze(-1)  # (num_envs,1)
+            obs = torch.cat([obs, m_norm], dim=-1)
+            
         return {"policy": obs}
 
 
@@ -398,6 +405,14 @@ class UavPayloadMetaEnv(DirectRLEnv):
             # 记录到 device tensor（便于log）
             self._payload_mass[env_ids] = new_mass.to(self.device)
 
+        # --- TB logging: payload mass for newly reset envs (new episode) ---
+        m = self._payload_mass[env_ids]  # (len(env_ids),)
+        extras = dict()
+        extras["Metrics/payload_mass_true_mean"] = float(m.mean().item())
+        extras["Metrics/payload_mass_true_min"]  = float(m.min().item())
+        extras["Metrics/payload_mass_true_max"]  = float(m.max().item())
+        self.extras["log"].update(extras)
+        
         
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs:

@@ -83,7 +83,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     decimation = 2                      # 每执行一次 RL action，物理 step 多少次
     episode_length_s = 35.0             # 一局多长时间（秒）
     action_space = 4
-    observation_space = 17
+    observation_space = 18
     state_space = 0
     debug_vis = True
 
@@ -126,7 +126,8 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
     rope_length = 0.8
-
+    
+    use_oracle_mass_obs = True
     payload_mass_range = (0.05, 0.5)   # kg，每个episode随机
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
 
