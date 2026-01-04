@@ -40,7 +40,7 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
     spawn=sim_utils.UsdFileCfg(
         # TODO：如果你改过路径，这里换成你真实的 iris_payload.usd 路径
-        usd_path="/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/iris_payload.usd",
+        usd_path="/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_meta/iris_payload_prismatic.usd",
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=10.0,
@@ -57,10 +57,11 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         # 这里我按你之前 peg 项目约定：payload 初始大概在 z=0.4，绳长 0.8 ⇒ UAV z≈1.2
-        pos=(0.0, 0.0, 1.2),
+        pos=(0.0, 0.0, 2.0),
         # 所有关节初始角度 = 0
         joint_pos={
-            ".*": 0.0,
+            r"^(?!rope_joint).*": 0.0,
+            "rope_joint": -0.8, # 【关键】给绳长关节一个合法的初值 (-1.5 ~ -0.1 之间)
         },
         # 所有关节初始角速度 = 0（不像 CRAZYFLIE 那样给螺旋桨预转速）
         joint_vel={
@@ -68,11 +69,19 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
         },
     ),
     actuators={
-        # 和 CRAZYFLIE 一样，挂一个 dummy actuator，让 articulation 在 IsaacLab 里是“有执行器的”
+        # 1. 螺旋桨等普通关节 (保持不变)
         "dummy": ImplicitActuatorCfg(
-            joint_names_expr=[".*"],
+            joint_names_expr=[r"^(?!rope_joint).*"], 
             stiffness=0.0,
             damping=0.0,
+        ),
+        # 2. 【新增】绳长关节 Actuator
+        # 加上这个后，Isaac Lab 会自动把 init_state 里的 -0.8 也应用给 Drive Target
+        # 这样初始时刻 Target=-0.8, Pos=-0.8, 力=0，就不会炸了！
+        "rope_winch": ImplicitActuatorCfg(
+            joint_names_expr=["rope_joint"],
+            stiffness=100.0,  # 在这里指定刚度，覆盖 USD
+            damping=5.0,      # 在这里指定阻尼，覆盖 USD
         ),
     },
 )
@@ -125,10 +134,10 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     moment_scale = 0.4 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
     
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
-    rope_length = 0.8
+    rope_length_range = (0.3, 0.8)  # 绳长随机范围 (米)
     
     use_oracle_mass_obs = True
-    payload_mass_range = (0.05, 0.5)   # kg，每个episode随机
+    payload_mass_range = (0.05, 0.15)   # kg，每个episode随机
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
 
     # 场景：并行 env 数 / 间距
@@ -155,8 +164,8 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     #斜飞start_pos_w = (0.5, 1.0, 1.2)
     #平飞start_pos_w = (2.0, 0.0, 1.2)
-    start_pos_w = (-2.0, 0.0, 1.2)
+    start_pos_w = (-2.0, 0.0, 2.0)
     # payload 终点用于reward：0.5 1 0.4 → -0.5 0 1.2
     #斜飞goal_pos_w = (-0.5, 0.0, 1.2)
     #平飞goal_pos_w = (-2.0, 0.0, 1.2)
-    goal_pos_w = (2.0, 0.0, 1.2)
+    goal_pos_w = (2.0, 0.0, 2.0)

@@ -67,7 +67,34 @@ class UavPayloadMetaEnv(DirectRLEnv):
         if len(payload_ids) == 0:
             raise RuntimeError("UavPayloadLabEnv: cannot find payload body named 'link'.")
         self._payload_id = payload_ids[0]  # int，用来写 p_load_w = body_pos_w[:, self._payload_id, :]
-        
+        # --- [新增] 获取 Prismatic Joint (绳长关节) 的索引 ---
+        # 你的 USD 里关节名字叫 "PrismaticJoint"
+        rope_joint_indices, _ = self._robot.find_joints("rope_joint")
+        if len(rope_joint_indices) == 0:
+            # 容错：防止你 USD 里还没改名成功，保留一个旧名字的查找
+            rope_joint_indices, _ = self._robot.find_joints("PrismaticJoint")
+            
+        if len(rope_joint_indices) == 0:
+            raise RuntimeError("Cannot find 'rope_joint' in USD! Please check joint name.")
+        self._rope_joint_idx = rope_joint_indices[0]
+
+        # --- [新增] 初始化记录绳长的 tensor ---
+        self._rope_lengths = torch.zeros(self.num_envs, device=self.device)
+        # 1) 找关节（建议你把 USD 里的 PrismaticJoint prim 改名 rope_joint）
+        self._rope_joint_id = self._robot.find_joints("rope_joint")[0][0]   # 取第一个匹配到的 joint index
+
+        # 2) 计算 F_max（固定：只看 UAV body 质量）
+        g = float(self.cfg.sim.gravity[2]) if hasattr(self.cfg.sim, "gravity") else -9.81
+        g = abs(g)
+
+        masses0 = self._robot.root_physx_view.get_masses()[0]  # (num_bodies,)
+        uav_mass = float(masses0[self._body_id[0]].item())     # 只取 body 的质量
+        self._F_max = self.cfg.thrust_to_weight * (uav_mass * g)
+
+        # 3) 每个 env 的绳长 / 悬停推力 buffer
+        # self._rope_len = torch.full((self.num_envs,), self.cfg.rope_length, device=self.device)
+        self._F_hover = torch.full((self.num_envs,), uav_mass * g, device=self.device)  # 先给个初值
+
         # 缓存默认 mass / inertia（用于每次reset从“默认值”开始随机）
         self._default_masses_cpu = self._robot.root_physx_view.get_masses().clone()     # (num_envs, num_bodies) on CPU
         self._default_inertias_cpu = self._robot.root_physx_view.get_inertias().clone() # (num_envs, num_bodies, 9) on CPU
@@ -140,7 +167,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # --- 2) 摆角 + 摆角角速度 ----------------------------------------
         # rope 长度，用 cfg 中的参数（标量）
-        L = self.cfg.rope_length
+        L = self._rope_lengths  # 保持 (num_envs,) 维度，不要 unsqueeze
 
         # 近似：摆角 θx, θy（世界系）—— 和你原来的定义保持一致
         ex = r_load_uav[:, 0]
@@ -241,10 +268,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 归一化摆能量 E_hat（小角度线性摆近似，单位：rad^2/s^2）
         # E_hat = 0.5*(||theta_dot||^2 + (g/L)*||theta||^2)，用于诊断/画图，不进入 reward
         g = 9.81
-        L = float(self.cfg.rope_length)
+        L = self._rope_lengths # Tensor (num_envs,)
         theta_dot_rad_s = swing_deg_s * (math.pi / 180.0)
-        E_hat = 0.5 * (theta_dot_rad_s * theta_dot_rad_s + (g / max(L, 1e-6)) * (theta_rad * theta_rad))
-        # 记录时间平均：episode_sums 累加的是 ∑ E_hat * dt，reset 时再除以 T
+        E_hat = 0.5 * (theta_dot_rad_s * theta_dot_rad_s + (g / torch.clamp(L, min=1e-6)) * (theta_rad * theta_rad))        # 记录时间平均：episode_sums 累加的是 ∑ E_hat * dt，reset 时再除以 T
         E_hat_mean_dt = E_hat * self.step_dt
         # === 3. 计算各项奖励组件 ===
         
@@ -359,91 +385,106 @@ class UavPayloadMetaEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
-        # 计算本局的步数 / 时间（每个 env 自己的）
-        ep_steps = self.episode_length_buf[env_ids].float().clamp(min=1.0)
-        ep_time  = ep_steps * self.step_dt  # 单位：秒
-
-        # Logging
-        p_load_w = self._robot.data.body_pos_w[env_ids, self._payload_id, :]
-        goal_payload_w = self._desired_pos_w[env_ids]
-        final_distance_to_goal = torch.linalg.norm(goal_payload_w - p_load_w, dim=1).mean()
-
-        extras = dict()
-        for key in self._episode_sums.keys():
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
-            self._episode_sums[key][env_ids] = 0.0
-        self.extras["log"] = dict()
-        self.extras["log"].update(extras)
-        extras = dict()
-        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
-        self.extras["log"].update(extras)
-
+        
+        # 1. 重置 Robot (清除之前的速度、力等)
         self._robot.reset(env_ids)
-        
-        # --- Domain Randomization: payload mass (episode-level) ---
-        if hasattr(self.cfg, "payload_mass_range") and self.cfg.payload_mass_range is not None:
-            lo, hi = self.cfg.payload_mass_range
-            env_ids_cpu = env_ids.to("cpu")
 
-            # 从默认值拷贝再修改（避免“随机叠加到随机”）
-            masses = self._default_masses_cpu.clone()
-            new_mass = torch.empty((len(env_ids_cpu),), device="cpu").uniform_(float(lo), float(hi))
-            masses[env_ids_cpu, self._payload_id] = new_mass
-            self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
+        # 2. 获取默认状态
+        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
+        default_root_state = self._robot.data.default_root_state[env_ids].clone()
 
-            # 可选：按比例缩放 inertia（官方也是这么干的）
-            if getattr(self.cfg, "recompute_inertia", True):
-                inertias = self._default_inertias_cpu.clone()
-                default_mass = self._default_masses_cpu[env_ids_cpu, self._payload_id].clamp(min=1e-6)
-                ratio = (new_mass / default_mass).unsqueeze(-1)  # (N,1)
-                inertias[env_ids_cpu, self._payload_id] = self._default_inertias_cpu[env_ids_cpu, self._payload_id] * ratio
-                self._robot.root_physx_view.set_inertias(inertias, env_ids_cpu)
+        # 3. 绳长随机化 & 设置关节目标 (核心修复!)
+        if hasattr(self.cfg, "rope_length_range"):
+            lo_len, hi_len = self.cfg.rope_length_range
+            L = torch.rand(len(env_ids), device=self.device) * (hi_len - lo_len) + lo_len
+            self._rope_lengths[env_ids] = L
+            
+            # (A) 设置状态：告诉物理引擎现在绳子有多长
+            target_pos = -1.0 * L
+            joint_pos[:, self._rope_joint_idx] = target_pos
+            joint_vel[:, self._rope_joint_idx] = 0.0
 
-            # 记录到 device tensor（便于log）
-            self._payload_mass[env_ids] = new_mass.to(self.device)
+            # (B) 【关键修复】设置 Drive Target：告诉弹簧“你就停在这个长度，别乱拉”
+            # 注意：set_joint_position_target 需要 (num_envs, 1) 的维度
+            self._robot.set_joint_position_target(
+                target_pos.view(-1, 1), 
+                env_ids=env_ids, 
+                joint_ids=[self._rope_joint_idx]
+            )
+        else:
+            # 如果没有随机化配置，给个默认值防止报错
+            self._rope_lengths[env_ids] = 0.8 
 
-        # --- TB logging: payload mass for newly reset envs (new episode) ---
-        m = self._payload_mass[env_ids]  # (len(env_ids),)
-        extras = dict()
-        extras["Metrics/payload_mass_true_mean"] = float(m.mean().item())
-        extras["Metrics/payload_mass_true_min"]  = float(m.min().item())
-        extras["Metrics/payload_mass_true_max"]  = float(m.max().item())
-        self.extras["log"].update(extras)
-        
-        
-        super()._reset_idx(env_ids)
-        if len(env_ids) == self.num_envs:
-            # Spread out the resets to avoid spikes in training when many environments reset at a similar time
-            self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
-
-        self._actions[env_ids] = 0.0
-        # Sample new commands
-        # self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-2.0, 2.0)
-        # self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
-        # self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.5)
-        
-        # Reset robot state
-        joint_pos = self._robot.data.default_joint_pos[env_ids]
-        joint_vel = self._robot.data.default_joint_vel[env_ids]
-        default_root_state = self._robot.data.default_root_state[env_ids]
-        # 每个 env 的原点（平铺用）
+        # 4. 计算出生位置 (使用 Config 里的 start_pos_w)
+        # 加上 env_origins，让无人机分散开，不要叠在一起
         env_origins = self._terrain.env_origins[env_ids]
         default_root_state[:, :3] = env_origins + self._start_offset
-        # UAV 目标点（世界系）= env_origin + goal_offset
+
+        # 设置目标点
         self._desired_pos_w[env_ids] = env_origins + self._goal_offset
         
+        # 5. 写入物理引擎
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
-        # reset 摆角历史，用于新 episode 的角速度差分
+        # 6. 重置历史 Buffer (用于摆角速度计算)
         if isinstance(self._prev_tilt_deg, torch.Tensor):
             self._prev_tilt_deg[env_ids] = 0.0
             self._tilt_vel_deg[env_ids] = 0.0
             self._has_prev_tilt[env_ids] = False
+            
+        # 7. 日志记录 (Extras Logging) - 放在最后以免被 reset 清空
+        self._log_extras(env_ids)
+
+        # 8. 父类逻辑 (必须调用)
+        super()._reset_idx(env_ids)
+        
+        # 9. 错峰 Reset (Spread out)
+        if len(env_ids) == self.num_envs:
+            self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+        
+        self._actions[env_ids] = 0.0
+
+    # 辅助函数：把原来乱七八糟的 logging 移出来，保持主函数干净
+    def _log_extras(self, env_ids):
+        # Logging Payload Mass
+        m = self._payload_mass[env_ids]
+        extras = dict()
+        extras["Metrics/payload_mass_true_mean"] = float(m.mean().item())
+        extras["Metrics/payload_mass_true_min"]  = float(m.min().item())
+        extras["Metrics/payload_mass_true_max"]  = float(m.max().item())
+        
+        # Logging Rope Length
+        l = self._rope_lengths[env_ids]
+        extras["Metrics/rope_length_mean"] = float(l.mean().item())
+        extras["Metrics/rope_length_min"]  = float(l.min().item())
+        extras["Metrics/rope_length_max"]  = float(l.max().item())
+
+        # Logging Joint Pos Mean (Debug)
+        jp = self._robot.data.joint_pos[env_ids, self._rope_joint_idx]
+        extras["Metrics/rope_joint_pos_mean"] = float(jp.mean().item())
+        
+        # Logging Termination Stats
+        root_pos = self._robot.data.root_pos_w[env_ids]
+        env_origins = self._terrain.env_origins[env_ids]
+        rel_pos = root_pos - env_origins
+        height_fail = torch.logical_or(root_pos[:, 2] < 0.1, root_pos[:, 2] > 6.0)
+        out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
+        extras["Debug/died_height"] = int(torch.count_nonzero(height_fail).item())
+        extras["Debug/died_out_of_box"] = int(torch.count_nonzero(out_of_box).item())
+
+        # Logging Distance
+        p_load_w = self._robot.data.body_pos_w[env_ids, self._payload_id, :]
+        goal_payload_w = self._desired_pos_w[env_ids]
+        final_distance_to_goal = torch.linalg.norm(goal_payload_w - p_load_w, dim=1).mean()
+        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+
+        # Update Extras
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
+        self.extras["log"].update(extras)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first time
