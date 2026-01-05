@@ -61,7 +61,7 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
         # 所有关节初始角度 = 0
         joint_pos={
             r"^(?!rope_joint).*": 0.0,
-            "rope_joint": -0.8, # 【关键】给绳长关节一个合法的初值 (-1.5 ~ -0.1 之间)
+            "rope_joint": -0.8, # 这里的数值必须和usd的drive target对上，不然初始第一帧就会拉扯到爆炸【关键】给绳长关节一个合法的初值 (-1.5 ~ -0.1 之间)
         },
         # 所有关节初始角速度 = 0（不像 CRAZYFLIE 那样给螺旋桨预转速）
         joint_vel={

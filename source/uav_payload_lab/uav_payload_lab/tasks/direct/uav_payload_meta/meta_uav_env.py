@@ -63,7 +63,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._body_id = body_ids  # list[int]，用于 set_external_force_and_torque 的 body_ids
 
         # payload 刚体：这里只需要「一个具体 body index」用于 body_pos_w 的第二维索引
-        payload_ids, payload_names = self._robot.find_bodies("link")
+        payload_ids, payload_names = self._robot.find_bodies(r"^(?!.*winch).*link")
         if len(payload_ids) == 0:
             raise RuntimeError("UavPayloadLabEnv: cannot find payload body named 'link'.")
         self._payload_id = payload_ids[0]  # int，用来写 p_load_w = body_pos_w[:, self._payload_id, :]
@@ -385,7 +385,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
-        
+        # 必须在 reset 物理状态之前记录，否则位置都被重置了，永远查不到死因
+        self._log_termination_stats(env_ids)
+
         # 1. 重置 Robot (清除之前的速度、力等)
         self._robot.reset(env_ids)
 
@@ -415,12 +417,25 @@ class UavPayloadMetaEnv(DirectRLEnv):
         else:
             # 如果没有随机化配置，给个默认值防止报错
             self._rope_lengths[env_ids] = 0.8 
-
+        # 5. 质量随机化 (你之前的代码好像漏了这一段，我帮你补上，为了Log正确)
+        if hasattr(self.cfg, "payload_mass_range"):
+            lo, hi = self.cfg.payload_mass_range
+            env_ids_cpu = env_ids.to("cpu")
+            # 假设你已经缓存了 _default_masses_cpu
+            masses = self._default_masses_cpu.clone() 
+            new_mass = torch.empty((len(env_ids_cpu),), device="cpu").uniform_(float(lo), float(hi))
+            masses[env_ids_cpu, self._payload_id] = new_mass
+            self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
+            # 记录到 buffer
+            self._payload_mass[env_ids] = new_mass.to(self.device)
+        
+        # === 6.【关键修改】随机化完参数后，立刻记本局参数 ===
+        # 确保记录的是新一局的真实质量和绳长
+        self._log_task_config(env_ids)
         # 4. 计算出生位置 (使用 Config 里的 start_pos_w)
         # 加上 env_origins，让无人机分散开，不要叠在一起
         env_origins = self._terrain.env_origins[env_ids]
         default_root_state[:, :3] = env_origins + self._start_offset
-
         # 设置目标点
         self._desired_pos_w[env_ids] = env_origins + self._goal_offset
         
@@ -434,9 +449,6 @@ class UavPayloadMetaEnv(DirectRLEnv):
             self._prev_tilt_deg[env_ids] = 0.0
             self._tilt_vel_deg[env_ids] = 0.0
             self._has_prev_tilt[env_ids] = False
-            
-        # 7. 日志记录 (Extras Logging) - 放在最后以免被 reset 清空
-        self._log_extras(env_ids)
 
         # 8. 父类逻辑 (必须调用)
         super()._reset_idx(env_ids)
@@ -447,43 +459,53 @@ class UavPayloadMetaEnv(DirectRLEnv):
         
         self._actions[env_ids] = 0.0
 
-    # 辅助函数：把原来乱七八糟的 logging 移出来，保持主函数干净
-    def _log_extras(self, env_ids):
-        # Logging Payload Mass
+    # --- 新增辅助函数 1：记录结束状态 (放 Reset 前) ---
+    def _log_termination_stats(self, env_ids):
+        extras = dict()
+        # 1. Final Distance
+        p_load_w = self._robot.data.body_pos_w[env_ids, self._payload_id, :]
+        goal_w = self._desired_pos_w[env_ids]
+        final_dist = torch.linalg.norm(goal_w - p_load_w, dim=1).mean()
+        
+        # 2. Died Reason
+        root_pos = self._robot.data.root_pos_w[env_ids]
+        env_origins = self._terrain.env_origins[env_ids]
+        
+        height_fail = torch.logical_or(root_pos[:, 2] < 0.1, root_pos[:, 2] > 6.0)
+        out_of_box = torch.any(torch.abs(root_pos - env_origins) > 6.0, dim=1)
+        # 遍历所有累加器，计算平均值 (Total Sum / Max Time)
+        for key in self._episode_sums.keys():
+            # 取出这些 env 的累加值
+            avg = torch.mean(self._episode_sums[key][env_ids])
+            
+            # 写入 Log (加前缀 Episode_Reward 以便在 TB 里分类显示)
+            extras["Episode_Reward/" + key] = avg / self.max_episode_length_s
+            
+            # 【重要】清零！否则下个 episode 会无限累加
+            self._episode_sums[key][env_ids] = 0.0
+        extras = dict()
+        extras["Metrics/final_distance_to_goal"] = final_dist.item()
+        extras["Debug/died_height"] = int(torch.count_nonzero(height_fail).item())
+        extras["Debug/died_out_of_box"] = int(torch.count_nonzero(out_of_box).item())
+
+        if "log" not in self.extras: self.extras["log"] = dict()
+        self.extras["log"].update(extras)
+
+    # --- 新增辅助函数 2：记录任务配置 (放 Reset 后) ---
+    def _log_task_config(self, env_ids):
         m = self._payload_mass[env_ids]
+        l = self._rope_lengths[env_ids]
+        
         extras = dict()
         extras["Metrics/payload_mass_true_mean"] = float(m.mean().item())
         extras["Metrics/payload_mass_true_min"]  = float(m.min().item())
         extras["Metrics/payload_mass_true_max"]  = float(m.max().item())
         
-        # Logging Rope Length
-        l = self._rope_lengths[env_ids]
         extras["Metrics/rope_length_mean"] = float(l.mean().item())
         extras["Metrics/rope_length_min"]  = float(l.min().item())
         extras["Metrics/rope_length_max"]  = float(l.max().item())
 
-        # Logging Joint Pos Mean (Debug)
-        jp = self._robot.data.joint_pos[env_ids, self._rope_joint_idx]
-        extras["Metrics/rope_joint_pos_mean"] = float(jp.mean().item())
-        
-        # Logging Termination Stats
-        root_pos = self._robot.data.root_pos_w[env_ids]
-        env_origins = self._terrain.env_origins[env_ids]
-        rel_pos = root_pos - env_origins
-        height_fail = torch.logical_or(root_pos[:, 2] < 0.1, root_pos[:, 2] > 6.0)
-        out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
-        extras["Debug/died_height"] = int(torch.count_nonzero(height_fail).item())
-        extras["Debug/died_out_of_box"] = int(torch.count_nonzero(out_of_box).item())
-
-        # Logging Distance
-        p_load_w = self._robot.data.body_pos_w[env_ids, self._payload_id, :]
-        goal_payload_w = self._desired_pos_w[env_ids]
-        final_distance_to_goal = torch.linalg.norm(goal_payload_w - p_load_w, dim=1).mean()
-        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
-
-        # Update Extras
-        if "log" not in self.extras:
-            self.extras["log"] = dict()
+        if "log" not in self.extras: self.extras["log"] = dict()
         self.extras["log"].update(extras)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
