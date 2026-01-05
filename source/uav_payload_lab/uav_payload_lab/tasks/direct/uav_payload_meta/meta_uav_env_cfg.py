@@ -81,7 +81,7 @@ IRIS_PAYLOAD_CFG = ArticulationCfg(
         "rope_winch": ImplicitActuatorCfg(
             joint_names_expr=["rope_joint"],
             stiffness=100.0,  # 在这里指定刚度，覆盖 USD
-            damping=5.0,      # 在这里指定阻尼，覆盖 USD
+            damping=10.0,      # 在这里指定阻尼，覆盖 USD
         ),
     },
 )
