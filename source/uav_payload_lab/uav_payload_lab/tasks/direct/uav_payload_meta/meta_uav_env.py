@@ -226,12 +226,23 @@ class UavPayloadMetaEnv(DirectRLEnv):
             dim=-1,
         )
         # --- Oracle: append true payload mass (normalized to [0,1]) ---
+         # --- 3) 全知模式拼接 (Oracle Mode) ---
+        # 如果 Config 里开了 True，就把 Mass 和 Length 拼进去
         if getattr(self.cfg, "use_oracle_mass_obs", False):
-            lo, hi = self.cfg.payload_mass_range
-            denom = max(float(hi) - float(lo), 1e-6)
-            m_norm = (self._payload_mass - float(lo)) / denom
-            m_norm = torch.clamp(m_norm, 0.0, 1.0).unsqueeze(-1)  # (num_envs,1)
-            obs = torch.cat([obs, m_norm], dim=-1)
+            # A. 处理 Mass
+            lo_m, hi_m = self.cfg.payload_mass_range
+            denom_m = max(float(hi_m) - float(lo_m), 1e-6)
+            m_norm = (self._payload_mass - float(lo_m)) / denom_m
+            m_norm = torch.clamp(m_norm, 0.0, 1.0).unsqueeze(-1)
+            
+            # B. 处理 Rope Length
+            lo_l, hi_l = self.cfg.rope_length_range
+            denom_l = max(float(hi_l) - float(lo_l), 1e-6)
+            l_norm = (self._rope_lengths - float(lo_l)) / denom_l 
+            l_norm = torch.clamp(l_norm, 0.0, 1.0).unsqueeze(-1)
+
+            # C. 拼接：17 + 1 + 1 = 19
+            obs = torch.cat([obs, m_norm, l_norm], dim=-1)
             
         return {"policy": obs}
 
