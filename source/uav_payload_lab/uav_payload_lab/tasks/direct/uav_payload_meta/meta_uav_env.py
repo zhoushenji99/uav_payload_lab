@@ -36,8 +36,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # Goal position
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
         # ★ 任务：起点 / 终点（相对 env_origin 的偏移）
-        self._start_offset = torch.tensor(cfg.start_pos_w, dtype=torch.float, device=self.device)
-        self._goal_offset  = torch.tensor(cfg.goal_pos_w,  dtype=torch.float, device=self.device)
+        # 我们可以给它一个随机初始值，防止4096个环境在同一帧同时换目标（造成卡顿）
+        self._goal_timer = torch.zeros(self.num_envs, device=self.device).uniform_(0.0, self.cfg.goal_change_interval)        
+        # self._start_offset = torch.tensor(cfg.start_pos_w, dtype=torch.float, device=self.device)
+        # self._goal_offset  = torch.tensor(cfg.goal_pos_w,  dtype=torch.float, device=self.device)
                 # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -133,6 +135,24 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._raw_actions = actions.clone()
+        # === [修改] 纯定时器逻辑 ===
+        # 1. 计时
+        self._goal_timer += self.step_dt
+        
+        # 2. 检查是否超时
+        # 只要时间到了，必须换目标，不管你飞到了哪里
+        time_out_mask = self._goal_timer > self.cfg.goal_change_interval
+        
+        # 3. 执行刷新
+        if torch.any(time_out_mask):
+            env_ids_refresh = time_out_mask.nonzero(as_tuple=False).flatten()
+            
+            # 换新目标
+            self._sample_new_goals(env_ids_refresh)
+            
+            # 计时器归零
+            self._goal_timer[env_ids_refresh] = 0.0
+        # ==========================
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
         self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
@@ -446,10 +466,24 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 4. 计算出生位置 (使用 Config 里的 start_pos_w)
         # 加上 env_origins，让无人机分散开，不要叠在一起
         env_origins = self._terrain.env_origins[env_ids]
-        default_root_state[:, :3] = env_origins + self._start_offset
-        # 设置目标点
-        self._desired_pos_w[env_ids] = env_origins + self._goal_offset
+        # default_root_state[:, :3] = env_origins + self._start_offset
+        # # 设置目标点
+        # self._desired_pos_w[env_ids] = env_origins + self._goal_offset
+        # (A) 随机生成无人机出生点 (范围稍微比目标范围小一点，比如 -2 到 2)
+        start_x = torch.empty(len(env_ids), device=self.device).uniform_(-2.0, 2.0)
+        start_y = torch.empty(len(env_ids), device=self.device).uniform_(-2.0, 2.0)
+        start_z = torch.empty(len(env_ids), device=self.device).uniform_(1.5, 2.0)
         
+        # 赋值给 default_root_state
+        default_root_state[:, 0] = env_origins[:, 0] + start_x
+        default_root_state[:, 1] = env_origins[:, 1] + start_y
+        default_root_state[:, 2] = start_z
+        # [新增] 重置计时器为 0
+        self._goal_timer[env_ids] = 0.0
+        # (B) 随机生成初始目标点
+        # 直接调用刚才写好的辅助函数
+        self._sample_new_goals(env_ids)
+
         # 5. 写入物理引擎
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
@@ -518,6 +552,27 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         if "log" not in self.extras: self.extras["log"] = dict()
         self.extras["log"].update(extras)
+    
+    def _sample_new_goals(self, env_ids: torch.Tensor):
+        """辅助函数：生成新的随机目标点"""
+        # 1. 读取你在 cfg 里定义的范围
+        range_x = self.cfg.goal_random_range["x"]
+        range_y = self.cfg.goal_random_range["y"]
+        range_z = self.cfg.goal_random_range["z"]
+        
+        # 2. 生成随机坐标 (局部坐标)
+        num_targets = len(env_ids)
+        new_x = torch.empty(num_targets, device=self.device).uniform_(*range_x)
+        new_y = torch.empty(num_targets, device=self.device).uniform_(*range_y)
+        new_z = torch.empty(num_targets, device=self.device).uniform_(*range_z)
+        
+        # 3. 加上环境原点 (转为世界坐标)
+        env_origins = self._terrain.env_origins[env_ids]
+        self._desired_pos_w[env_ids, 0] = env_origins[:, 0] + new_x
+        self._desired_pos_w[env_ids, 1] = env_origins[:, 1] + new_y
+        self._desired_pos_w[env_ids, 2] = new_z
+
+
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first time

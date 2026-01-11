@@ -92,7 +92,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     decimation = 2                      # 每执行一次 RL action，物理 step 多少次
     episode_length_s = 35.0             # 一局多长时间（秒）
     action_space = 4
-    observation_space = 17          #oracle就是19,不是就是17
+    observation_space = 19          #oracle就是19,不是就是17
     state_space = 0
     debug_vis = True
 
@@ -136,7 +136,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
     rope_length_range = (0.3, 0.8)  # 绳长随机范围 (米)
     
-    use_oracle_mass_obs = False
+    use_oracle_mass_obs = True
     payload_mass_range = (0.05, 0.15)   # kg，每个episode随机
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
 
@@ -164,8 +164,17 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     #斜飞start_pos_w = (0.5, 1.0, 1.2)
     #平飞start_pos_w = (2.0, 0.0, 1.2)
-    start_pos_w = (-2.0, 0.0, 2.0)
+    # start_pos_w = (-2.0, 0.0, 2.0)
     # payload 终点用于reward：0.5 1 0.4 → -0.5 0 1.2
     #斜飞goal_pos_w = (-0.5, 0.0, 1.2)
     #平飞goal_pos_w = (-2.0, 0.0, 1.2)
-    goal_pos_w = (2.0, 0.0, 2.0)
+    # goal_pos_w = (2.0, 0.0, 2.0)
+    goal_change_interval = 5.0
+    
+    # 目标生成的空间范围 (World Frame)
+    # 建议设在场地中心，避免飞出界
+    goal_random_range = {
+        "x": (-3.0, 3.0), 
+        "y": (-3.0, 3.0), 
+        "z": (1.0, 2.5)   # 高度范围
+    }
