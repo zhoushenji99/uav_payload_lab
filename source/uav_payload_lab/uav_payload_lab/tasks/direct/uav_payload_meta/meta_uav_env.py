@@ -91,6 +91,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         masses0 = self._robot.root_physx_view.get_masses()[0]  # (num_bodies,)
         uav_mass = float(masses0[self._body_id[0]].item())     # 只取 body 的质量
+        self._uav_mass = uav_mass  # <<< [新增] 缓存 UAV 质量，给风扰用
         self._F_max = self.cfg.thrust_to_weight * (uav_mass * g)
 
         # 3) 每个 env 的绳长 / 悬停推力 buffer
@@ -116,6 +117,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._has_prev_tilt = None
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
+        # Wind disturbance module (optional)
+        self._init_wind_module()
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -156,9 +159,59 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
         self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+        # [新增] wind state update (OU + gust), store wind accel in world frame
+        self._wind_step(self.step_dt)
 
     def _apply_action(self):
-        self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+        # 默认行为：无风扰时保持原逻辑不变
+        if not getattr(self, "_wind_enabled", False):
+            self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+            return
+
+        # 组合外力/外矩：body_ids = [uav_body, payload_body(可选)]
+        body_ids = self._ext_body_ids
+        forces = self._ext_forces_buf
+        torques = self._ext_torques_buf
+        forces.zero_()
+        torques.zero_()
+
+        # --- UAV: thrust/moment (body frame) ---
+        forces[:, 0, :] = self._thrust[:, 0, :]
+        torques[:, 0, :] = self._moment[:, 0, :]
+
+        # --- Wind: compute in world frame -> rotate into each body's frame ---
+        acc_w = self._wind_acc_w  # (N,3) world
+        if self._wind_apply_to_uav:
+            F_uav_w = (self._uav_mass_tensor.unsqueeze(-1) * acc_w) * self._wind_scale_uav
+        else:
+            F_uav_w = torch.zeros_like(acc_w)
+
+        # payload force uses per-env payload mass buffer
+        if self._wind_apply_to_payload and (len(body_ids) > 1):
+            F_pay_w = (self._payload_mass.unsqueeze(-1) * acc_w) * self._wind_scale_payload
+        else:
+            F_pay_w = None
+
+        # quaternions (world)
+        quat_uav_w = self._robot.data.root_quat_w  # (N,4) wxyz
+
+        # UAV wind: world -> uav body frame
+        F_uav_b = self._quat_rotate_inverse(quat_uav_w, F_uav_w)
+        forces[:, 0, :] = forces[:, 0, :] + F_uav_b
+
+        # payload wind: world -> payload body frame
+        if F_pay_w is not None:
+            body_quat_w = getattr(self._robot.data, "body_quat_w", None)
+            if body_quat_w is not None:
+                quat_pay_w = body_quat_w[:, self._payload_id, :]
+            else:
+                quat_pay_w = quat_uav_w  # fallback (不会崩，但不够准)
+
+            F_pay_b = self._quat_rotate_inverse(quat_pay_w, F_pay_w)
+            forces[:, 1, :] = forces[:, 1, :] + F_pay_b
+
+        # apply (forces/torques are in body frame, consistent with your thrust)
+        self._robot.set_external_force_and_torque(forces, torques, body_ids=body_ids)
 
     def _get_observations(self) -> dict:
         """构造 17 维的观察量:
@@ -463,6 +516,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # === 6.【关键修改】随机化完参数后，立刻记本局参数 ===
         # 确保记录的是新一局的真实质量和绳长
         self._log_task_config(env_ids)
+        self._reset_wind(env_ids)
         # 4. 计算出生位置 (使用 Config 里的 start_pos_w)
         # 加上 env_origins，让无人机分散开，不要叠在一起
         env_origins = self._terrain.env_origins[env_ids]
@@ -573,6 +627,149 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._desired_pos_w[env_ids, 2] = new_z
 
 
+    # ---------------------------------------------------------------------
+    # Wind disturbance module (optional)
+    #   - OU smooth noise + piecewise constant gust
+    #   - wind modeled as world-frame acceleration (m/s^2)
+    #   - converted to force via F = m * a, then rotated into body frame
+    # ---------------------------------------------------------------------
+
+    def _init_wind_module(self):
+        self._wind_enabled = bool(getattr(self.cfg, "enable_wind", False))
+
+        # always create buffer to avoid attribute errors
+        self._wind_acc_w = torch.zeros(self.num_envs, 3, device=self.device)
+
+        if not self._wind_enabled:
+            return
+
+        # switches
+        self._wind_apply_to_uav = bool(getattr(self.cfg, "wind_apply_to_uav", True))
+        self._wind_apply_to_payload = bool(getattr(self.cfg, "wind_apply_to_payload", True))
+        self._wind_axis = str(getattr(self.cfg, "wind_axis", "xy")).lower()
+
+        # params
+        self._wind_mean_accel_max = float(getattr(self.cfg, "wind_mean_accel_max", 0.5))
+        self._wind_gust_accel_max = float(getattr(self.cfg, "wind_gust_accel_max", 1.5))
+        self._wind_total_accel_max = float(getattr(self.cfg, "wind_total_accel_max", 3.0))
+        self._wind_gust_dt_min = float(getattr(self.cfg, "wind_gust_dt_min", 0.5))
+        self._wind_gust_dt_max = float(getattr(self.cfg, "wind_gust_dt_max", 2.0))
+        self._wind_ou_theta = float(getattr(self.cfg, "wind_ou_theta", 1.0))
+        self._wind_ou_sigma = float(getattr(self.cfg, "wind_ou_sigma", 1.0))
+        self._wind_scale_uav = float(getattr(self.cfg, "wind_scale_uav", 0.4))
+        self._wind_scale_payload = float(getattr(self.cfg, "wind_scale_payload", 1.0))
+
+        # body ids for external wrench application
+        self._uav_body_idx = int(self._body_id[0])
+        self._ext_body_ids = [self._uav_body_idx]
+        if self._wind_apply_to_payload:
+            self._ext_body_ids.append(int(self._payload_id))
+
+        self._ext_forces_buf = torch.zeros(self.num_envs, len(self._ext_body_ids), 3, device=self.device)
+        self._ext_torques_buf = torch.zeros_like(self._ext_forces_buf)
+
+        # per-env wind states
+        self._wind_mean = torch.zeros(self.num_envs, 3, device=self.device)
+        self._wind_gust = torch.zeros(self.num_envs, 3, device=self.device)
+        self._wind_ou = torch.zeros(self.num_envs, 3, device=self.device)
+        self._wind_t = torch.zeros(self.num_envs, device=self.device)
+        self._wind_t_next = torch.zeros(self.num_envs, device=self.device)
+
+        # UAV mass tensor (constant)
+        self._uav_mass_tensor = torch.full((self.num_envs,), float(getattr(self, "_uav_mass", 1.0)), device=self.device)
+
+        # init for all envs
+        self._reset_wind(self._robot._ALL_INDICES)
+
+    def _reset_wind(self, env_ids: torch.Tensor):
+        if not getattr(self, "_wind_enabled", False):
+            return
+        dev = self.device
+        m = int(env_ids.shape[0])
+
+        # episode-constant mean wind direction (XY)
+        ang = 2.0 * math.pi * torch.rand(m, device=dev)
+        dir_xy = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)  # (m,2)
+        mag = self._wind_mean_accel_max * torch.rand(m, device=dev)
+        mean_xy = dir_xy * mag.unsqueeze(-1)
+        self._wind_mean[env_ids] = torch.cat([mean_xy, torch.zeros(m, 1, device=dev)], dim=-1)
+
+        # clear gust/ou and timers
+        self._wind_gust[env_ids].zero_()
+        self._wind_ou[env_ids].zero_()
+        self._wind_acc_w[env_ids].zero_()
+        self._wind_t[env_ids].zero_()
+
+        dt_next = self._wind_gust_dt_min + (self._wind_gust_dt_max - self._wind_gust_dt_min) * torch.rand(m, device=dev)
+        self._wind_t_next[env_ids] = dt_next
+
+    def _wind_step(self, dt: float):
+        """Update wind state and write self._wind_acc_w (world frame)."""
+        if not getattr(self, "_wind_enabled", False):
+            return
+
+        dev = self.device
+        n = self.num_envs
+
+        # gust: piecewise constant
+        self._wind_t += dt
+        mask = self._wind_t >= self._wind_t_next
+        if mask.any():
+            idx = torch.nonzero(mask).squeeze(-1)
+            m = int(idx.shape[0])
+
+            ang = 2.0 * math.pi * torch.rand(m, device=dev)
+            dir_xy = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+
+            # allow +/- gust along sampled direction
+            mag = self._wind_gust_accel_max * (2.0 * torch.rand(m, device=dev) - 1.0)
+            gust_xy = dir_xy * mag.unsqueeze(-1)
+            self._wind_gust[idx] = torch.cat([gust_xy, torch.zeros(m, 1, device=dev)], dim=-1)
+
+            self._wind_t[idx] = 0.0
+            dt_next = self._wind_gust_dt_min + (self._wind_gust_dt_max - self._wind_gust_dt_min) * torch.rand(m, device=dev)
+            self._wind_t_next[idx] = dt_next
+
+        # OU: smooth, time-varying
+        noise = torch.randn(n, 3, device=dev)
+        if self._wind_axis == "xy":
+            noise[:, 2] = 0.0
+
+        self._wind_ou = self._wind_ou + (-self._wind_ou_theta * self._wind_ou) * dt + self._wind_ou_sigma * math.sqrt(max(dt, 1e-6)) * noise
+        if self._wind_axis == "xy":
+            self._wind_ou[:, 2] = 0.0
+
+        # total accel
+        a_w = self._wind_mean + self._wind_gust + self._wind_ou
+        if self._wind_axis == "xy":
+            a_w[:, 2] = 0.0
+
+        # clamp XY magnitude to avoid blow-ups
+        xy = a_w[:, :2]
+        norm = torch.norm(xy, dim=-1).clamp_min(1e-6)
+        scale = torch.clamp(self._wind_total_accel_max / norm, max=1.0)
+        a_w[:, :2] = xy * scale.unsqueeze(-1)
+        if self._wind_axis == "xy":
+            a_w[:, 2] = 0.0
+
+        self._wind_acc_w = a_w
+
+    # ---------------- Quaternion helpers (wxyz) ----------------
+    @staticmethod
+    def _quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+        return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+    @staticmethod
+    def _quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # v' = v + 2*cross(qvec, cross(qvec,v) + w*v)
+        qw = q[..., 0:1]
+        qv = q[..., 1:4]
+        t = 2.0 * torch.cross(qv, v, dim=-1)
+        return v + qw * t + torch.cross(qv, t, dim=-1)
+
+    @classmethod
+    def _quat_rotate_inverse(cls, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return cls._quat_rotate(cls._quat_conjugate(q), v)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first time

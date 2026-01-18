@@ -139,6 +139,37 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     use_oracle_mass_obs = True
     payload_mass_range = (0.05, 0.15)   # kg，每个episode随机
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
+    # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Wind disturbance (optional)
+    # ---------------------------------------------------------------------
+    enable_wind = True                 # 总开关：True 才启用风扰
+    wind_apply_to_uav = True            # 是否对 UAV 本体施加风扰
+    wind_apply_to_payload = True        # 是否对 payload 刚体施加风扰（你想要的默认就是 True）
+    wind_axis = "xy"                    # "xy"：只水平风；"xyz"：允许垂直扰动（一般先别开）
+
+    # 风扰用“等效加速度”建模（更稳：不同质量不会被同一牛顿力吹飞）
+    wind_mean_accel_max = 0.5           # episode-constant mean wind accel 最大值 (m/s^2)
+    wind_gust_accel_max = 1.5           # gust 加速度幅值 (m/s^2)，每段随机方向/正负
+    wind_total_accel_max = 3.0          # 总风加速度限幅 (m/s^2)
+
+    # gust 分段常值持续时间（秒）
+    wind_gust_dt_min = 0.5
+    wind_gust_dt_max = 2.0
+
+    # OU 平滑噪声参数：dx = -theta*x*dt + sigma*sqrt(dt)*N(0,1)
+    wind_ou_theta = 1.0                 # (1/s) 越大越“拉回 0”，变化更快但更平滑
+    wind_ou_sigma = 1.0                 # (m/s^2 / sqrt(s)) 噪声强度
+
+    # UAV vs payload 受风比例（同一风向，力度不同）
+    wind_scale_uav = 0.4
+    wind_scale_payload = 1.0
+    
+    # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+
 
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
