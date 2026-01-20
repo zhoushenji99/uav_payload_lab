@@ -195,17 +195,8 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     #斜飞start_pos_w = (0.5, 1.0, 1.2)
     #平飞start_pos_w = (2.0, 0.0, 1.2)
-    # start_pos_w = (-2.0, 0.0, 2.0)
+    start_pos_w = (-2.0, 0.0, 2.0)
     # payload 终点用于reward：0.5 1 0.4 → -0.5 0 1.2
     #斜飞goal_pos_w = (-0.5, 0.0, 1.2)
     #平飞goal_pos_w = (-2.0, 0.0, 1.2)
-    # goal_pos_w = (2.0, 0.0, 2.0)
-    goal_change_interval = 5.0
-    
-    # 目标生成的空间范围 (World Frame)
-    # 建议设在场地中心，避免飞出界
-    goal_random_range = {
-        "x": (-3.0, 3.0), 
-        "y": (-3.0, 3.0), 
-        "z": (1.0, 2.5)   # 高度范围
-    }
+    goal_pos_w = (2.0, 0.0, 2.0)
