@@ -294,9 +294,18 @@ class UavPayloadMetaEnv(DirectRLEnv):
             denom_l = max(float(hi_l) - float(lo_l), 1e-6)
             l_norm = (self._rope_lengths - float(lo_l)) / denom_l 
             l_norm = torch.clamp(l_norm, 0.0, 1.0).unsqueeze(-1)
-
-            # C. 拼接：17 + 1 + 1 = 19
-            obs = torch.cat([obs, m_norm, l_norm], dim=-1)
+            # C. 【新增】处理 Wind (转机体系 + 归一化)
+            # 1. 获取世界系风加速度 (N, 3)
+            wind_w = self._wind_acc_w 
+            # 2. 旋转到机体系 (使用当前四元数 root_quat_w)
+            #    _quat_rotate_inverse 是把世界系向量转回机体系
+            wind_b = self._quat_rotate_inverse(root_quat_w, wind_w)
+            # 3. 归一化 (除以配置中的最大风力)
+            #    防止神经网络输入过大，一般除以 wind_total_accel_max
+            max_wind = getattr(self.cfg, "wind_total_accel_max", 3.0)
+            wind_norm = wind_b / max(max_wind, 1e-6)
+            # C. 最终拼接：17 + 1 + 1 + 3 = 22
+            obs = torch.cat([obs, m_norm, l_norm, wind_norm], dim=-1)
             
         return {"policy": obs}
 

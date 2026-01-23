@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class MetaPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
-    max_iterations = 40000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
+    max_iterations = 80000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
     save_interval = 500  #多少个 iteration 存一次 model_*.pt
     experiment_name = "uav_payload_meta_rl" #日志目录名
     policy = RslRlPpoActorCriticCfg(

@@ -92,7 +92,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     decimation = 2                      # 每执行一次 RL action，物理 step 多少次
     episode_length_s = 35.0             # 一局多长时间（秒）
     action_space = 4
-    observation_space = 19          #oracle就是19,不是就是17
+    observation_space = 22          #oracle就是17+2ML+3wind,不是就是17
     state_space = 0
     debug_vis = True
 
