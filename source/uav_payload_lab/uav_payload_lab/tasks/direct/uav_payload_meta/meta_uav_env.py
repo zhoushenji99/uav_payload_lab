@@ -105,9 +105,12 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._payload_mass = torch.zeros(self.num_envs, device=self.device)
 
 
-        self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
-        self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
-        self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
+        # gravity (float)
+        self._gravity_magnitude = float(torch.tensor(self.sim.cfg.gravity).norm().item())
+
+        # per-env weight (num_envs,)
+        masses_cpu = self._robot.root_physx_view.get_masses()  # (num_envs, num_bodies) on CPU
+        self._robot_weight = masses_cpu.sum(dim=1).to(self.device) * self._gravity_magnitude
 
         # 摆角历史（deg）用于计算角速度（deg/s）
         # 摆角历史缓冲区，延迟到首次 _get_observations 再按实际形状创建
@@ -502,7 +505,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
             self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
             # 记录到 buffer
             self._payload_mass[env_ids] = new_mass.to(self.device)
-        
+            self._robot_weight[env_ids] = masses[env_ids_cpu].sum(dim=1).to(self.device) * self._gravity_magnitude
+
         # === 6.【关键修改】随机化完参数后，立刻记本局参数 ===
         # 确保记录的是新一局的真实质量和绳长
         self._log_task_config(env_ids)
