@@ -141,7 +141,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._raw_actions = actions.clone()
         self._actions = actions.clone().clamp(-1.0, 1.0)
-        self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
+        self._thrust[:, 0, 2] = self._F_max * (self._actions[:, 0] + 1.0) / 2.0
         self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
         # [新增] wind state update (OU + gust), store wind accel in world frame
         self._wind_step(self.step_dt)
@@ -374,7 +374,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # [D] 动作平滑惩罚 (r_action) - 新增项，不算在 r_pos 里，算额外惩罚
         # 防止力矩控制时电机高频震荡
-        r_action_val = -0.0 * torch.sum(torch.square(self._actions), dim=1)
+        r_action_val = - self.cfg.action_l2_penalty_scale * torch.sum(torch.square(self._actions), dim=1)
 
         # [E] 死亡惩罚 (death_penalty)
         root_pos = self._robot.data.root_pos_w
@@ -404,9 +404,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # === [新增] 标准 Action L2 Penalty (Effort) ===
         # 惩罚动作幅度的平方。鼓励 Agent 在不需要大机动时回归到 0 (即悬停状态)。
         # 这就是 Omnidrones 和标准控制论文里的 "Control Cost"。
-        r_action_l2 = -self.cfg.action_l2_penalty_scale * (self._raw_actions ** 2).sum(dim=1)        
+        r_action_l2 = -self.cfg.action_l2_penalty_scale * (self._raw_actions ** 2).sum(dim=1)   
+        r_action_total = r_action_l2 #+r_action_raw_val +r_action_val
         # === 4. 总奖励汇总 ===
-        reward = r_pos_val + r_tilt_val + r_swing_val + r_spin_val + r_action_val + death_penalty_vec + r_action_l2
+        reward = r_pos_val + r_tilt_val + r_swing_val  + death_penalty_vec + r_action_total + r_spin_val
         # === 5. Logging (完全兼容你原来的结构) ===
         # 这里为了保持和你 __init__ 中的 keys 一致，我把各项归类
         rewards_dict = {

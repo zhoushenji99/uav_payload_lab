@@ -182,7 +182,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # reward scales
     # === Reward 参数：payload 到点 + 消摆 ===
     sigma_pos = 0.2            # 位置高斯尺度（m）
-    sigma_tilt_deg = 10.0       # 摆角高斯尺度（deg）
+    sigma_tilt_deg = 10.0       # 摆角高斯尺度（deg） 这里本来是10,但为了风扰饱和输出而妥协为40，风扰晃动和reward冲突，agent想拉回来payload但是reward会惩罚大角度
     sigma_swing_deg_s = 10.0   # 摆角角速度高斯尺度（deg/s）
     pos_weight = 0.3           # 位置主项权重
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
