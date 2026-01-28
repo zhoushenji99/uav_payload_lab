@@ -310,7 +310,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
             # C. 最终拼接：17 + 1 + 1 + 3 = 22
             obs = torch.cat([obs, m_norm, l_norm, wind_norm], dim=-1)
             
-        return {"policy": obs}
+        return {"policy": obs,"critic": obs}
 
 
 

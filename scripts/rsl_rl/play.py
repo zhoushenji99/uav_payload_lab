@@ -148,8 +148,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    # --- robust load: model weights only (ignore optimizer mismatch) ---
+    try:
+        runner.load(resume_path)
+    except Exception as e:
+        print(f"[WARN] runner.load failed: {e}")
+        print("[WARN] Fallback: load model_state_dict only (skip optimizer).")
+        ckpt = torch.load(resume_path, map_location=agent_cfg.device)
 
+        policy_nn = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
+        policy_nn.load_state_dict(ckpt["model_state_dict"], strict=False)
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
@@ -291,6 +299,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             # 6. 记录时间
             current_time = timestep * dt
+            # --- add near where you already have policy_nn and obs_tensor ---
+
+            # privileged e is the tail of raw obs in Phase-1: dims [17:22]
+            e_priv = np.zeros(5, dtype=np.float32)
+            if isinstance(obs_tensor, torch.Tensor) and obs_tensor.shape[1] >= 22:
+                e_priv = obs_tensor[0, 17:22].cpu().numpy()
+
+            # z from teacher encoder μ(e)
+            z = np.zeros(getattr(base_env.cfg, "rma_z_dim", 5), dtype=np.float32)
+            if hasattr(policy_nn, "last_z") and (policy_nn.last_z is not None):
+                z = policy_nn.last_z[0].detach().cpu().numpy()
+
+            zexp_dim = getattr(base_env.cfg, "rma_z_exp_dim", 2)
+            z_exp = z[:zexp_dim]
+            z_imp = z[zexp_dim:]
 
             # 7. 打包数据: [Time, UAV..., Payload..., Swing..., Actions..., Commands...]
             csv_data.append([
@@ -309,6 +332,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 a_env_raw[0], a_env_raw[1], a_env_raw[2], a_env_raw[3],
                 a_env_clamp[0], a_env_clamp[1], a_env_clamp[2], a_env_clamp[3],
                 thrust_cmd, moment_cmd[0], moment_cmd[1], moment_cmd[2],
+                e_priv[0], e_priv[1], e_priv[2], e_priv[3], e_priv[4],
+                z[0], z[1], z[2], z[3], z[4],
             ])
             # ==========================
 
@@ -352,7 +377,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "Policy_a0","Policy_a1","Policy_a2","Policy_a3", 
                 "Env_raw_a0","Env_raw_a1","Env_raw_a2","Env_raw_a3", 
                 "Env_clamp_a0","Env_clamp_a1","Env_clamp_a2","Env_clamp_a3", 
-                "Thrust_Cmd","Moment_Cmd_X","Moment_Cmd_Y","Moment_Cmd_Z"
+                "Thrust_Cmd","Moment_Cmd_X","Moment_Cmd_Y","Moment_Cmd_Z",
+                "e_m", "e_l", "e_wx", "e_wy", "e_wz",
+                "z0","z1","z2","z3","z4"
+
             ])
             # 写入数据
             writer.writerows(csv_data)

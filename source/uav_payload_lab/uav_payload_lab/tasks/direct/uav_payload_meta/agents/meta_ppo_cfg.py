@@ -7,7 +7,8 @@ from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 
-
+# 让 IsaacLab 的 eval(class_name) 直接拿到类，不依赖额外 import
+RMA_ACTOR_CRITIC = '__import__("uav_payload_lab.tasks.direct.uav_payload_meta.rma_actor_critic", fromlist=["RMAActorCritic"]).RMAActorCritic'
 @configclass
 class MetaPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
@@ -15,12 +16,18 @@ class MetaPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 500  #多少个 iteration 存一次 model_*.pt
     experiment_name = "uav_payload_meta_rl" #日志目录名
     policy = RslRlPpoActorCriticCfg(
+        class_name=RMA_ACTOR_CRITIC,
+        
         init_noise_std=1.0,     #动作高斯探索噪声初始 std
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         actor_hidden_dims=[128, 128],     #MLP 的层数和宽度
         critic_hidden_dims=[128, 128],
         activation="elu",
+    
+        # --------- critical: avoid negative std crash ----------
+        noise_std_type="log",          # <--- MUST (scalar can go negative)  :contentReference[oaicite:3]{index=3}
+
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,

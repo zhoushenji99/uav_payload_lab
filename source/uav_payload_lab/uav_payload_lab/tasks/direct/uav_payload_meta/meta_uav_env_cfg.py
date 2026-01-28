@@ -150,9 +150,9 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     wind_axis = "xy"                    # "xy"：只水平风；"xyz"：允许垂直扰动（一般先别开）
 
     # 风扰用“等效加速度”建模（更稳：不同质量不会被同一牛顿力吹飞）
-    wind_mean_accel_max = 0.5           # episode-constant mean wind accel 最大值 (m/s^2)
-    wind_gust_accel_max = 1.5           # gust 加速度幅值 (m/s^2)，每段随机方向/正负
-    wind_total_accel_max = 3.0          # 总风加速度限幅 (m/s^2)
+    wind_mean_accel_max = 0.2           # episode-constant mean wind accel 最大值 (m/s^2)
+    wind_gust_accel_max = 0.7           # gust 加速度幅值 (m/s^2)，每段随机方向/正负
+    wind_total_accel_max = 1.5          # 总风加速度限幅 (m/s^2)
 
     # gust 分段常值持续时间（秒）
     wind_gust_dt_min = 0.5
@@ -200,3 +200,13 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     #斜飞goal_pos_w = (-0.5, 0.0, 1.2)
     #平飞goal_pos_w = (-2.0, 0.0, 1.2)
     goal_pos_w = (2.0, 0.0, 2.0)
+    # ---------------- RMA Phase-1 (teacher) ----------------
+    proprio_obs_dim = 17          # 可观测部分
+    privileged_obs_dim = 5        # e_t = [m_norm, l_norm, wind_norm(3)]
+    rma_z_dim = 5                 # z_t dim (这里先设为5，匹配你的“mlw5->z”)
+    rma_z_exp_dim = 2             # z前2维当 z_exp（对应慢变量）
+    rma_use_mu = True             # Phase1: True; Phase2部署/评估: False
+
+    # μ(e)->z 的网络结构（Phase1 联训）
+    rma_mu_hidden_dims = (64, 64)
+    rma_activation = "elu"
