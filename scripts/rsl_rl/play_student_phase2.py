@@ -1,29 +1,56 @@
 # play_student_phase2.py
-# Paper-grade play: record z_hat vs z_teacher, z_rmse, raw/clamped actions, key states, errors, thrust/moment.
+# Phase-2 closed-loop rollout for Teacher vs Student (RMA):
+# - Teacher: z = mu(priv)  (oracle context)
+# - Student: z_hat = encoder(history(proprio + last_action))
+# Logs env{trace_env} to CSV for paper-grade plots (UAV pos, payload pos, swing, z, energy proxies).
+#
+# Key fixes vs your "Ultimate" script:
+# 1) Teacher action input MUST be [proprio(17), z_teacher(5)], NOT [proprio(17), priv(5)].
+# 2) Student encoder input MUST match collect_z_dataset.py: feature_t = [proprio(17), last_action(4)] => 21 dims.
+# 3) Use IsaacLab's hydra_task_config + parse_known_args pattern (same as official play.py) so CLI works.
+
+from __future__ import annotations
 
 import argparse
 import sys
 import os
 import csv
 import time
+import math
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
-import numpy as np
-
 from isaaclab.app import AppLauncher
+import cli_args  # isort: skip
 
-parser = argparse.ArgumentParser(description="Play Phase-2: Teacher policy + Student z_hat, record comprehensive CSV.")
-parser.add_argument("--task", type=str, required=True)
-parser.add_argument("--num_envs", type=int, default=16)
-parser.add_argument("--checkpoint", type=str, required=True, help="Teacher checkpoint (.pt)")
-parser.add_argument("--encoder", type=str, required=True, help="Student encoder .pth")
-parser.add_argument("--max_steps", type=int, default=3000)
-parser.add_argument("--csv", type=str, required=True)
 
-# extra compare
-parser.add_argument("--compare_teacher_action", action="store_true",
-                    help="Also compute action_teacher by feeding z_teacher to policy; record diff.")
+# ----------------------------
+# args
+# ----------------------------
+parser = argparse.ArgumentParser(description="Phase-2 Play: Teacher(mu(priv)) vs Student(encoder(history)) with CSV logging.")
 
+# phase-2 specific
+parser.add_argument("--mode", type=str, default="student", choices=["student", "teacher"])
+parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
+parser.add_argument("--history_len", type=int, default=50)
+parser.add_argument("--trace_env", type=int, default=0, help="Which env index to log to CSV.")
+parser.add_argument("--stop_on_done", action="store_true", default=True, help="Stop when trace_env episode ends (default: True).")
+parser.add_argument("--no_stop_on_done", dest="stop_on_done", action="store_false", help="Do not stop on done; keep running until max_steps.")
+parser.add_argument("--max_steps", type=int, default=2000, help="Max env steps to run (avoid crossing episode boundary).")
+parser.add_argument("--csv", type=str, default="", help="CSV output path. If empty, write into checkpoint folder.")
+
+# standard play args
+parser.add_argument("--task", type=str, default=None)
+parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
+parser.add_argument("--seed", type=int, default=None)
+parser.add_argument("--num_envs", type=int, default=None)
+parser.add_argument("--real-time", action="store_true", default=False, help="Sleep to match wall-clock dt.")
+parser.add_argument("--video", action="store_true", default=False)
+parser.add_argument("--video_length", type=int, default=200)
+parser.add_argument("--disable_fabric", action="store_true", default=False)
+
+cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -31,252 +58,314 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-# SAFE imports after SimulationApp
+# ----------------------------
+# safe imports after SimulationApp
+# ----------------------------
 import gymnasium as gym
 from rsl_rl.runners import OnPolicyRunner
+from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+from isaaclab.utils.assets import retrieve_file_path
+from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
+import isaaclab_tasks  # noqa: F401
 import uav_payload_lab.tasks  # noqa: F401
 
 
+# ----------------------------
+# helpers
+# ----------------------------
+def _get_obs_tensor(obs_td):
+    if isinstance(obs_td, torch.Tensor):
+        return obs_td
+    if hasattr(obs_td, "get") and obs_td.get("policy") is not None:
+        return obs_td["policy"]
+    if isinstance(obs_td, dict) and "policy" in obs_td:
+        return obs_td["policy"]
+    raise RuntimeError(f"Unsupported obs type: {type(obs_td)}")
+
+
+def _safe_load_model_only(runner: OnPolicyRunner, ckpt_path: str):
+    """Load ONLY model (and normalizers if exist). Avoid optimizer mismatch."""
+    ckpt = torch.load(ckpt_path, map_location=runner.device)
+
+    # common keys in rsl_rl / isaaclab
+    if "model_state_dict" in ckpt:
+        runner.alg.policy.load_state_dict(ckpt["model_state_dict"], strict=False)
+    elif "model" in ckpt and isinstance(ckpt["model"], dict):
+        runner.alg.policy.load_state_dict(ckpt["model"], strict=False)
+    elif "state_dict" in ckpt:
+        runner.alg.policy.load_state_dict(ckpt["state_dict"], strict=False)
+    else:
+        # fall back: assume whole ckpt is state_dict
+        runner.alg.policy.load_state_dict(ckpt, strict=False)
+
+    # optional normalizers
+    if "actor_obs_normalizer_state_dict" in ckpt and hasattr(runner.alg.policy, "actor_obs_normalizer"):
+        runner.alg.policy.actor_obs_normalizer.load_state_dict(ckpt["actor_obs_normalizer_state_dict"])
+    if "critic_obs_normalizer_state_dict" in ckpt and hasattr(runner.alg.policy, "critic_obs_normalizer"):
+        runner.alg.policy.critic_obs_normalizer.load_state_dict(ckpt["critic_obs_normalizer_state_dict"])
+
+
+def _default_csv_path(resume_path: str, mode: str) -> str:
+    run_dir = os.path.dirname(resume_path)
+    name = "phase2_teacher.csv" if mode == "teacher" else "phase2_student.csv"
+    return os.path.join(run_dir, name)
+
+
+# ----------------------------
+# student encoder (must match train_student_z.py)
+# ----------------------------
 class CNNStudentEncoder(nn.Module):
     def __init__(self, input_dim=21, history_len=50, output_dim=5):
         super().__init__()
-        self.history_len = history_len
         self.cnn = nn.Sequential(
             nn.Conv1d(input_dim, 64, 5, 1, 2), nn.ReLU(), nn.BatchNorm1d(64),
             nn.Conv1d(64, 128, 3, 1, 1), nn.ReLU(), nn.BatchNorm1d(128),
             nn.Conv1d(128, 64, 3, 1, 1), nn.ReLU(), nn.BatchNorm1d(64),
             nn.Flatten(),
         )
+        flat = 64 * history_len
         self.mlp = nn.Sequential(
-            nn.Linear(64 * history_len, 256), nn.ReLU(),
+            nn.Linear(flat, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, output_dim),
         )
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)  # (B,H,21)->(B,21,H)
         return self.mlp(self.cnn(x))
 
 
-def load_model_only(policy_nn, ckpt_path: str, device: str):
-    ckpt = torch.load(ckpt_path, map_location=device)
-    sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-    policy_nn.load_state_dict(sd, strict=False)
-
-
-def _get_obs_tensor(obs_td):
-    if isinstance(obs_td, torch.Tensor):
-        return obs_td
-    if isinstance(obs_td, dict) and "policy" in obs_td:
-        return obs_td["policy"]
-    if hasattr(obs_td, "get") and obs_td.get("policy") is not None:
-        return obs_td["policy"]
-    raise RuntimeError(f"Unsupported obs type: {type(obs_td)}")
-
-
-@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+@hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg, agent_cfg):
-    env_cfg.scene.num_envs = args_cli.num_envs
-    env = gym.make(args_cli.task, cfg=env_cfg)
+    # ---- cfg wiring (mirror official play.py + collect_z_dataset.py) ----
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+
+    if args_cli.seed is not None:
+        agent_cfg.seed = int(args_cli.seed)
+
+    if args_cli.num_envs is not None:
+        env_cfg.scene.num_envs = int(args_cli.num_envs)
+    env_cfg.seed = int(agent_cfg.seed)
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+
+    # where to load checkpoint
+    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+    if args_cli.checkpoint:
+        resume_path = retrieve_file_path(args_cli.checkpoint)
+    else:
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    log_dir = os.path.dirname(resume_path)
+    env_cfg.log_dir = log_dir
+
+    # ---- env ----
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        env = multi_agent_to_single_agent(env)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    base_env = env.unwrapped
 
-    device = env.unwrapped.device
-    base_env = env.unwrapped  # used for accessing _robot / _thrust / _moment if present
+    # ---- runner + policy ----
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    print(f"[INFO] Loading checkpoint (model-only): {resume_path}")
+    _safe_load_model_only(runner, resume_path)
 
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
-    print(f"[INFO] Loading teacher MODEL ONLY: {args_cli.checkpoint}")
-    load_model_only(runner.alg.policy, args_cli.checkpoint, device=device)
+    policy_nn = runner.alg.policy  # expected RMAActorCritic in your setup
+    policy_nn.eval()
 
-    policy = runner.get_inference_policy(device=device)
-    policy_nn = runner.alg.policy  # RMAActorCritic
-
-    # deployment uses z_hat (no mu(priv) in the forward)
+    # teacher must use mu(priv)
     if hasattr(policy_nn, "use_mu"):
-        policy_nn.use_mu = False
+        policy_nn.use_mu = True
 
-    # load student encoder
-    encoder = CNNStudentEncoder().to(device)
-    encoder.load_state_dict(torch.load(args_cli.encoder, map_location=device))
-    encoder.eval()
+    # ---- student encoder ----
+    encoder = None
+    if args_cli.mode == "student":
+        if not args_cli.encoder:
+            raise ValueError("--mode student requires --encoder path")
+        encoder = CNNStudentEncoder(input_dim=21, history_len=int(args_cli.history_len), output_dim=5).to(env.device)
+        encoder.load_state_dict(torch.load(args_cli.encoder, map_location=env.device))
+        encoder.eval()
+        print(f"[INFO] Loaded student encoder: {args_cli.encoder}")
 
-    # buffers
-    history_len = 50
+    # ---- buffers ----
+    history_len = int(args_cli.history_len)
     proprio_dim = 17
     action_dim = 4
     z_dim = getattr(policy_nn, "z_dim", 5)
-    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=device)
-    last_actions = torch.zeros((env.num_envs, action_dim), device=device)
+    priv_dim = z_dim  # current env appends mlw(5): m_norm, l_norm, wind_norm(3)
 
     obs = env.get_observations()
-    dt = env.unwrapped.step_dt
+    dt = float(base_env.step_dt)
+    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=env.device)
+    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
 
-    # CSV rows (env0 only)
-    rows = []
-    env0 = 0
-    prev_v_w = None
+    trace_env = int(args_cli.trace_env)
+    if trace_env < 0 or trace_env >= env.num_envs:
+        raise ValueError(f"--trace_env {trace_env} out of range. num_envs={env.num_envs}")
 
-    with torch.inference_mode():
-        for t in range(args_cli.max_steps):
-            obs_oracle_td = obs
-            obs_oracle = _get_obs_tensor(obs_oracle_td)  # contains privileged info at 17:22 (oracle)
+    # ---- CSV ----
+    csv_path = args_cli.csv.strip() if args_cli.csv.strip() else _default_csv_path(resume_path, args_cli.mode)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
 
-            # build history input for student
-            proprio = obs_oracle[:, :proprio_dim]
-            feat = torch.cat([proprio, last_actions], dim=1)  # (N,21)
+    header = [
+        "time_s",
+        "mode",
+        # UAV / payload / goal positions
+        "uav_px","uav_py","uav_pz",
+        "payload_px","payload_py","payload_pz",
+        "goal_px","goal_py","goal_pz",
+        # payload error (also obs[0:3])
+        "payload_err_x","payload_err_y","payload_err_z",
+        # swing metrics (from obs)
+        "theta_x_deg","theta_y_deg",
+        "theta_dot_x_deg_s","theta_dot_y_deg_s",
+        # true physical params (from env buffers)
+        "rope_length_m","payload_mass_kg",
+        # priv (obs tail)
+        "priv0","priv1","priv2","priv3","priv4",
+        # z teacher / z hat
+        "zT0","zT1","zT2","zT3","zT4",
+        "zH0","zH1","zH2","zH3","zH4",
+        "z_rmse",
+        # actions
+        "a0_raw","a1_raw","a2_raw","a3_raw",
+        "a0_clamp","a1_clamp","a2_clamp","a3_clamp",
+    ]
+
+    f = open(csv_path, "w", newline="")
+    w = csv.writer(f)
+    w.writerow(header)
+
+    print(f"[INFO] mode={args_cli.mode} num_envs={env.num_envs} max_steps={args_cli.max_steps} stop_on_done={args_cli.stop_on_done}")
+    print(f"[INFO] CSV -> {csv_path}")
+
+    step_count = 0
+    t0 = time.time()
+
+    while simulation_app.is_running() and step_count < int(args_cli.max_steps):
+        start = time.time()
+        with torch.inference_mode():
+            obs_tensor = _get_obs_tensor(obs)  # (N, 22)
+            obs_proprio = obs_tensor[:, :proprio_dim]
+            priv = obs_tensor[:, proprio_dim:proprio_dim + priv_dim]
+
+            # history: [proprio(17), last_action(4)] => 21 dims (MUST match collect_z_dataset.py)
+            feat = torch.cat([obs_proprio, last_actions], dim=1)
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
-            # student z_hat
-            z_hat = encoder(obs_history)  # (N,5)
-
-            # teacher z_teacher from oracle priv (for analysis only)
-            priv = obs_oracle[:, 17:17 + z_dim]
+            # teacher z: mu(priv)
             if hasattr(policy_nn, "mu"):
                 z_teacher = policy_nn.mu(priv)
             else:
-                z_teacher = torch.zeros_like(z_hat)
+                z_teacher = priv
 
-            z_rmse = torch.sqrt(((z_hat - z_teacher) ** 2).mean(dim=1))  # (N,)
-
-            # feed policy with [proprio, z_hat]
-            policy_in = obs_oracle.clone()
-            policy_in[:, 17:17 + z_dim] = z_hat
-
-            obs_in = obs_oracle_td.clone() if hasattr(obs_oracle_td, "clone") else {"policy": policy_in}
-            if isinstance(obs_in, dict):
-                obs_in["policy"] = policy_in
+            # student z_hat
+            if args_cli.mode == "teacher":
+                z_hat = z_teacher
             else:
-                obs_in["policy"] = policy_in
+                z_hat = encoder(obs_history)
+            # ---- build obs dict for policy (RMAActorCritic expects TensorDict/dict with group keys) ----
+            # Start from raw env obs (22-dim): [proprio(17), tail(5)]
+            raw_in = obs_tensor.clone()
 
-            actions_raw = policy(obs_in)
+            if args_cli.mode == "teacher":
+                # Phase-1 teacher: tail is privileged e, policy internally does z=mu(e)
+                if hasattr(policy_nn, "use_mu"):
+                    policy_nn.use_mu = True
+                z_hat_for_policy = priv  # keep original tail as e
+            else:
+                # Phase-2 student: replace tail with z_hat, and policy treats tail as z directly
+                if hasattr(policy_nn, "use_mu"):
+                    policy_nn.use_mu = False
+                raw_in[:, proprio_dim:proprio_dim + priv_dim] = z_hat
+                z_hat_for_policy = z_hat
+
+            # Build obs input for actor. Use existing group names if possible.
+            # Most IsaacLab setups use obs["policy"] only; we also provide "critic" if present.
+            obs_in = {}
+            obs_in["policy"] = raw_in
+            if isinstance(obs, dict) and ("critic" in obs):
+                obs_in["critic"] = raw_in
+
+            # Action inference (returns unclipped action)
+            if not hasattr(policy_nn, "act_inference"):
+                raise RuntimeError("policy_nn has no act_inference(); unexpected policy type.")
+            actions_raw = policy_nn.act_inference(obs_in)
             actions_clamp = actions_raw.clamp(-1.0, 1.0)
 
-            # optional teacher action (for action-diff plots)
-            a_teacher = None
-            if args_cli.compare_teacher_action:
-                policy_in_T = obs_oracle.clone()
-                policy_in_T[:, 17:17 + z_dim] = z_teacher
-                obs_in_T = obs_oracle_td.clone() if hasattr(obs_oracle_td, "clone") else {"policy": policy_in_T}
-                if isinstance(obs_in_T, dict):
-                    obs_in_T["policy"] = policy_in_T
-                else:
-                    obs_in_T["policy"] = policy_in_T
-                a_teacher = policy(obs_in_T).clamp(-1.0, 1.0)
-
-            # step env with clamped actions (match training)
-            step_out = env.step(actions_clamp)
-            if len(step_out) == 4:
-                obs, rewards, dones, infos = step_out
-            else:
-                obs = step_out[0]
-                dones = step_out[2]
-                rewards = None
-                infos = None
+            # step env
+            obs, _, dones, _ = env.step(actions_clamp)
             last_actions = actions_clamp.detach()
 
+            # reset history for done envs
             if torch.any(dones):
                 obs_history[dones] = 0.0
                 last_actions[dones] = 0.0
                 if hasattr(policy_nn, "reset"):
                     policy_nn.reset(dones)
 
-            # ===== env0 metrics =====
-            # from obs layout (proprio):
-            # err(0:3), theta(3:5), theta_dot(5:7), quat(7:11), lin_vel(11:14), ang_vel(14:17)
-            err0 = obs_oracle[env0, 0:3].detach().cpu().numpy()
-            pos_err = float(np.linalg.norm(err0))
-            theta_deg = obs_oracle[env0, 3:5].detach().cpu().numpy()
-            theta_dot_deg_s = obs_oracle[env0, 5:7].detach().cpu().numpy()
+            # ---- log trace env ----
+            e = trace_env
+            # positions from env (more trustworthy than reconstructing)
+            uav_pos = base_env._robot.data.root_pos_w[e].detach().cpu().numpy().tolist()
+            payload_pos = base_env._robot.data.body_pos_w[e, base_env._payload_id, :].detach().cpu().numpy().tolist()
+            goal_pos = base_env._desired_pos_w[e].detach().cpu().numpy().tolist()
+            payload_err = obs_tensor[e, 0:3].detach().cpu().numpy().tolist()
 
-            quat_w = obs_oracle[env0, 7:11].detach().cpu().numpy()
-            v_b = obs_oracle[env0, 11:14].detach().cpu().numpy()
-            w_b = obs_oracle[env0, 14:17].detach().cpu().numpy()
+            theta_x = float(obs_tensor[e, 3].detach().cpu())
+            theta_y = float(obs_tensor[e, 4].detach().cpu())
+            theta_dx = float(obs_tensor[e, 5].detach().cpu())
+            theta_dy = float(obs_tensor[e, 6].detach().cpu())
 
-            # try world vel/acc if available (optional)
-            v_w = None
-            a_w = np.zeros(3)
-            if hasattr(base_env, "_robot") and hasattr(base_env._robot, "data") and hasattr(base_env._robot.data, "root_lin_vel_w"):
-                v_w = base_env._robot.data.root_lin_vel_w[env0].detach().cpu().numpy()
-                if prev_v_w is not None:
-                    a_w = (v_w - prev_v_w) / dt
-                prev_v_w = v_w.copy()
+            rope_L = float(base_env._rope_lengths[e].detach().cpu())
+            pay_m = float(base_env._payload_mass[e].detach().cpu())
 
-            # thrust/moment if available
-            thrust_cmd = float(base_env._thrust[env0, 0, 2].detach().cpu()) if hasattr(base_env, "_thrust") else 0.0
-            moment_cmd = base_env._moment[env0, 0, :].detach().cpu().numpy() if hasattr(base_env, "_moment") else np.zeros(3)
+            priv_e = priv[e].detach().cpu().numpy().tolist()
+            zT = z_teacher[e].detach().cpu().numpy().tolist()
+            zH = z_hat[e].detach().cpu().numpy().tolist()
+            z_rmse = float(torch.sqrt(torch.mean((z_teacher[e] - z_hat[e]) ** 2)).detach().cpu())
 
-            # done flag env0
-            done0 = bool(dones[env0].item()) if isinstance(dones, torch.Tensor) else False
+            a_raw = actions_raw[e].detach().cpu().numpy().tolist()
+            a_clp = actions_clamp[e].detach().cpu().numpy().tolist()
 
-            # action diff if teacher action computed
-            if a_teacher is not None:
-                aT0 = a_teacher[env0].detach().cpu().numpy()
-                aDiff = actions_clamp[env0].detach().cpu().numpy() - aT0
-            else:
-                aT0 = np.zeros(4)
-                aDiff = np.zeros(4)
-
-            rows.append([
-                t * dt,
-                # oracle priv (mlw)
-                *priv[env0].detach().cpu().numpy().tolist(),
-                # z_hat / z_teacher / rmse
-                *z_hat[env0].detach().cpu().numpy().tolist(),
-                *z_teacher[env0].detach().cpu().numpy().tolist(),
-                float(z_rmse[env0].detach().cpu()),
-                # errors / swing
-                pos_err,
-                theta_deg[0], theta_deg[1],
-                theta_dot_deg_s[0], theta_dot_deg_s[1],
-                # quat/vels
-                quat_w[0], quat_w[1], quat_w[2], quat_w[3],
-                v_b[0], v_b[1], v_b[2],
-                w_b[0], w_b[1], w_b[2],
-                a_w[0], a_w[1], a_w[2],
-                # actions raw/clamp
-                *actions_raw[env0].detach().cpu().numpy().tolist(),
-                *actions_clamp[env0].detach().cpu().numpy().tolist(),
-                # optional teacher action + diff
-                *aT0.tolist(),
-                *aDiff.tolist(),
-                # thrust/moment
-                thrust_cmd, moment_cmd[0], moment_cmd[1], moment_cmd[2],
-                # done
-                int(done0),
+            w.writerow([
+                step_count * dt,
+                args_cli.mode,
+                *uav_pos,
+                *payload_pos,
+                *goal_pos,
+                *payload_err,
+                theta_x, theta_y,
+                theta_dx, theta_dy,
+                rope_L, pay_m,
+                *priv_e,
+                *zT,
+                *zH,
+                z_rmse,
+                *a_raw,
+                *a_clp,
             ])
 
-            if (t + 1) % 200 == 0:
-                print(f"t={t+1} | pos_err={pos_err:.3f} | z_rmse(env0)={float(z_rmse[env0]):.3f}")
+            # stop if traced env ended (for single-episode comparability)
+            if bool(args_cli.stop_on_done) and bool(dones[e].item()):
+                print(f"[INFO] trace_env done at step={step_count}. stop_on_done=True -> exit.")
+                break
 
-    os.makedirs(os.path.dirname(args_cli.csv), exist_ok=True)
-    with open(args_cli.csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "time",
-            "priv0","priv1","priv2","priv3","priv4",
-            "zH0","zH1","zH2","zH3","zH4",
-            "zT0","zT1","zT2","zT3","zT4",
-            "z_rmse",
-            "pos_err",
-            "theta_x_deg","theta_y_deg",
-            "theta_dot_x_deg_s","theta_dot_y_deg_s",
-            "quat0","quat1","quat2","quat3",
-            "v_bx","v_by","v_bz",
-            "w_bx","w_by","w_bz",
-            "a_wx","a_wy","a_wz",
-            "a0_raw","a1_raw","a2_raw","a3_raw",
-            "a0_clamp","a1_clamp","a2_clamp","a3_clamp",
-            "a0_T","a1_T","a2_T","a3_T",
-            "a0_diff","a1_diff","a2_diff","a3_diff",
-            "thrust_cmd","moment_x","moment_y","moment_z",
-            "done",
-        ])
-        w.writerows(rows)
-    print(f"[INFO] Saved: {args_cli.csv} rows={len(rows)}")
+        step_count += 1
 
+        # realtime option
+        if args_cli.real_time:
+            sleep_time = dt - (time.time() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    f.close()
     env.close()
+    print(f"[DONE] steps={step_count} wall={time.time()-t0:.2f}s -> {csv_path}")
 
 
 if __name__ == "__main__":

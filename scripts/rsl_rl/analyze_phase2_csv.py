@@ -1,389 +1,470 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Phase2 CSV key-figures generator (paper-focused).
+Analyze phase2 teacher/student CSV and reproduce plots in the style of IsaaclabPlot12.5.py:
+  Fig1  payload position (task frame) + swing angles   (teacher vs student)
+  Fig2  payload swing angles (task frame)              (teacher vs student)
+  Fig3  latent z comparison                            (student zH vs zT, optionally teacher zT)
+  Fig4  energy dissipation verification (E_hat, dE/dt, P_xy, P_param, P_model)
 
-Required figures:
-Fig1) Teacher vs Student: pos & theta_xy swing (5 subplots in one big figure).
-Fig2) Teacher z0..z4 vs Student z0..z4 (5 subplots in one big figure).
-Fig3) priv0..priv4 vs z0..z4 (scatter; 5 subplots in one big figure).
-Fig4) Teacher vs Student: anti-sway energy dissipation rate statistics (one figure).
-
-Run:
-  python3 analyze_phase2_csv.py --csv <payload_phase2_student_full_v2.csv> --out_dir <dir>
-
-Notes:
-- We try to auto-detect teacher/student column pairs with common suffix/prefix patterns.
-- If some columns are missing, we will warn and either fallback or skip that subplot.
+Usage example:
+  python scripts/rsl_rl/analyze_phase2_csv_v2.py \
+    --teacher /path/to/phase2_teacher.csv \
+    --student /path/to/phase2_student.csv \
+    --goal 2 0 2 --start -2 0 2 \
+    --time_window 5
 """
 
-import os
+from __future__ import annotations
+
 import argparse
+from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# -----------------------------
+# ----------------------------
 # Helpers
-# -----------------------------
-def ensure_dir(d):
-    os.makedirs(d, exist_ok=True)
+# ----------------------------
 
-def _first_existing(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
+    if win <= 1:
+        return x
+    x = np.asarray(x, dtype=float)
+    k = np.ones(win, dtype=float) / float(win)
+    return np.convolve(x, k, mode="same")
 
-def find_pair(df, base_name, *, prefer_student_base=True):
+def _safe_unit(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < eps:
+        return np.array([1.0, 0.0], dtype=float)
+    return (v / n).astype(float)
+
+def _gradient(y: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Robust gradient with non-uniform dt support."""
+    y = np.asarray(y, dtype=float)
+    t = np.asarray(t, dtype=float)
+    if len(y) < 3:
+        return np.zeros_like(y)
+    return np.gradient(y, t)
+
+def _infer_origin_from_goal(df: pd.DataFrame, goal_ref: np.ndarray) -> np.ndarray:
     """
-    Find teacher/student columns for a metric.
-
-    Teacher candidates:
-      {base}_T, {base}_teacher, teacher_{base}, T_{base}
-
-    Student candidates:
-      {base}_S, {base}_student, student_{base}, S_{base}, {base}
-
-    If prefer_student_base=True, we use {base} as student when present.
+    If CSV contains goal_px/py/pz in WORLD coordinates and goal_ref is TASK offset (e.g. [2,0,2]),
+    then env_origin ≈ goal_world - goal_ref (constant per run/trace env).
     """
-    t_cands = [
-        f"{base_name}_T", f"{base_name}_teacher", f"teacher_{base_name}", f"T_{base_name}"
+    for c in ["goal_px", "goal_py", "goal_pz"]:
+        if c not in df.columns:
+            return np.zeros(3, dtype=float)
+    ox = np.nanmedian(df["goal_px"].to_numpy(dtype=float) - float(goal_ref[0]))
+    oy = np.nanmedian(df["goal_py"].to_numpy(dtype=float) - float(goal_ref[1]))
+    oz = np.nanmedian(df["goal_pz"].to_numpy(dtype=float) - float(goal_ref[2]))
+    return np.array([ox, oy, oz], dtype=float)
+
+def _ensure_out_dir(out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+def _save_fig(fig, path: Path) -> None:
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+def _canon_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep current phase2 CSV column names, but allow some aliases for older scripts.
+    """
+    rename = {}
+
+    # common aliases
+    alias_groups = [
+        (["time", "t", "t_sec"], "time_s"),
+        (["uav_x", "uav_px_w"], "uav_px"),
+        (["uav_y", "uav_py_w"], "uav_py"),
+        (["uav_z", "uav_pz_w"], "uav_pz"),
+        (["payload_x", "payload_px_w"], "payload_px"),
+        (["payload_y", "payload_py_w"], "payload_py"),
+        (["payload_z", "payload_pz_w"], "payload_pz"),
+        (["theta_x", "swing_x_deg"], "theta_x_deg"),
+        (["theta_y", "swing_y_deg"], "theta_y_deg"),
+        (["theta_dot_x", "swing_vel_x_deg_s"], "theta_dot_x_deg_s"),
+        (["theta_dot_y", "swing_vel_y_deg_s"], "theta_dot_y_deg_s"),
+        (["rope_len", "L", "rope_length"], "rope_length_m"),
+        (["payload_mass"], "payload_mass_kg"),
     ]
-    s_cands = [
-        f"{base_name}_S", f"{base_name}_student", f"student_{base_name}", f"S_{base_name}"
-    ]
-    if prefer_student_base:
-        s_cands.append(base_name)
 
-    col_T = _first_existing(df, t_cands)
-    col_S = _first_existing(df, s_cands)
-
-    return col_T, col_S
-
-def find_dim_cols(df, prefix):
-    cols = [c for c in df.columns if c.startswith(prefix)]
-    def key(c):
-        try:
-            return int(c[len(prefix):])
-        except Exception:
-            return 10**9
-    return sorted(cols, key=key)
-
-def safe_series(df, col):
-    if col is None or col not in df.columns:
-        return None
-    x = df[col].to_numpy(dtype=np.float64)
-    x[~np.isfinite(x)] = np.nan
-    return x
-
-def finite_mask(*arrs):
-    m = None
-    for a in arrs:
-        if a is None:
+    cols_lower = {c.lower(): c for c in df.columns}
+    for aliases, target in alias_groups:
+        if target in df.columns:
             continue
-        mm = np.isfinite(a)
-        m = mm if m is None else (m & mm)
-    if m is None:
-        return None
-    return m
+        for a in aliases:
+            if a in cols_lower:
+                rename[cols_lower[a]] = target
+                break
 
-def savefig(path):
-    plt.tight_layout()
-    plt.savefig(path, dpi=220)
-    plt.close()
+    if rename:
+        df = df.rename(columns=rename)
 
-def get_time(df):
-    # common time column names
-    for c in ["time", "t", "t_sec", "t_s", "sim_time"]:
-        if c in df.columns:
-            t = df[c].to_numpy(dtype=np.float64)
-            t[~np.isfinite(t)] = np.nan
-            return t, c
-    # fallback: step index
-    t = np.arange(len(df), dtype=np.float64)
-    return t, "step"
+    return df
+
+@dataclass
+class Series:
+    name: str
+    df: pd.DataFrame
+    origin_w: np.ndarray
+    start_ref: np.ndarray
+    goal_ref: np.ndarray
+
+    def t(self) -> np.ndarray:
+        return self.df["time_s"].to_numpy(dtype=float)
+
+    def add_task_frame(self) -> None:
+        """Add *_x/_y/_z columns in TASK frame (subtract env origin)."""
+        o = self.origin_w
+        for prefix in ["uav", "payload", "goal"]:
+            for axis, idx in [("x", 0), ("y", 1), ("z", 2)]:
+                wcol = f"{prefix}_p{axis}"
+                if wcol in self.df.columns:
+                    self.df[f"{prefix}_{axis}"] = self.df[wcol].to_numpy(dtype=float) - float(o[idx])
+
+    def add_derivatives(self) -> None:
+        """Add uav_vx/vy/vz and uav_ax/ay/az in TASK frame by numerical differentiation."""
+        t = self.t()
+        for axis in ["x", "y", "z"]:
+            pcol = f"uav_{axis}"
+            if pcol not in self.df.columns:
+                continue
+            p = self.df[pcol].to_numpy(dtype=float)
+            v = _gradient(p, t)
+            a = _gradient(v, t)
+            self.df[f"uav_v{axis}"] = v
+            self.df[f"uav_a{axis}"] = a
+
+    def clip_time(self, t_max: float | None) -> "Series":
+        if t_max is None:
+            return self
+        m = self.t() <= float(t_max)
+        df2 = self.df.loc[m].copy()
+        return Series(self.name, df2, self.origin_w, self.start_ref, self.goal_ref)
+
+def load_series(path: Path, name: str, start_ref: np.ndarray, goal_ref: np.ndarray) -> Series:
+    df = pd.read_csv(path)
+    df = _canon_cols(df)
+    if "time_s" not in df.columns:
+        raise ValueError(f"[{name}] CSV missing time_s column: {path}")
+    origin = _infer_origin_from_goal(df, goal_ref)
+    s = Series(name=name, df=df, origin_w=origin, start_ref=start_ref, goal_ref=goal_ref)
+    s.add_task_frame()
+    s.add_derivatives()
+    return s
 
 
-# -----------------------------
-# Main plotting functions
-# -----------------------------
-def plot_fig1_pos_theta(df, out_png):
-    """
-    Fig1: 5 subplots in a big figure:
-      1) pos_err teacher vs student
-      2) theta_x_deg teacher vs student
-      3) theta_y_deg teacher vs student
-      4) theta_dot_x_deg_s teacher vs student
-      5) theta_dot_y_deg_s teacher vs student
-    """
-    t, tname = get_time(df)
+# ----------------------------
+# Plots
+# ----------------------------
 
-    # metric bases you asked for
-    bases = ["pos_err", "theta_x_deg", "theta_y_deg", "theta_dot_x_deg_s", "theta_dot_y_deg_s"]
+def plot_fig1_payload_pos_and_swing(teacher: Series, student: Series, out_dir: Path) -> None:
+    # match time range
+    tmax = min(float(teacher.t()[-1]), float(student.t()[-1]))
+    teacher = teacher.clip_time(tmax)
+    student = student.clip_time(tmax)
 
-    # fallback options (in case your CSV uses slightly different names)
-    # e.g., theta_x_deg may be tilt_x_deg, swing_x_deg, etc.
-    fallbacks = {
-        "theta_x_deg": ["theta_x_deg", "tilt_x_deg", "swing_x_deg", "theta_x"],
-        "theta_y_deg": ["theta_y_deg", "tilt_y_deg", "swing_y_deg", "theta_y"],
-        "theta_dot_x_deg_s": ["theta_dot_x_deg_s", "theta_x_dot_deg_s", "swing_dot_x_deg_s", "theta_dot_x"],
-        "theta_dot_y_deg_s": ["theta_dot_y_deg_s", "theta_y_dot_deg_s", "swing_dot_y_deg_s", "theta_dot_y"],
-        "pos_err": ["pos_err", "final_distance_to_goal", "dist_to_goal", "distance_to_goal"],
+    fig, axs = plt.subplots(2, 3, figsize=(14, 7))
+    axs = axs.reshape(2, 3)
+
+    # payload position x/y/z
+    refs = {
+        "x": (teacher.goal_ref[0], "goal_x"),
+        "y": (teacher.goal_ref[1], "goal_y"),
+        "z": (teacher.goal_ref[2], "goal_z"),
     }
+    for j, axis in enumerate(["x", "y", "z"]):
+        ax = axs[0, j]
+        ax.plot(teacher.t(), teacher.df[f"payload_{axis}"], label="teacher")
+        ax.plot(student.t(), student.df[f"payload_{axis}"], label="student")
+        ax.axhline(float(refs[axis][0]), linestyle="--", linewidth=1.0, label="ref")
+        ax.set_title(f"Payload {axis.upper()} (task frame)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{axis} (m)")
+        ax.grid(True, linestyle=":", linewidth=0.6)
+        ax.legend()
 
-    series_pairs = []
-    used_titles = []
-    warnings = []
+    # swing angles theta_x / theta_y
+    for j, (col, title) in enumerate([("theta_x_deg", "Swing θx (deg)"), ("theta_y_deg", "Swing θy (deg)")]):
+        ax = axs[1, j]
+        ax.plot(teacher.t(), teacher.df[col], label="teacher")
+        ax.plot(student.t(), student.df[col], label="student")
+        ax.axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("deg")
+        ax.grid(True, linestyle=":", linewidth=0.6)
+        ax.legend()
 
-    for b in bases:
-        # try base first
-        colT, colS = find_pair(df, b, prefer_student_base=True)
+    # last panel: payload error norm (optional quick sanity)
+    ax = axs[1, 2]
+    if all(c in teacher.df.columns for c in ["payload_err_x", "payload_err_y", "payload_err_z"]):
+        eT = np.linalg.norm(teacher.df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
+        eS = np.linalg.norm(student.df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
+        ax.plot(teacher.t(), eT, label="teacher")
+        ax.plot(student.t(), eS, label="student")
+        ax.set_ylabel("||e|| (m)")
+    ax.set_title("Payload error norm")
+    ax.set_xlabel("Time (s)")
+    ax.grid(True, linestyle=":", linewidth=0.6)
+    ax.legend()
 
-        # if not found, try fallback list for the BASE NAME (we still keep teacher/student pattern)
-        if colT is None or colS is None:
-            for alt in fallbacks.get(b, [b]):
-                colT2, colS2 = find_pair(df, alt, prefer_student_base=True)
-                if colS2 is not None:  # student metric must exist
-                    colT, colS = colT2, colS2
-                    b = alt
-                    break
+    _save_fig(fig, out_dir / "fig1_payload_pos_and_swing.png")
 
-        yT = safe_series(df, colT) if colT is not None else None
-        yS = safe_series(df, colS) if colS is not None else None
+def plot_fig2_swing_angles(teacher: Series, student: Series, out_dir: Path) -> None:
+    tmax = min(float(teacher.t()[-1]), float(student.t()[-1]))
+    teacher = teacher.clip_time(tmax)
+    student = student.clip_time(tmax)
 
-        if yS is None:
-            warnings.append(f"[Fig1] Missing student column for '{b}' (tried {fallbacks.get(b,[b])}). Skip subplot.")
-            series_pairs.append((None, None, b))
-            used_titles.append(b)
-            continue
+    fig, axs = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
 
-        if yT is None:
-            warnings.append(f"[Fig1] Missing teacher column for '{b}'. Will plot student only.")
-        series_pairs.append((yT, yS, b))
-        used_titles.append(b)
+    axs[0].plot(teacher.t(), teacher.df["theta_x_deg"], label="teacher")
+    axs[0].plot(student.t(), student.df["theta_x_deg"], label="student")
+    axs[0].axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
+    axs[0].set_ylabel("deg")
+    axs[0].set_title("Payload swing angle θx")
+    axs[0].grid(True, linestyle=":", linewidth=0.6)
+    axs[0].legend()
 
-    fig, axes = plt.subplots(5, 1, figsize=(12, 14), sharex=True)
+    axs[1].plot(teacher.t(), teacher.df["theta_y_deg"], label="teacher")
+    axs[1].plot(student.t(), student.df["theta_y_deg"], label="student")
+    axs[1].axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
+    axs[1].set_ylabel("deg")
+    axs[1].set_title("Payload swing angle θy")
+    axs[1].grid(True, linestyle=":", linewidth=0.6)
+    axs[1].legend()
 
-    for i, (yT, yS, name) in enumerate(series_pairs):
-        ax = axes[i]
-        ax.plot(t, yS, label="student")
-        if yT is not None:
-            ax.plot(t, yT, label="teacher")
-        ax.set_ylabel(name)
-        ax.grid(True, alpha=0.3)
-        if i == 0:
-            ax.legend(loc="best")
+    # magnitude
+    thT = np.sqrt(teacher.df["theta_x_deg"].to_numpy(dtype=float)**2 + teacher.df["theta_y_deg"].to_numpy(dtype=float)**2)
+    thS = np.sqrt(student.df["theta_x_deg"].to_numpy(dtype=float)**2 + student.df["theta_y_deg"].to_numpy(dtype=float)**2)
+    axs[2].plot(teacher.t(), thT, label="teacher")
+    axs[2].plot(student.t(), thS, label="student")
+    axs[2].axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
+    axs[2].set_ylabel("deg")
+    axs[2].set_title("Swing magnitude sqrt(θx^2+θy^2)")
+    axs[2].set_xlabel("Time (s)")
+    axs[2].grid(True, linestyle=":", linewidth=0.6)
+    axs[2].legend()
 
-    axes[-1].set_xlabel(f"{tname}")
-    fig.suptitle("Fig1: Teacher vs Student - Position and Swing (theta_xy)", y=0.995)
-    savefig(out_png)
+    _save_fig(fig, out_dir / "fig2_swing_angles.png")
 
-    if warnings:
-        print("\n".join(warnings))
+def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None:
+    # student must have zT* and zH*
+    need = [f"zT{i}" for i in range(5)] + [f"zH{i}" for i in range(5)]
+    for c in need:
+        if c not in student.df.columns:
+            raise ValueError(f"[student] CSV missing {c}")
 
+    tS = student.t()
+    tmax = float(tS[-1])
 
-def plot_fig2_z_overlay(df, out_png):
-    """
-    Fig2: zT0..zT4 vs zH0..zH4 overlays (5 subplots)
-    """
-    t, tname = get_time(df)
+    # teacher zT optional
+    have_teacher_zT = all(f"zT{i}" in teacher.df.columns for i in range(5))
 
-    zH_cols = find_dim_cols(df, "zH")
-    zT_cols = find_dim_cols(df, "zT")
-    if len(zH_cols) < 5 or len(zT_cols) < 5:
-        raise RuntimeError(f"[Fig2] Need zH0..zH4 and zT0..zT4. Found zH={zH_cols}, zT={zT_cols}")
-
-    zH = df[zH_cols[:5]].to_numpy(dtype=np.float64)
-    zT = df[zT_cols[:5]].to_numpy(dtype=np.float64)
-
-    fig, axes = plt.subplots(5, 1, figsize=(12, 14), sharex=True)
+    fig, axs = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
     for i in range(5):
-        ax = axes[i]
-        ax.plot(t, zH[:, i], label=f"student zH{i}")
-        ax.plot(t, zT[:, i], label=f"teacher zT{i}")
-        ax.set_ylabel(f"z{i}")
-        ax.grid(True, alpha=0.3)
+        ax = axs[i]
+        ax.plot(tS, student.df[f"zT{i}"], label="student:zT (teacher mu(priv))")
+        ax.plot(tS, student.df[f"zH{i}"], label="student:zH (encoder)")
+        if have_teacher_zT:
+            # align by time index (same dt) – good enough for visual reference
+            tT = teacher.t()
+            m = tT <= tmax
+            ax.plot(tT[m], teacher.df.loc[m, f"zT{i}"], linestyle="--", linewidth=1.0, label="teacher:zT")
+        ax.set_ylabel(f"z[{i}]")
+        ax.grid(True, linestyle=":", linewidth=0.6)
         if i == 0:
-            ax.legend(loc="best")
-    axes[-1].set_xlabel(f"{tname}")
-    fig.suptitle("Fig2: Teacher zT0-4 vs Student zH0-4", y=0.995)
-    savefig(out_png)
+            ax.legend()
 
+    axs[-1].set_xlabel("Time (s)")
+    fig.suptitle("Latent z comparison (student encoder vs teacher priv->mu)", y=0.995)
+    _save_fig(fig, out_dir / "fig3_z_compare.png")
 
-def plot_fig3_priv_vs_z(df, out_png):
+def _compute_energy(df: pd.DataFrame, goal_ref: np.ndarray, smooth_window_s: float = 0.15):
     """
-    Fig3: priv0..priv4 vs z0..z4 (scatter, 5 subplots)
-
-    We will plot:
-      x = priv_i
-      y1 = teacher zT_i (if exists)
-      y2 = student zH_i (if exists)
+    Re-implement the core of IsaaclabPlot12.5 Figure-6 combined plots, using
+    columns available in phase2 CSV (derive UAV accel from position).
     """
-    # priv
-    priv_cols = [f"priv{i}" for i in range(5)]
-    # sometimes your dataset might use "priv0..4" or "mlw0..4"
-    if not all(c in df.columns for c in priv_cols):
-        alt = [f"mlw{i}" for i in range(5)]
-        if all(c in df.columns for c in alt):
-            priv_cols = alt
-        else:
-            raise RuntimeError(f"[Fig3] Need priv0..priv4 (or mlw0..mlw4). Missing: {priv_cols}")
+    g0 = 9.81
 
-    # z
-    zH_cols = find_dim_cols(df, "zH")
-    zT_cols = find_dim_cols(df, "zT")
-    has_student = len(zH_cols) >= 5
-    has_teacher = len(zT_cols) >= 5
-    if not (has_student or has_teacher):
-        raise RuntimeError("[Fig3] Need at least zH0..zH4 or zT0..zT4.")
+    t = df["time_s"].to_numpy(dtype=float)
+    if len(t) < 3:
+        return None
 
-    priv = df[priv_cols].to_numpy(dtype=np.float64)
-    zH = df[zH_cols[:5]].to_numpy(dtype=np.float64) if has_student else None
-    zT = df[zT_cols[:5]].to_numpy(dtype=np.float64) if has_teacher else None
+    # estimate dt and smoothing window
+    dt = float(np.nanmedian(np.diff(t)))
+    win = max(1, int(round(float(smooth_window_s) / dt)))
 
-    fig, axes = plt.subplots(5, 1, figsize=(12, 14), sharex=False)
-    for i in range(5):
-        ax = axes[i]
-        x = priv[:, i]
-        m = np.isfinite(x)
-        if zT is not None:
-            y = zT[:, i]
-            mm = m & np.isfinite(y)
-            ax.scatter(x[mm], y[mm], s=6, alpha=0.35, label=f"teacher zT{i}")
-        if zH is not None:
-            y = zH[:, i]
-            mm = m & np.isfinite(y)
-            ax.scatter(x[mm], y[mm], s=6, alpha=0.35, label=f"student zH{i}")
-
-        ax.set_xlabel(priv_cols[i])
-        ax.set_ylabel(f"z{i}")
-        ax.grid(True, alpha=0.3)
-        if i == 0:
-            ax.legend(loc="best")
-
-    fig.suptitle("Fig3: Privileged vars (priv/mlw) vs z (teacher/student)", y=0.995)
-    savefig(out_png)
-
-
-def plot_fig4_energy_dissipation(df, out_png):
-    """
-    Fig4: energy dissipation rate statistics (teacher vs student).
-
-    We need E_hat for teacher and student (if teacher missing, plot student only).
-    Candidate bases: E_hat, E_hat_mean, Ehat, energy_hat
-
-    We compute dissipation rate:
-      dE/dt via finite difference, then dissipation = -dE/dt (positive means energy decreases)
-
-    We output one figure with:
-      - top: E_hat vs time (teacher/student)
-      - bottom: histogram of dissipation rate (teacher/student)
-    """
-    t, tname = get_time(df)
-
-    # Find energy columns
-    # prefer E_hat
-    base_candidates = ["E_hat", "E_hat_mean", "Ehat", "energy_hat"]
-    colT = None
-    colS = None
-    used_base = None
-    for b in base_candidates:
-        cT, cS = find_pair(df, b, prefer_student_base=True)
-        if cS is not None:
-            colT, colS = cT, cS
-            used_base = b
-            break
-
-    if colS is None:
-        raise RuntimeError(f"[Fig4] Cannot find student energy column. Tried: {base_candidates}")
-
-    E_S = safe_series(df, colS)
-    E_T = safe_series(df, colT) if colT is not None else None
-
-    # time diffs
-    dt = np.diff(t)
-    dt[dt == 0] = np.nan
-    # compute rate arrays aligned to length N (pad first with nan)
-    dE_S = np.diff(E_S) / dt
-    diss_S = -dE_S
-    diss_S = np.concatenate([[np.nan], diss_S])
-
-    if E_T is not None:
-        dE_T = np.diff(E_T) / dt
-        diss_T = -dE_T
-        diss_T = np.concatenate([[np.nan], diss_T])
+    # rope length: prefer rope_length_m in CSV
+    if "rope_length_m" in df.columns:
+        L_est = float(np.nanmedian(df["rope_length_m"].to_numpy(dtype=float)))
     else:
-        diss_T = None
+        L_est = 1.0
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=False)
+    # direction in XY: use UAV displacement in TASK frame
+    dx = float(df["uav_x"].iloc[-1] - df["uav_x"].iloc[0])
+    dy = float(df["uav_y"].iloc[-1] - df["uav_y"].iloc[0])
+    d_xy = _safe_unit(np.array([dx, dy], dtype=float))
 
-    # top: E_hat time series
-    ax0 = axes[0]
-    ax0.plot(t, E_S, label="student")
-    if E_T is not None:
-        ax0.plot(t, E_T, label="teacher")
-    ax0.set_title(f"Energy proxy over time ({used_base})")
-    ax0.set_xlabel(tname)
-    ax0.set_ylabel("E_hat")
-    ax0.grid(True, alpha=0.3)
-    ax0.legend(loc="best")
+    # swing angle and swing velocity (rad / rad/s)
+    thx = np.deg2rad(df["theta_x_deg"].to_numpy(dtype=float))
+    thy = np.deg2rad(df["theta_y_deg"].to_numpy(dtype=float))
+    thdx = np.deg2rad(df["theta_dot_x_deg_s"].to_numpy(dtype=float))
+    thdy = np.deg2rad(df["theta_dot_y_deg_s"].to_numpy(dtype=float))
 
-    # bottom: dissipation histogram
-    ax1 = axes[1]
-    mS = np.isfinite(diss_S)
-    ax1.hist(diss_S[mS], bins=80, alpha=0.55, label="student")
-    if diss_T is not None:
-        mT = np.isfinite(diss_T)
-        ax1.hist(diss_T[mT], bins=80, alpha=0.55, label="teacher")
-    ax1.set_title("Energy dissipation rate distribution (positive=energy decreasing)")
-    ax1.set_xlabel("dissipation = -dE/dt")
-    ax1.set_ylabel("count")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc="best")
+    th2 = thx**2 + thy**2
+    thd2 = thdx**2 + thdy**2
 
-    fig.suptitle("Fig4: Teacher vs Student - Anti-sway energy dissipation statistics", y=0.995)
-    savefig(out_png)
+    # UAV accelerations (m/s^2) in TASK frame – derived
+    ax = df.get("uav_ax", pd.Series(np.zeros_like(t))).to_numpy(dtype=float)
+    ay = df.get("uav_ay", pd.Series(np.zeros_like(t))).to_numpy(dtype=float)
+    az = df.get("uav_az", pd.Series(np.zeros_like(t))).to_numpy(dtype=float)
+
+    # parallel components (for mechanism plot)
+    v_swing_parallel = df["theta_dot_x_deg_s"].to_numpy(dtype=float) * d_xy[0] + df["theta_dot_y_deg_s"].to_numpy(dtype=float) * d_xy[1]
+    a_uav_parallel = ax * d_xy[0] + ay * d_xy[1]
+
+    # w2 and energy
+    w2 = (g0 + az) / max(L_est, 1e-6)
+    w2_dot = _gradient(w2, t)
+    E_hat = 0.5 * (thd2 + w2 * th2)
+
+    # power terms (verification / decomposition)
+    P_xy = (ax * thdx + ay * thdy) / max(L_est, 1e-6)
+    P_param = 0.5 * w2_dot * th2
+    P_model = P_xy + P_param
+    E_dot_num = _gradient(E_hat, t)
+
+    # smoothing for plots
+    out = dict(
+        t=t,
+        dt=dt,
+        L_est=L_est,
+        d_xy=d_xy,
+        v_swing_parallel=_moving_average(v_swing_parallel, win),
+        a_uav_parallel=_moving_average(a_uav_parallel, win),
+        E_hat=_moving_average(E_hat, win),
+        E_dot_num=_moving_average(E_dot_num, win),
+        P_xy=_moving_average(P_xy, win),
+        P_param=_moving_average(P_param, win),
+        P_model=_moving_average(P_model, win),
+    )
+    return out
+
+def plot_fig4_energy_combined(teacher: Series, student: Series, out_dir: Path, time_window_s: float | None, smooth_window_s: float) -> None:
+    # clip time (energy plot focuses on early window, like IsaaclabPlot12.5)
+    teacher_c = teacher.clip_time(time_window_s)
+    student_c = student.clip_time(time_window_s)
+
+    ET = _compute_energy(teacher_c.df, teacher_c.goal_ref, smooth_window_s=smooth_window_s)
+    ES = _compute_energy(student_c.df, student_c.goal_ref, smooth_window_s=smooth_window_s)
+    if ET is None or ES is None:
+        print("[WARN] Not enough samples for energy plot.")
+        return
+
+    fig, axs = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+
+    # (1) mechanism: v_swing_parallel & a_uav_parallel (twin y)
+    ax1 = axs[0]
+    ax1.plot(ET["t"], ET["v_swing_parallel"], label="teacher: v_swing_parallel (deg/s)")
+    ax1.plot(ES["t"], ES["v_swing_parallel"], label="student: v_swing_parallel (deg/s)")
+    ax1.set_ylabel("deg/s")
+    ax1.grid(True, linestyle=":", linewidth=0.6)
+    ax1.set_title("Mechanism: swing vel parallel vs UAV accel parallel")
+
+    ax1b = ax1.twinx()
+    ax1b.plot(ET["t"], ET["a_uav_parallel"], linestyle="--", linewidth=1.0, label="teacher: a_uav_parallel (m/s^2)")
+    ax1b.plot(ES["t"], ES["a_uav_parallel"], linestyle="--", linewidth=1.0, label="student: a_uav_parallel (m/s^2)")
+    ax1b.set_ylabel("m/s²")
+
+    # merge legends
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax1b.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper right")
+
+    # (2) energy
+    axs[1].plot(ET["t"], ET["E_hat"], label="teacher: E_hat")
+    axs[1].plot(ES["t"], ES["E_hat"], label="student: E_hat")
+    axs[1].set_ylabel("E_hat (arb.)")
+    axs[1].set_title("Energy E_hat")
+    axs[1].grid(True, linestyle=":", linewidth=0.6)
+    axs[1].legend()
+
+    # (3) verification: dE/dt vs P_model
+    axs[2].plot(ET["t"], ET["E_dot_num"], label="teacher: dE/dt")
+    axs[2].plot(ET["t"], ET["P_model"], linestyle="--", linewidth=1.0, label="teacher: P_model")
+    axs[2].plot(ES["t"], ES["E_dot_num"], label="student: dE/dt")
+    axs[2].plot(ES["t"], ES["P_model"], linestyle="--", linewidth=1.0, label="student: P_model")
+    axs[2].set_ylabel("rate (arb.)")
+    axs[2].set_title("Verification: dE/dt ≈ P_model")
+    axs[2].grid(True, linestyle=":", linewidth=0.6)
+    axs[2].legend(ncol=2)
+
+    # (4) decomposition
+    axs[3].plot(ET["t"], ET["P_model"], label="teacher: P_model")
+    axs[3].plot(ET["t"], ET["P_xy"], linestyle="--", linewidth=1.0, label="teacher: P_xy")
+    axs[3].plot(ET["t"], ET["P_param"], linestyle=":", linewidth=1.0, label="teacher: P_param")
+
+    axs[3].plot(ES["t"], ES["P_model"], label="student: P_model")
+    axs[3].plot(ES["t"], ES["P_xy"], linestyle="--", linewidth=1.0, label="student: P_xy")
+    axs[3].plot(ES["t"], ES["P_param"], linestyle=":", linewidth=1.0, label="student: P_param")
+
+    axs[3].set_ylabel("power (arb.)")
+    axs[3].set_title("Decomposition: P_model = P_xy + P_param")
+    axs[3].set_xlabel("Time (s)")
+    axs[3].grid(True, linestyle=":", linewidth=0.6)
+    axs[3].legend(ncol=2)
+
+    _save_fig(fig, out_dir / "fig4_energy_combined.png")
 
 
-# -----------------------------
-# Entry
-# -----------------------------
+# ----------------------------
+# Main
+# ----------------------------
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=str, required=True)
-    ap.add_argument("--out_dir", type=str, required=True)
+    ap.add_argument("--teacher", type=str, required=True, help="Path to phase2_teacher.csv")
+    ap.add_argument("--student", type=str, required=True, help="Path to phase2_student.csv")
+    ap.add_argument("--out_dir", type=str, default=None, help="Output directory for figures (default: dir of student csv)")
+    ap.add_argument("--start", type=float, nargs=3, default=[-2.0, 0.0, 2.0], help="TASK start offset (x y z)")
+    ap.add_argument("--goal", type=float, nargs=3, default=[2.0, 0.0, 2.0], help="TASK goal offset (x y z)")
+    ap.add_argument("--time_window", type=float, default=5.0, help="Energy plot time window in seconds (like IsaaclabPlot12.5). Use <=0 to disable clipping.")
+    ap.add_argument("--smooth_window", type=float, default=0.15, help="Smoothing window seconds for energy curves.")
     args = ap.parse_args()
 
-    ensure_dir(args.out_dir)
+    teacher_path = Path(args.teacher).expanduser().resolve()
+    student_path = Path(args.student).expanduser().resolve()
 
-    df = pd.read_csv(args.csv)
-    print(f"[INFO] Loaded CSV: {args.csv} rows={len(df)} cols={len(df.columns)}")
+    start_ref = np.array(args.start, dtype=float)
+    goal_ref = np.array(args.goal, dtype=float)
 
-    # Figure 1
-    fig1 = os.path.join(args.out_dir, "Fig1_pos_theta_teacher_vs_student.png")
-    plot_fig1_pos_theta(df, fig1)
-    print(f"[OK] Saved: {fig1}")
+    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else student_path.parent
+    _ensure_out_dir(out_dir)
 
-    # Figure 2
-    fig2 = os.path.join(args.out_dir, "Fig2_z_teacher_vs_student.png")
-    plot_fig2_z_overlay(df, fig2)
-    print(f"[OK] Saved: {fig2}")
+    teacher = load_series(teacher_path, "teacher", start_ref, goal_ref)
+    student = load_series(student_path, "student", start_ref, goal_ref)
 
-    # Figure 3
-    fig3 = os.path.join(args.out_dir, "Fig3_priv_vs_z.png")
-    plot_fig3_priv_vs_z(df, fig3)
-    print(f"[OK] Saved: {fig3}")
+    # Optional: print inferred origins so you can sanity-check the -9..11 issue.
+    print(f"[INFO] teacher origin_w inferred: {teacher.origin_w} (goal_world - goal_ref)")
+    print(f"[INFO] student origin_w inferred: {student.origin_w} (goal_world - goal_ref)")
 
-    # Figure 4
-    fig4 = os.path.join(args.out_dir, "Fig4_energy_dissipation_teacher_vs_student.png")
-    plot_fig4_energy_dissipation(df, fig4)
-    print(f"[OK] Saved: {fig4}")
+    # Plots
+    plot_fig1_payload_pos_and_swing(teacher, student, out_dir)
+    plot_fig2_swing_angles(teacher, student, out_dir)
+    plot_fig3_z_compare(teacher, student, out_dir)
 
-    print("[DONE] Key figures generated.")
+    tw = float(args.time_window)
+    tmax = None if tw <= 0 else tw
+    plot_fig4_energy_combined(teacher, student, out_dir, tmax, float(args.smooth_window))
 
+    print(f"[DONE] Figures saved to: {out_dir}")
 
 if __name__ == "__main__":
     main()
