@@ -1,470 +1,327 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Analyze phase2 teacher/student CSV and reproduce plots in the style of IsaaclabPlot12.5.py:
-  Fig1  payload position (task frame) + swing angles   (teacher vs student)
-  Fig2  payload swing angles (task frame)              (teacher vs student)
-  Fig3  latent z comparison                            (student zH vs zT, optionally teacher zT)
-  Fig4  energy dissipation verification (E_hat, dE/dt, P_xy, P_param, P_model)
-
-Usage example:
-  python scripts/rsl_rl/analyze_phase2_csv_v2.py \
-    --teacher /path/to/phase2_teacher.csv \
-    --student /path/to/phase2_student.csv \
-    --goal 2 0 2 --start -2 0 2 \
-    --time_window 5
-"""
-
+# analyze_phase2_csv.py (Final Version with Advanced Energy Mechanism)
 from __future__ import annotations
-
 import argparse
-from dataclasses import dataclass
-from pathlib import Path
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
+import os
 
+# ==========================================
+# 1. 基础工具与数据增强
+# ==========================================
 
-# ----------------------------
-# Helpers
-# ----------------------------
+def load_data(path):
+    if not os.path.exists(path):
+        print(f"[Error] File not found: {path}")
+        return None
+    return pd.read_csv(path)
 
-def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
-    if win <= 1:
-        return x
-    x = np.asarray(x, dtype=float)
-    k = np.ones(win, dtype=float) / float(win)
-    return np.convolve(x, k, mode="same")
-
-def _safe_unit(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n < eps:
-        return np.array([1.0, 0.0], dtype=float)
-    return (v / n).astype(float)
-
-def _gradient(y: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Robust gradient with non-uniform dt support."""
-    y = np.asarray(y, dtype=float)
-    t = np.asarray(t, dtype=float)
-    if len(y) < 3:
-        return np.zeros_like(y)
-    return np.gradient(y, t)
-
-def _infer_origin_from_goal(df: pd.DataFrame, goal_ref: np.ndarray) -> np.ndarray:
+def augment_data_for_energy_analysis(df):
     """
-    If CSV contains goal_px/py/pz in WORLD coordinates and goal_ref is TASK offset (e.g. [2,0,2]),
-    then env_origin ≈ goal_world - goal_ref (constant per run/trace env).
+    预处理数据：计算导数（速度、加速度），以满足高级能量分析的需求。
     """
-    for c in ["goal_px", "goal_py", "goal_pz"]:
-        if c not in df.columns:
-            return np.zeros(3, dtype=float)
-    ox = np.nanmedian(df["goal_px"].to_numpy(dtype=float) - float(goal_ref[0]))
-    oy = np.nanmedian(df["goal_py"].to_numpy(dtype=float) - float(goal_ref[1]))
-    oz = np.nanmedian(df["goal_pz"].to_numpy(dtype=float) - float(goal_ref[2]))
-    return np.array([ox, oy, oz], dtype=float)
-
-def _ensure_out_dir(out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-def _save_fig(fig, path: Path) -> None:
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-
-def _canon_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Keep current phase2 CSV column names, but allow some aliases for older scripts.
-    """
-    rename = {}
-
-    # common aliases
-    alias_groups = [
-        (["time", "t", "t_sec"], "time_s"),
-        (["uav_x", "uav_px_w"], "uav_px"),
-        (["uav_y", "uav_py_w"], "uav_py"),
-        (["uav_z", "uav_pz_w"], "uav_pz"),
-        (["payload_x", "payload_px_w"], "payload_px"),
-        (["payload_y", "payload_py_w"], "payload_py"),
-        (["payload_z", "payload_pz_w"], "payload_pz"),
-        (["theta_x", "swing_x_deg"], "theta_x_deg"),
-        (["theta_y", "swing_y_deg"], "theta_y_deg"),
-        (["theta_dot_x", "swing_vel_x_deg_s"], "theta_dot_x_deg_s"),
-        (["theta_dot_y", "swing_vel_y_deg_s"], "theta_dot_y_deg_s"),
-        (["rope_len", "L", "rope_length"], "rope_length_m"),
-        (["payload_mass"], "payload_mass_kg"),
-    ]
-
-    cols_lower = {c.lower(): c for c in df.columns}
-    for aliases, target in alias_groups:
-        if target in df.columns:
-            continue
-        for a in aliases:
-            if a in cols_lower:
-                rename[cols_lower[a]] = target
-                break
-
-    if rename:
-        df = df.rename(columns=rename)
-
+    # 1. 确定时间步长 dt
+    t_all = df['time_s'].to_numpy()
+    dt = np.median(np.diff(t_all)) if len(t_all) > 1 else 0.02
+    if dt <= 0: dt = 0.02
+    
+    # 2. 计算摆动角速度 (SwingVel_DegS)
+    # 使用 gradient 进行中心差分
+    df['SwingVel_DegS_X'] = np.gradient(df['theta_x_deg'], dt)
+    df['SwingVel_DegS_Y'] = np.gradient(df['theta_y_deg'], dt)
+    
+    # 3. 计算无人机加速度 (UAV_a_w)
+    # 先算速度
+    vx = np.gradient(df['uav_px'], dt)
+    vy = np.gradient(df['uav_py'], dt)
+    vz = np.gradient(df['uav_pz'], dt)
+    # 再算加速度
+    df['UAV_a_wx'] = np.gradient(vx, dt)
+    df['UAV_a_wy'] = np.gradient(vy, dt)
+    df['UAV_a_wz'] = np.gradient(vz, dt)
+    
+    # 4. 确保有 UAV_Z 和 Payload_Z (用于估算绳长)
+    if 'uav_pz' in df.columns: df['UAV_Z'] = df['uav_pz']
+    if 'payload_pz' in df.columns: df['Payload_Z'] = df['payload_pz']
+    
+    # 5. 确保有 UAV_X/Y 用于计算投影方向
+    df['UAV_X'] = df['uav_px']
+    df['UAV_Y'] = df['uav_py']
+    
     return df
 
-@dataclass
-class Series:
-    name: str
-    df: pd.DataFrame
-    origin_w: np.ndarray
-    start_ref: np.ndarray
-    goal_ref: np.ndarray
+# ==========================================
+# 2. 核心绘图逻辑 (Figure 6 Combined 迁移)
+# ==========================================
 
-    def t(self) -> np.ndarray:
-        return self.df["time_s"].to_numpy(dtype=float)
-
-    def add_task_frame(self) -> None:
-        """Add *_x/_y/_z columns in TASK frame (subtract env origin)."""
-        o = self.origin_w
-        for prefix in ["uav", "payload", "goal"]:
-            for axis, idx in [("x", 0), ("y", 1), ("z", 2)]:
-                wcol = f"{prefix}_p{axis}"
-                if wcol in self.df.columns:
-                    self.df[f"{prefix}_{axis}"] = self.df[wcol].to_numpy(dtype=float) - float(o[idx])
-
-    def add_derivatives(self) -> None:
-        """Add uav_vx/vy/vz and uav_ax/ay/az in TASK frame by numerical differentiation."""
-        t = self.t()
-        for axis in ["x", "y", "z"]:
-            pcol = f"uav_{axis}"
-            if pcol not in self.df.columns:
-                continue
-            p = self.df[pcol].to_numpy(dtype=float)
-            v = _gradient(p, t)
-            a = _gradient(v, t)
-            self.df[f"uav_v{axis}"] = v
-            self.df[f"uav_a{axis}"] = a
-
-    def clip_time(self, t_max: float | None) -> "Series":
-        if t_max is None:
-            return self
-        m = self.t() <= float(t_max)
-        df2 = self.df.loc[m].copy()
-        return Series(self.name, df2, self.origin_w, self.start_ref, self.goal_ref)
-
-def load_series(path: Path, name: str, start_ref: np.ndarray, goal_ref: np.ndarray) -> Series:
-    df = pd.read_csv(path)
-    df = _canon_cols(df)
-    if "time_s" not in df.columns:
-        raise ValueError(f"[{name}] CSV missing time_s column: {path}")
-    origin = _infer_origin_from_goal(df, goal_ref)
-    s = Series(name=name, df=df, origin_w=origin, start_ref=start_ref, goal_ref=goal_ref)
-    s.add_task_frame()
-    s.add_derivatives()
-    return s
-
-
-# ----------------------------
-# Plots
-# ----------------------------
-
-def plot_fig1_payload_pos_and_swing(teacher: Series, student: Series, out_dir: Path) -> None:
-    # match time range
-    tmax = min(float(teacher.t()[-1]), float(student.t()[-1]))
-    teacher = teacher.clip_time(tmax)
-    student = student.clip_time(tmax)
-
-    fig, axs = plt.subplots(2, 3, figsize=(14, 7))
-    axs = axs.reshape(2, 3)
-
-    # payload position x/y/z
-    refs = {
-        "x": (teacher.goal_ref[0], "goal_x"),
-        "y": (teacher.goal_ref[1], "goal_y"),
-        "z": (teacher.goal_ref[2], "goal_z"),
-    }
-    for j, axis in enumerate(["x", "y", "z"]):
-        ax = axs[0, j]
-        ax.plot(teacher.t(), teacher.df[f"payload_{axis}"], label="teacher")
-        ax.plot(student.t(), student.df[f"payload_{axis}"], label="student")
-        ax.axhline(float(refs[axis][0]), linestyle="--", linewidth=1.0, label="ref")
-        ax.set_title(f"Payload {axis.upper()} (task frame)")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel(f"{axis} (m)")
-        ax.grid(True, linestyle=":", linewidth=0.6)
-        ax.legend()
-
-    # swing angles theta_x / theta_y
-    for j, (col, title) in enumerate([("theta_x_deg", "Swing θx (deg)"), ("theta_y_deg", "Swing θy (deg)")]):
-        ax = axs[1, j]
-        ax.plot(teacher.t(), teacher.df[col], label="teacher")
-        ax.plot(student.t(), student.df[col], label="student")
-        ax.axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
-        ax.set_title(title)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("deg")
-        ax.grid(True, linestyle=":", linewidth=0.6)
-        ax.legend()
-
-    # last panel: payload error norm (optional quick sanity)
-    ax = axs[1, 2]
-    if all(c in teacher.df.columns for c in ["payload_err_x", "payload_err_y", "payload_err_z"]):
-        eT = np.linalg.norm(teacher.df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
-        eS = np.linalg.norm(student.df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
-        ax.plot(teacher.t(), eT, label="teacher")
-        ax.plot(student.t(), eS, label="student")
-        ax.set_ylabel("||e|| (m)")
-    ax.set_title("Payload error norm")
-    ax.set_xlabel("Time (s)")
-    ax.grid(True, linestyle=":", linewidth=0.6)
-    ax.legend()
-
-    _save_fig(fig, out_dir / "fig1_payload_pos_and_swing.png")
-
-def plot_fig2_swing_angles(teacher: Series, student: Series, out_dir: Path) -> None:
-    tmax = min(float(teacher.t()[-1]), float(student.t()[-1]))
-    teacher = teacher.clip_time(tmax)
-    student = student.clip_time(tmax)
-
-    fig, axs = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-
-    axs[0].plot(teacher.t(), teacher.df["theta_x_deg"], label="teacher")
-    axs[0].plot(student.t(), student.df["theta_x_deg"], label="student")
-    axs[0].axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
-    axs[0].set_ylabel("deg")
-    axs[0].set_title("Payload swing angle θx")
-    axs[0].grid(True, linestyle=":", linewidth=0.6)
-    axs[0].legend()
-
-    axs[1].plot(teacher.t(), teacher.df["theta_y_deg"], label="teacher")
-    axs[1].plot(student.t(), student.df["theta_y_deg"], label="student")
-    axs[1].axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
-    axs[1].set_ylabel("deg")
-    axs[1].set_title("Payload swing angle θy")
-    axs[1].grid(True, linestyle=":", linewidth=0.6)
-    axs[1].legend()
-
-    # magnitude
-    thT = np.sqrt(teacher.df["theta_x_deg"].to_numpy(dtype=float)**2 + teacher.df["theta_y_deg"].to_numpy(dtype=float)**2)
-    thS = np.sqrt(student.df["theta_x_deg"].to_numpy(dtype=float)**2 + student.df["theta_y_deg"].to_numpy(dtype=float)**2)
-    axs[2].plot(teacher.t(), thT, label="teacher")
-    axs[2].plot(student.t(), thS, label="student")
-    axs[2].axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
-    axs[2].set_ylabel("deg")
-    axs[2].set_title("Swing magnitude sqrt(θx^2+θy^2)")
-    axs[2].set_xlabel("Time (s)")
-    axs[2].grid(True, linestyle=":", linewidth=0.6)
-    axs[2].legend()
-
-    _save_fig(fig, out_dir / "fig2_swing_angles.png")
-
-def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None:
-    # student must have zT* and zH*
-    need = [f"zT{i}" for i in range(5)] + [f"zH{i}" for i in range(5)]
-    for c in need:
-        if c not in student.df.columns:
-            raise ValueError(f"[student] CSV missing {c}")
-
-    tS = student.t()
-    tmax = float(tS[-1])
-
-    # teacher zT optional
-    have_teacher_zT = all(f"zT{i}" in teacher.df.columns for i in range(5))
-
-    fig, axs = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
-    for i in range(5):
-        ax = axs[i]
-        ax.plot(tS, student.df[f"zT{i}"], label="student:zT (teacher mu(priv))")
-        ax.plot(tS, student.df[f"zH{i}"], label="student:zH (encoder)")
-        if have_teacher_zT:
-            # align by time index (same dt) – good enough for visual reference
-            tT = teacher.t()
-            m = tT <= tmax
-            ax.plot(tT[m], teacher.df.loc[m, f"zT{i}"], linestyle="--", linewidth=1.0, label="teacher:zT")
-        ax.set_ylabel(f"z[{i}]")
-        ax.grid(True, linestyle=":", linewidth=0.6)
-        if i == 0:
-            ax.legend()
-
-    axs[-1].set_xlabel("Time (s)")
-    fig.suptitle("Latent z comparison (student encoder vs teacher priv->mu)", y=0.995)
-    _save_fig(fig, out_dir / "fig3_z_compare.png")
-
-def _compute_energy(df: pd.DataFrame, goal_ref: np.ndarray, smooth_window_s: float = 0.15):
+def plot_advanced_energy_mechanism(df_sim, out_path, title_prefix):
     """
-    Re-implement the core of IsaaclabPlot12.5 Figure-6 combined plots, using
-    columns available in phase2 CSV (derive UAV accel from position).
+    [移植自 IsaaclabPlot12.5.py] Figure 6 Combined: 综合分析
+    包含: Mechanism (耦合), Energy State, Verification, Decomposition
     """
+    print(f"[Plotting] Energy Mechanism Analysis for {title_prefix}...")
+
+    # --- 数据准备 ---
+    t = df_sim["time_s"].to_numpy(dtype=np.float32)
+    t_all = t # 别名
+    
+    # 绳长估算
+    L_est = 0.8
+    if "rope_length_m" in df_sim.columns:
+        L_est = df_sim["rope_length_m"].mean()
+    elif "UAV_Z" in df_sim.columns and "Payload_Z" in df_sim.columns:
+        dz = (df_sim["UAV_Z"] - df_sim["Payload_Z"]).to_numpy()
+        L_est = float(np.median(np.abs(dz)))
     g0 = 9.81
 
-    t = df["time_s"].to_numpy(dtype=float)
-    if len(t) < 3:
-        return None
+    # --- 计算部分 ---
+    
+    # (A) 投影与平滑 (Mechanism)
+    # 计算运动主方向 (起始点到终点)
+    dx = float(df_sim["UAV_X"].iloc[-1] - df_sim["UAV_X"].iloc[0])
+    dy = float(df_sim["UAV_Y"].iloc[-1] - df_sim["UAV_Y"].iloc[0])
+    dnorm = float(np.sqrt(dx*dx + dy*dy))
+    d_xy = np.array([dx/dnorm, dy/dnorm]) if dnorm > 1e-6 else np.array([1.0, 0.0])
 
-    # estimate dt and smoothing window
-    dt = float(np.nanmedian(np.diff(t)))
-    win = max(1, int(round(float(smooth_window_s) / dt)))
+    # 提取数据
+    v_swing_x = df_sim["SwingVel_DegS_X"].to_numpy(dtype=np.float32)
+    v_swing_y = df_sim["SwingVel_DegS_Y"].to_numpy(dtype=np.float32)
+    a_uav_x = df_sim["UAV_a_wx"].to_numpy(dtype=np.float32)
+    a_uav_y = df_sim["UAV_a_wy"].to_numpy(dtype=np.float32)
 
-    # rope length: prefer rope_length_m in CSV
-    if "rope_length_m" in df.columns:
-        L_est = float(np.nanmedian(df["rope_length_m"].to_numpy(dtype=float)))
-    else:
-        L_est = 1.0
+    # 投影到主运动方向
+    v_swing_parallel = v_swing_x * d_xy[0] + v_swing_y * d_xy[1]
+    a_uav_parallel   = a_uav_x * d_xy[0] + a_uav_y * d_xy[1]
 
-    # direction in XY: use UAV displacement in TASK frame
-    dx = float(df["uav_x"].iloc[-1] - df["uav_x"].iloc[0])
-    dy = float(df["uav_y"].iloc[-1] - df["uav_y"].iloc[0])
-    d_xy = _safe_unit(np.array([dx, dy], dtype=float))
+    # 平滑函数
+    dt = np.median(np.diff(t)) if len(t) > 1 else 0.02
+    win = max(1, int(round(0.15 / dt))) # 0.15s 窗口平滑
+    def _smooth(arr, w):
+        return np.convolve(arr, np.ones(w)/w, mode='same')
 
-    # swing angle and swing velocity (rad / rad/s)
-    thx = np.deg2rad(df["theta_x_deg"].to_numpy(dtype=float))
-    thy = np.deg2rad(df["theta_y_deg"].to_numpy(dtype=float))
-    thdx = np.deg2rad(df["theta_dot_x_deg_s"].to_numpy(dtype=float))
-    thdy = np.deg2rad(df["theta_dot_y_deg_s"].to_numpy(dtype=float))
+    v_plot = _smooth(v_swing_parallel, win)
+    a_plot = _smooth(a_uav_parallel, win)
 
-    th2 = thx**2 + thy**2
-    thd2 = thdx**2 + thdy**2
+    # (B) 能量与功率 (Energy)
+    # 弧度转换
+    thx = df_sim["theta_x_deg"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+    thy = df_sim["theta_y_deg"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+    thdx = df_sim["SwingVel_DegS_X"].to_numpy(dtype=np.float32) * (np.pi/180.0)
+    thdy = df_sim["SwingVel_DegS_Y"].to_numpy(dtype=np.float32) * (np.pi/180.0)
 
-    # UAV accelerations (m/s^2) in TASK frame – derived
-    ax = df.get("uav_ax", pd.Series(np.zeros_like(t))).to_numpy(dtype=float)
-    ay = df.get("uav_ay", pd.Series(np.zeros_like(t))).to_numpy(dtype=float)
-    az = df.get("uav_az", pd.Series(np.zeros_like(t))).to_numpy(dtype=float)
+    th2 = thx*thx + thy*thy
+    thd2 = thdx*thdx + thdy*thdy
 
-    # parallel components (for mechanism plot)
-    v_swing_parallel = df["theta_dot_x_deg_s"].to_numpy(dtype=float) * d_xy[0] + df["theta_dot_y_deg_s"].to_numpy(dtype=float) * d_xy[1]
-    a_uav_parallel = ax * d_xy[0] + ay * d_xy[1]
+    a_z = df_sim["UAV_a_wz"].to_numpy(dtype=np.float32) if "UAV_a_wz" in df_sim.columns else np.zeros_like(thx)
+    
+    # 等效重力频率 w^2 = (g + az) / L
+    w2 = (g0 + a_z) / max(L_est, 1e-6)
+    w2 = np.clip(w2, 0.1, 200.0)
 
-    # w2 and energy
-    w2 = (g0 + az) / max(L_est, 1e-6)
-    w2_dot = _gradient(w2, t)
-    E_hat = 0.5 * (thd2 + w2 * th2)
+    # 能量估计 E_hat
+    E_hat_all = 0.5 * (thd2 + w2 * th2)
+    E_hat_f = _smooth(E_hat_all, win)
+    E_dot = np.gradient(E_hat_f, t) # 数值微分求功率
 
-    # power terms (verification / decomposition)
-    P_xy = (ax * thdx + ay * thdy) / max(L_est, 1e-6)
+    # 理论功率模型 P_model = P_xy + P_param
+    # P_xy: 水平运动做的功
+    P_xy = (a_uav_x * thdx + a_uav_y * thdy) / max(L_est, 1e-6)
+    # P_param: 垂直运动/变参数做的功
+    w2_f = _smooth(w2, win)
+    w2_dot = np.gradient(w2_f, t)
     P_param = 0.5 * w2_dot * th2
     P_model = P_xy + P_param
-    E_dot_num = _gradient(E_hat, t)
 
-    # smoothing for plots
-    out = dict(
-        t=t,
-        dt=dt,
-        L_est=L_est,
-        d_xy=d_xy,
-        v_swing_parallel=_moving_average(v_swing_parallel, win),
-        a_uav_parallel=_moving_average(a_uav_parallel, win),
-        E_hat=_moving_average(E_hat, win),
-        E_dot_num=_moving_average(E_dot_num, win),
-        P_xy=_moving_average(P_xy, win),
-        P_param=_moving_average(P_param, win),
-        P_model=_moving_average(P_model, win),
-    )
-    return out
+    # 平滑后用于绘图
+    E_hat = E_hat_f
+    E_dot_w = E_dot
+    P_xy_w = _smooth(P_xy, win)
+    P_param_w = _smooth(P_param, win)
+    P_model_w = _smooth(P_model, win)
 
-def plot_fig4_energy_combined(teacher: Series, student: Series, out_dir: Path, time_window_s: float | None, smooth_window_s: float) -> None:
-    # clip time (energy plot focuses on early window, like IsaaclabPlot12.5)
-    teacher_c = teacher.clip_time(time_window_s)
-    student_c = student.clip_time(time_window_s)
+    # --- 3. 绘图 (合并) ---
+    fig6, axs6 = plt.subplots(4, 1, figsize=(18, 16), constrained_layout=True, sharex=True)
+    fig6.suptitle(f"{title_prefix}: Comprehensive Energy Analysis (Mechanism -> Result)", fontsize=16, weight="bold")
 
-    ET = _compute_energy(teacher_c.df, teacher_c.goal_ref, smooth_window_s=smooth_window_s)
-    ES = _compute_energy(student_c.df, student_c.goal_ref, smooth_window_s=smooth_window_s)
-    if ET is None or ES is None:
-        print("[WARN] Not enough samples for energy plot.")
-        return
+    # [Subplot 1] Mechanism
+    ax1 = axs6[0]
+    color_vel = 'tab:blue'
+    ax1.set_title("1. Mechanism: In-Phase Coupling (UAV Accelerates with Swing)", fontsize=12, loc='left')
+    ax1.set_ylabel("Swing Vel (deg/s)", color=color_vel, weight='bold')
+    l1, = ax1.plot(t, v_plot, color=color_vel, linewidth=2.0, label="Swing Velocity ($v_{swing}$)")
+    ax1.tick_params(axis='y', labelcolor=color_vel)
+    ax1.grid(True, linestyle=":", alpha=0.5)
 
-    fig, axs = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+    ax1_r = ax1.twinx()
+    color_acc = 'tab:red'
+    ax1_r.set_ylabel("UAV Accel (m/s$^2$)", color=color_acc, weight='bold')
+    l2, = ax1_r.plot(t, a_plot, color=color_acc, linestyle='--', linewidth=2.0, label="UAV Acceleration ($a_{uav}$)")
+    ax1_r.tick_params(axis='y', labelcolor=color_acc)
+    
+    # Legend合并
+    lines = [l1, l2]
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
 
-    # (1) mechanism: v_swing_parallel & a_uav_parallel (twin y)
-    ax1 = axs[0]
-    ax1.plot(ET["t"], ET["v_swing_parallel"], label="teacher: v_swing_parallel (deg/s)")
-    ax1.plot(ES["t"], ES["v_swing_parallel"], label="student: v_swing_parallel (deg/s)")
-    ax1.set_ylabel("deg/s")
-    ax1.grid(True, linestyle=":", linewidth=0.6)
-    ax1.set_title("Mechanism: swing vel parallel vs UAV accel parallel")
+    # [Subplot 2] Energy State
+    axs6[1].set_title("2. Energy State: Monotonic Decay", fontsize=12, loc='left')
+    axs6[1].plot(t, E_hat, label="E_hat(t) (smoothed)", color='k', linewidth=2.0)
+    axs6[1].set_ylabel("E_hat [rad^2/s^2]")
+    axs6[1].grid(True, linestyle=":", alpha=0.5)
+    axs6[1].legend(loc="upper right")
 
-    ax1b = ax1.twinx()
-    ax1b.plot(ET["t"], ET["a_uav_parallel"], linestyle="--", linewidth=1.0, label="teacher: a_uav_parallel (m/s^2)")
-    ax1b.plot(ES["t"], ES["a_uav_parallel"], linestyle="--", linewidth=1.0, label="student: a_uav_parallel (m/s^2)")
-    ax1b.set_ylabel("m/s²")
+    # [Subplot 3] Verification
+    axs6[2].set_title("3. Verification: Power Matches Energy Rate", fontsize=12, loc='left')
+    axs6[2].plot(t, E_dot_w, label="dE_hat/dt (numeric)", color='gray', alpha=0.6)
+    axs6[2].plot(t, P_model_w, label="P_model (analytical)", color='tab:purple', linewidth=2.0)
+    axs6[2].axhline(0.0, linestyle="--", linewidth=1, color='k')
+    axs6[2].set_ylabel("Rate [rad^2/s^3]")
+    axs6[2].grid(True, linestyle=":", alpha=0.5)
+    axs6[2].legend(loc="upper right")
 
-    # merge legends
-    h1, l1 = ax1.get_legend_handles_labels()
-    h2, l2 = ax1b.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="upper right")
+    # [Subplot 4] Decomposition
+    axs6[3].set_title("4. Decomposition: Contribution of Horizontal Motion", fontsize=12, loc='left')
+    axs6[3].plot(t, P_xy_w, label="P_xy = -(a_xy·theta_dot)/L", color='tab:red', linewidth=2.0)
+    axs6[3].plot(t, P_param_w, label="P_param (Vertical/Gravity)", color='tab:green', alpha=0.7, linewidth=1.5)
+    axs6[3].plot(t, P_model_w, label="P_model (Total)", color='k', linestyle='--', alpha=0.5)
+    axs6[3].axhline(0.0, linestyle="--", linewidth=1, color='k')
+    axs6[3].set_xlabel("Time (s)")
+    axs6[3].set_ylabel("Power [rad^2/s^3]")
+    axs6[3].grid(True, linestyle=":", alpha=0.5)
+    axs6[3].legend(loc="upper right")
 
-    # (2) energy
-    axs[1].plot(ET["t"], ET["E_hat"], label="teacher: E_hat")
-    axs[1].plot(ES["t"], ES["E_hat"], label="student: E_hat")
-    axs[1].set_ylabel("E_hat (arb.)")
-    axs[1].set_title("Energy E_hat")
-    axs[1].grid(True, linestyle=":", linewidth=0.6)
-    axs[1].legend()
+    # 阴影标注负功区域 (Dissipation)
+    axs6[3].fill_between(t, 0.0, P_model_w, where=(P_model_w < 0.0), alpha=0.10, color='green', interpolate=True)
+    
+    plt.savefig(out_path, dpi=300)
+    print(f"  - {out_path} (Saved!)")
+    plt.close()
 
-    # (3) verification: dE/dt vs P_model
-    axs[2].plot(ET["t"], ET["E_dot_num"], label="teacher: dE/dt")
-    axs[2].plot(ET["t"], ET["P_model"], linestyle="--", linewidth=1.0, label="teacher: P_model")
-    axs[2].plot(ES["t"], ES["E_dot_num"], label="student: dE/dt")
-    axs[2].plot(ES["t"], ES["P_model"], linestyle="--", linewidth=1.0, label="student: P_model")
-    axs[2].set_ylabel("rate (arb.)")
-    axs[2].set_title("Verification: dE/dt ≈ P_model")
-    axs[2].grid(True, linestyle=":", linewidth=0.6)
-    axs[2].legend(ncol=2)
+# ==========================================
+# 3. 其他基础绘图 (保留之前的 Fig1-3)
+# ==========================================
 
-    # (4) decomposition
-    axs[3].plot(ET["t"], ET["P_model"], label="teacher: P_model")
-    axs[3].plot(ET["t"], ET["P_xy"], linestyle="--", linewidth=1.0, label="teacher: P_xy")
-    axs[3].plot(ET["t"], ET["P_param"], linestyle=":", linewidth=1.0, label="teacher: P_param")
+def plot_fig1_position(teacher, student, out_dir):
+    """Fig1: 位置跟踪"""
+    t_min = min(teacher['time_s'].max(), student['time_s'].max())
+    t_teacher = teacher[teacher['time_s'] <= t_min].copy()
+    t_student = student[student['time_s'] <= t_min].copy()
 
-    axs[3].plot(ES["t"], ES["P_model"], label="student: P_model")
-    axs[3].plot(ES["t"], ES["P_xy"], linestyle="--", linewidth=1.0, label="student: P_xy")
-    axs[3].plot(ES["t"], ES["P_param"], linestyle=":", linewidth=1.0, label="student: P_param")
+    # 坐标系校准 (World -> Task Frame)
+    task_goal_x = 2.0
+    offset_x = t_teacher['goal_px'].mean() - task_goal_x
+    offset_y = t_teacher['goal_py'].mean() - 0.0
 
-    axs[3].set_ylabel("power (arb.)")
-    axs[3].set_title("Decomposition: P_model = P_xy + P_param")
-    axs[3].set_xlabel("Time (s)")
-    axs[3].grid(True, linestyle=":", linewidth=0.6)
-    axs[3].legend(ncol=2)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    
+    # X
+    axes[0].plot(t_teacher['time_s'], t_teacher['payload_px'] - offset_x, 'g-', label='Teacher', linewidth=2, alpha=0.6)
+    axes[0].plot(t_student['time_s'], t_student['payload_px'] - offset_x, 'r--', label='Student', linewidth=2)
+    axes[0].plot(t_teacher['time_s'], t_teacher['goal_px'] - offset_x, 'k:', label='Goal', alpha=0.5)
+    axes[0].set_ylabel('Pos X (m)')
+    axes[0].set_title('Figure 1: Position Tracking (Task Frame)')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True)
 
-    _save_fig(fig, out_dir / "fig4_energy_combined.png")
+    # Y
+    axes[1].plot(t_teacher['time_s'], t_teacher['payload_py'] - offset_y, 'g-', label='Teacher', linewidth=2, alpha=0.6)
+    axes[1].plot(t_student['time_s'], t_student['payload_py'] - offset_y, 'r--', label='Student', linewidth=2)
+    axes[1].set_ylabel('Pos Y (m)')
+    axes[1].grid(True)
 
+    # Z
+    axes[2].plot(t_teacher['time_s'], t_teacher['payload_pz'], 'g-', label='Teacher', linewidth=2, alpha=0.6)
+    axes[2].plot(t_student['time_s'], t_student['payload_pz'], 'r--', label='Student', linewidth=2)
+    axes[2].set_ylabel('Pos Z (m)')
+    axes[2].set_xlabel('Time (s)')
+    axes[2].grid(True)
 
-# ----------------------------
-# Main
-# ----------------------------
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "Fig1_Position.png"))
+    plt.close()
+
+def plot_fig2_swing(teacher, student, out_dir):
+    """Fig2: 摆角"""
+    t_min = min(teacher['time_s'].max(), student['time_s'].max())
+    t_teacher = teacher[teacher['time_s'] <= t_min]
+    t_student = student[student['time_s'] <= t_min]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    
+    axes[0].plot(t_teacher['time_s'], t_teacher['theta_x_deg'], 'g-', label='Teacher', alpha=0.6)
+    axes[0].plot(t_student['time_s'], t_student['theta_x_deg'], 'r--', label='Student')
+    axes[0].set_ylabel('Swing X (deg)')
+    axes[0].set_title('Figure 2: Swing Suppression')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(t_teacher['time_s'], t_teacher['theta_y_deg'], 'g-', label='Teacher', alpha=0.6)
+    axes[1].plot(t_student['time_s'], t_student['theta_y_deg'], 'r--', label='Student')
+    axes[1].set_ylabel('Swing Y (deg)')
+    axes[1].set_xlabel('Time (s)')
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "Fig2_Swing.png"))
+    plt.close()
+
+def plot_fig3_latent(student, out_dir):
+    """Fig3: Latent"""
+    df = student
+    fig, axes = plt.subplots(5, 1, figsize=(12, 15), sharex=True)
+    labels = ["z0 (Mass)", "z1 (Length)", "z2 (Env)", "z3 (Wind)", "z4 (Env)"]
+    
+    for i in range(5):
+        axes[i].plot(df['time_s'], df[f'zT{i}'], 'k-', linewidth=2, label='Teacher (GT)', alpha=0.5)
+        axes[i].plot(df['time_s'], df[f'zH{i}'], 'r--', linewidth=2, label='Student (Pred)')
+        axes[i].set_ylabel(f'Latent {i}')
+        axes[i].set_title(labels[i])
+        axes[i].grid(True)
+        if i == 0: axes[i].legend(loc='upper right')
+            
+    axes[-1].set_xlabel('Time (s)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "Fig3_Latent_Full.png"))
+    plt.close()
+
+# ==========================================
+# 4. 主程序
+# ==========================================
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--teacher", type=str, required=True, help="Path to phase2_teacher.csv")
-    ap.add_argument("--student", type=str, required=True, help="Path to phase2_student.csv")
-    ap.add_argument("--out_dir", type=str, default=None, help="Output directory for figures (default: dir of student csv)")
-    ap.add_argument("--start", type=float, nargs=3, default=[-2.0, 0.0, 2.0], help="TASK start offset (x y z)")
-    ap.add_argument("--goal", type=float, nargs=3, default=[2.0, 0.0, 2.0], help="TASK goal offset (x y z)")
-    ap.add_argument("--time_window", type=float, default=5.0, help="Energy plot time window in seconds (like IsaaclabPlot12.5). Use <=0 to disable clipping.")
-    ap.add_argument("--smooth_window", type=float, default=0.15, help="Smoothing window seconds for energy curves.")
-    args = ap.parse_args()
-
-    teacher_path = Path(args.teacher).expanduser().resolve()
-    student_path = Path(args.student).expanduser().resolve()
-
-    start_ref = np.array(args.start, dtype=float)
-    goal_ref = np.array(args.goal, dtype=float)
-
-    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else student_path.parent
-    _ensure_out_dir(out_dir)
-
-    teacher = load_series(teacher_path, "teacher", start_ref, goal_ref)
-    student = load_series(student_path, "student", start_ref, goal_ref)
-
-    # Optional: print inferred origins so you can sanity-check the -9..11 issue.
-    print(f"[INFO] teacher origin_w inferred: {teacher.origin_w} (goal_world - goal_ref)")
-    print(f"[INFO] student origin_w inferred: {student.origin_w} (goal_world - goal_ref)")
-
-    # Plots
-    plot_fig1_payload_pos_and_swing(teacher, student, out_dir)
-    plot_fig2_swing_angles(teacher, student, out_dir)
-    plot_fig3_z_compare(teacher, student, out_dir)
-
-    tw = float(args.time_window)
-    tmax = None if tw <= 0 else tw
-    plot_fig4_energy_combined(teacher, student, out_dir, tmax, float(args.smooth_window))
-
-    print(f"[DONE] Figures saved to: {out_dir}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--teacher", type=str, required=True, help="Path to teacher csv")
+    parser.add_argument("--student", type=str, required=True, help="Path to student csv")
+    parser.add_argument("--out_dir", type=str, default=".")
+    args, unknown = parser.parse_known_args()
+    
+    t_df = load_data(args.teacher)
+    s_df = load_data(args.student)
+    
+    if t_df is not None and s_df is not None:
+        # 1. 数据增强：计算速度、加速度
+        print("[Info] Augmenting data with derivatives...")
+        t_df = augment_data_for_energy_analysis(t_df)
+        s_df = augment_data_for_energy_analysis(s_df)
+        
+        # 2. 绘制基础图表
+        plot_fig1_position(t_df, s_df, args.out_dir)
+        plot_fig2_swing(t_df, s_df, args.out_dir)
+        plot_fig3_latent(s_df, args.out_dir)
+        
+        # 3. 绘制高级能量机理图 (Figure 6 Combined)
+        # 为 Teacher 生成
+        plot_advanced_energy_mechanism(t_df, 
+                                     os.path.join(args.out_dir, "Fig4_Teacher_Energy_Mechanism.png"), 
+                                     "Teacher")
+        
+        # 为 Student 生成
+        plot_advanced_energy_mechanism(s_df, 
+                                     os.path.join(args.out_dir, "Fig5_Student_Energy_Mechanism.png"), 
+                                     "Student")
+        
+    else:
+        print("Failed to load CSV files.")
 
 if __name__ == "__main__":
     main()

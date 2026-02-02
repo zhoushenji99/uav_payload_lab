@@ -160,9 +160,14 @@ def main(env_cfg, agent_cfg):
 
     log_dir = os.path.dirname(resume_path)
     env_cfg.log_dir = log_dir
-
+    # === 【修改位置在这里】 ===
+    # 强制把最大时长设为 10000秒，防止环境自动 Reset
+    if hasattr(env_cfg, "episode_length_s"):
+        env_cfg.episode_length_s = 10000.0
+    # ========================
     # ---- env ----
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -244,7 +249,19 @@ def main(env_cfg, agent_cfg):
 
     step_count = 0
     t0 = time.time()
+    # === 【在这里插入代码】 ===
+    # 强制重置随机种子，消除模型加载带来的 RNG 漂移
+    print(f"[INFO] Re-seeding RNG to {args_cli.seed} to ensure env alignment...")
+    import random
+    import numpy as np
+    torch.manual_seed(args_cli.seed)
+    np.random.seed(args_cli.seed)
+    random.seed(args_cli.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args_cli.seed)
+    # ==========================
 
+    obs, _ = env.reset()  # <--- 这行代码非常关键，必须插在它前面！
     while simulation_app.is_running() and step_count < int(args_cli.max_steps):
         start = time.time()
         with torch.inference_mode():
