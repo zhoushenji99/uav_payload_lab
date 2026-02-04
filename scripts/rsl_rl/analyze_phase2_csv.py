@@ -283,7 +283,65 @@ def plot_fig3_latent(student, out_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "Fig3_Latent_Full.png"))
     plt.close()
+def plot_fig_physical_decoder(student, out_dir):
+    """
+    Fig_Physical_Decoder: 物理参数解码验证 (修正版：反归一化 + 双轴显示)
+    """
+    if 'phys_pred_mass' not in student.columns:
+        print("[Warn] 缺少 phys_pred_mass 列")
+        return
 
+    print("[Plotting] Physical Decoder Verification...")
+    
+    # === 1. 核心修正：反归一化 ===
+    # 你的 Config 定义范围：Mass=[0.05, 0.15], Length=[0.3, 0.8]
+    # 公式：Physical = Min + Norm * (Max - Min)
+    mass_min, mass_max = 0.05, 0.15
+    pred_mass_kg = mass_min + student['phys_pred_mass'] * (mass_max - mass_min)
+    
+    rope_min, rope_max = 0.3, 0.8
+    pred_len_m = rope_min + student['phys_pred_len'] * (rope_max - rope_min)
+    
+    # === 2. 滤波 (去除风扰动的高频噪声) ===
+    # 窗口 100 (约2秒)，这对于质量这种常数估计非常合理
+    pred_mass_smooth = pred_mass_kg.rolling(window=100, min_periods=1).mean()
+    pred_len_smooth = pred_len_m.rolling(window=100, min_periods=1).mean()
+
+    # === 3. 绘图 ===
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    
+    # --- 质量图 ---
+    ax1 = axes[0]
+    # 画真值 (黑线)
+    l1, = ax1.plot(student['time_s'], student['payload_mass_kg'], 'k-', linewidth=3, label='True Mass (GT)')
+    # 画滤波后的预测 (红虚线)
+    l2, = ax1.plot(student['time_s'], pred_mass_smooth, 'r--', linewidth=2.5, label='Predicted (Filtered)')
+    # 画原始噪声预测 (浅红线，展示真实波动)
+    ax1.plot(student['time_s'], pred_mass_kg, 'r-', alpha=0.15, linewidth=1)
+    
+    ax1.set_ylabel('Mass (kg)', fontsize=12, fontweight='bold')
+    ax1.set_title(f'Mass Identification: Error ≈ {abs(pred_mass_smooth.mean() - student["payload_mass_kg"].mean()):.4f} kg', fontsize=14)
+    ax1.legend(loc='upper right')
+    ax1.grid(True, linestyle='--', alpha=0.5)
+    ax1.set_ylim(0.0, 0.25) # 聚焦在真值附近
+
+    # --- 绳长图 ---
+    ax2 = axes[1]
+    l1, = ax2.plot(student['time_s'], student['rope_length_m'], 'k-', linewidth=3, label='True Length (GT)')
+    l2, = ax2.plot(student['time_s'], pred_len_smooth, 'b--', linewidth=2.5, label='Predicted (Filtered)')
+    ax2.plot(student['time_s'], pred_len_m, 'b-', alpha=0.15, linewidth=1)
+    
+    ax2.set_ylabel('Rope Length (m)', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Time (s)', fontsize=12)
+    ax2.legend(loc='upper right')
+    ax2.grid(True, linestyle='--', alpha=0.5)
+    ax2.set_ylim(0.0, 1.0)
+    
+    save_path = os.path.join(out_dir, "Fig_Physical_Decoder.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    print(f"  - Saved {save_path}")
+    plt.close()
 # ==========================================
 # 4. 主程序
 # ==========================================
@@ -308,7 +366,9 @@ def main():
         plot_fig1_position(t_df, s_df, args.out_dir)
         plot_fig2_swing(t_df, s_df, args.out_dir)
         plot_fig3_latent(s_df, args.out_dir)
-        
+        # === [新增调用] ===
+        # 绘制物理参数解码验证图
+        plot_fig_physical_decoder(s_df, args.out_dir)
         # 3. 绘制高级能量机理图 (Figure 6 Combined)
         # 为 Teacher 生成
         plot_advanced_energy_mechanism(t_df, 

@@ -40,16 +40,44 @@ class CNNStudentEncoder(nn.Module):
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, output_dim),
         )
-
+        # === [新增插入] ===
+        # 物理参数解码头：将 Z 的前两维映射回 (Mass, Length)
+        self.decoder = nn.Sequential(
+            nn.Linear(2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2) 
+        )
+        
     def forward(self, x):
         x = x.permute(0, 2, 1)  # (B,H,21)->(B,21,H)
-        return self.mlp(self.cnn(x))
+        feat = self.cnn(x)      # 先提取特征
+        z = self.mlp(feat)      # 计算 Latent Z (5维)
+        
+        # === [新增逻辑] ===
+        # 截取 Z 的前两维 (Explicit)，并解码物理参数
+        z_exp = z[:, :2] 
+        phys_pred = self.decoder(z_exp)
+        
+        # 返回两个值：(Latent Z, Physical Params)
+        return z, phys_pred
 
 def load_shard(path):
     d = torch.load(path, map_location="cpu")
     x = d["inputs"].float()   # (N, H, 21)
     y = d["labels"].float()   # (N, 5)
-    return x, y
+    
+    # === [新增逻辑] ===
+    # 读取物理真值 (Mass, Length)。假设 priv 前两维是 m, l
+    if "priv" in d:
+        p = d["priv"].float()[:, :2]
+    else:
+        # 如果万一没有 priv，报错提醒 (或者临时用全0代替调试)
+        raise ValueError(f"Shard {path} missing 'priv'! Please re-run Step 1 (Collect).")
+        
+    return x, y, p  # 返回三个值
+    # ==================
 
 def compute_z_stats_from_meta(meta_path: str, z_dim: int):
     if not os.path.exists(meta_path):
@@ -78,7 +106,7 @@ def main():
     print(f"[Data] shards={n} train={len(train_files)} val={len(val_files)}")
 
     # infer dims from first shard
-    x0, y0 = load_shard(train_files[0])
+    x0, y0, p0 = load_shard(train_files[0])
     H = x0.shape[1]
     in_dim = x0.shape[2]
     z_dim = y0.shape[1]
@@ -105,7 +133,10 @@ def main():
 
     def mse_loss(pred, target):
         return torch.mean((pred - target) ** 2)
-
+    # === [新增] ===
+    def phys_loss_fn(pred, target):
+        return torch.mean((pred - target) ** 2)
+    lambda_phys = 2.0  # 物理约束权重
     def weighted_mse_loss(pred, target):
         # pred/target: (B,z_dim)
         return torch.mean(((pred - target) ** 2) * w)
@@ -120,8 +151,10 @@ def main():
         train_losses = []
 
         for fp in train_files:
-            x, y = load_shard(fp)
-            ds = TensorDataset(x, y)
+            # [修改] 接收三个返回值
+            x, y, p = load_shard(fp)
+            # [修改] Dataset 包含 x, y, p
+            ds = TensorDataset(x, y, p) 
             dl = DataLoader(
                 ds,
                 batch_size=args.batch_size,
@@ -130,12 +163,24 @@ def main():
                 pin_memory=True,
                 persistent_workers=(args.num_workers > 0),
             )
-            for bx, by in dl:
+            # [修改] 解包三个 batch 数据
+            for bx, by, bp in dl:
                 bx = bx.to(device, non_blocking=True)
                 by = by.to(device, non_blocking=True)
+                bp = bp.to(device, non_blocking=True) # 物理真值
+                
                 opt.zero_grad(set_to_none=True)
-                pred = model(bx)
-                loss = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+                
+                # [修改] 模型返回 z 和 phys_pred
+                z_pred, phys_pred = model(bx)
+                
+                # [修改] 计算两部分 Loss
+                l_z = weighted_mse_loss(z_pred, by) if args.use_weighted_mse else mse_loss(z_pred, by)
+                l_p = phys_loss_fn(phys_pred, bp)
+                
+                # 联合 Loss
+                loss = l_z + lambda_phys * l_p
+                
                 loss.backward()
                 opt.step()
                 train_losses.append(loss.item())
@@ -148,8 +193,8 @@ def main():
         count = 0
         with torch.no_grad():
             for fp in val_files:
-                x, y = load_shard(fp)
-                ds = TensorDataset(x, y)
+                x, y, p = load_shard(fp)
+                ds = TensorDataset(x, y, p)
                 dl = DataLoader(
                     ds,
                     batch_size=args.batch_size,
@@ -158,14 +203,21 @@ def main():
                     pin_memory=True,
                     persistent_workers=(args.num_workers > 0),
                 )
-                for bx, by in dl:
+                # [修改] 解包 bx, by, bp
+                for bx, by, bp in dl:
                     bx = bx.to(device, non_blocking=True)
                     by = by.to(device, non_blocking=True)
-                    pred = model(bx)
-                    loss = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+                    # bp = bp.to(...) # 验证阶段如果不算物理Loss可以不用bp，但为了不出错建议加上
+                    
+                    # [修改] 获取 z_pred
+                    z_pred, phys_pred = model(bx)
+                    
+                    # 计算 Loss (这里只记录了总 Loss，也可以拆开记录)
+                    loss = weighted_mse_loss(z_pred, by) if args.use_weighted_mse else mse_loss(z_pred, by)
                     val_losses.append(loss.item())
 
-                    err = pred - by
+                    # 计算 RMSE (只针对 Z)
+                    err = z_pred - by
                     sum_sq += (err * err).sum(dim=0)
                     count += err.shape[0]
 
