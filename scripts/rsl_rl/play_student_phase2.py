@@ -131,26 +131,10 @@ class CNNStudentEncoder(nn.Module):
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, output_dim),
         )
-        # === [必须新增] decoder 定义 ===
-        # 否则 load_state_dict 会报错 "Unexpected key: decoder..."
-        self.decoder = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2) 
-        )
-        # ============================
+
     def forward(self, x):
-        x = x.permute(0, 2, 1)
-        feat = self.cnn(x)
-        z = self.mlp(feat)
-        
-        # === [必须新增] 计算物理预测 ===
-        z_exp = z[:, :2]
-        phys_pred = self.decoder(z_exp)
-        
-        return z, phys_pred  # 返回 Tuple (z, phys_pred)
+        x = x.permute(0, 2, 1)  # (B,H,21)->(B,21,H)
+        return self.mlp(self.cnn(x))
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -176,14 +160,9 @@ def main(env_cfg, agent_cfg):
 
     log_dir = os.path.dirname(resume_path)
     env_cfg.log_dir = log_dir
-    # === 【修改位置在这里】 ===
-    # 强制把最大时长设为 10000秒，防止环境自动 Reset
-    if hasattr(env_cfg, "episode_length_s"):
-        env_cfg.episode_length_s = 10000.0
-    # ========================
+
     # ---- env ----
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -251,7 +230,6 @@ def main(env_cfg, agent_cfg):
         "zT0","zT1","zT2","zT3","zT4",
         "zH0","zH1","zH2","zH3","zH4",
         "z_rmse",
-        "phys_pred_mass", "phys_pred_len",
         # actions
         "a0_raw","a1_raw","a2_raw","a3_raw",
         "a0_clamp","a1_clamp","a2_clamp","a3_clamp",
@@ -266,84 +244,56 @@ def main(env_cfg, agent_cfg):
 
     step_count = 0
     t0 = time.time()
-    # === 【在这里插入代码】 ===
-    # 强制重置随机种子，消除模型加载带来的 RNG 漂移
-    print(f"[INFO] Re-seeding RNG to {args_cli.seed} to ensure env alignment...")
-    import random
-    import numpy as np
-    torch.manual_seed(args_cli.seed)
-    np.random.seed(args_cli.seed)
-    random.seed(args_cli.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args_cli.seed)
-    # ==========================
-
-    obs, _ = env.reset()  # <--- 这行代码非常关键，必须插在它前面！
-    # 确保 e 在循环前定义，避免报错
-    e = int(args_cli.trace_env)
 
     while simulation_app.is_running() and step_count < int(args_cli.max_steps):
         start = time.time()
         with torch.inference_mode():
-            # 1. 解析观测数据
             obs_tensor = _get_obs_tensor(obs)  # (N, 22)
             obs_proprio = obs_tensor[:, :proprio_dim]
             priv = obs_tensor[:, proprio_dim:proprio_dim + priv_dim]
 
-            # 2. 更新历史信息 (用于 Student Encoder)
+            # history: [proprio(17), last_action(4)] => 21 dims (MUST match collect_z_dataset.py)
             feat = torch.cat([obs_proprio, last_actions], dim=1)
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
-            # 3. 计算 Latent Z 和 物理预测
-            #    Teacher: z = mu(priv), phys_pred = 0 (占位)
-            #    Student: z = encoder(history), phys_pred = decoder(z)
+            # teacher z: mu(priv)
+            if hasattr(policy_nn, "mu"):
+                z_teacher = policy_nn.mu(priv)
+            else:
+                z_teacher = priv
+
+            # student z_hat
             if args_cli.mode == "teacher":
-                if hasattr(policy_nn, "mu"):
-                    z_teacher = policy_nn.mu(priv)
-                else:
-                    z_teacher = priv
-                
-                # Teacher 模式下的变量赋值
                 z_hat = z_teacher
-                phys_pred_val = [0.0, 0.0] # 占位符
-                
-                # 策略配置：Teacher 使用 mu(priv)
+            else:
+                z_hat = encoder(obs_history)
+            # ---- build obs dict for policy (RMAActorCritic expects TensorDict/dict with group keys) ----
+            # Start from raw env obs (22-dim): [proprio(17), tail(5)]
+            raw_in = obs_tensor.clone()
+
+            if args_cli.mode == "teacher":
+                # Phase-1 teacher: tail is privileged e, policy internally does z=mu(e)
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = True
-                    
-            else: # Student Mode
-                # 调用 Encoder (返回 tuple)
-                z_hat, phys_pred = encoder(obs_history)
-                
-                # 提取当前环境的物理预测值 (用于 Log)
-                phys_pred_val = phys_pred[e].detach().cpu().numpy().tolist()
-                
-                # 同时也需要计算 z_teacher 用于对比 (RMSE)
-                if hasattr(policy_nn, "mu"):
-                    z_teacher = policy_nn.mu(priv)
-                else:
-                    z_teacher = priv
-
-                # 策略配置：Student 直接使用 z_hat
+                z_hat_for_policy = priv  # keep original tail as e
+            else:
+                # Phase-2 student: replace tail with z_hat, and policy treats tail as z directly
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
-
-            # 4. 构建策略输入 (raw_in)
-            #    Teacher: [proprio, priv] (策略内部会自己做 mu(priv))
-            #    Student: [proprio, z_hat] (我们要手动替换 tail)
-            raw_in = obs_tensor.clone()
-            
-            if args_cli.mode == "student":
-                # 关键：用 Student 预测的 z 替换掉观测中的 priv
                 raw_in[:, proprio_dim:proprio_dim + priv_dim] = z_hat
+                z_hat_for_policy = z_hat
 
-            # 5. 策略推理
+            # Build obs input for actor. Use existing group names if possible.
+            # Most IsaacLab setups use obs["policy"] only; we also provide "critic" if present.
             obs_in = {}
             obs_in["policy"] = raw_in
             if isinstance(obs, dict) and ("critic" in obs):
                 obs_in["critic"] = raw_in
 
+            # Action inference (returns unclipped action)
+            if not hasattr(policy_nn, "act_inference"):
+                raise RuntimeError("policy_nn has no act_inference(); unexpected policy type.")
             actions_raw = policy_nn.act_inference(obs_in)
             actions_clamp = actions_raw.clamp(-1.0, 1.0)
 
@@ -396,7 +346,6 @@ def main(env_cfg, agent_cfg):
                 *zT,
                 *zH,
                 z_rmse,
-                phys_pred_val[0], phys_pred_val[1],
                 *a_raw,
                 *a_clp,
             ])

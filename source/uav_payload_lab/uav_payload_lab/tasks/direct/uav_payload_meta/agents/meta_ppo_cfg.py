@@ -6,6 +6,7 @@
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+PPO_PHYS_ANCHOR = '__import__("uav_payload_lab.tasks.direct.uav_payload_meta.ppo_phys_anchor", fromlist=["PPO"]).PPO'
 
 # 让 IsaacLab 的 eval(class_name) 直接拿到类，不依赖额外 import
 RMA_ACTOR_CRITIC = '__import__("uav_payload_lab.tasks.direct.uav_payload_meta.rma_actor_critic", fromlist=["RMAActorCritic"]).RMAActorCritic'
@@ -30,6 +31,7 @@ class MetaPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     )
     algorithm = RslRlPpoAlgorithmCfg(
+        class_name=PPO_PHYS_ANCHOR,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,

@@ -224,7 +224,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # --- 2) 摆角 + 摆角角速度 ----------------------------------------
         # rope 长度，用 cfg 中的参数（标量）
-        L = self._rope_lengths  # 保持 (num_envs,) 维度，不要 unsqueeze
+        L = self._rope_lengths.clamp(min=1e-3)
 
         # 近似：摆角 θx, θy（世界系）—— 和你原来的定义保持一致
         ex = r_load_uav[:, 0]

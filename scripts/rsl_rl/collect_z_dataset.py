@@ -128,7 +128,6 @@ def main(env_cfg, agent_cfg):
     # shard buffers
     shard_inputs = []
     shard_labels = []
-    shard_priv = []   
     shard_idx = 0
     step_count = 0
     warmup = history_len
@@ -177,7 +176,7 @@ def main(env_cfg, agent_cfg):
             if step_count >= warmup:
                 shard_inputs.append(obs_history.detach().clone().cpu().to(torch.float16))
                 shard_labels.append(z_teacher.detach().clone().cpu().to(torch.float32))
-                shard_priv.append(priv.detach().clone().cpu().to(torch.float32))
+
                 # update stats (use batch mean on CPU)
                 z_cpu = z_teacher.detach().cpu()
                 z_sum += z_cpu.sum(dim=0)
@@ -228,14 +227,11 @@ def main(env_cfg, agent_cfg):
             if (step_count >= warmup) and ((step_count - warmup + 1) % args_cli.save_every == 0):
                 inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
                 labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
-                privs = torch.stack(shard_priv, dim=0).reshape(-1, priv_dim)
-                
                 shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
-                torch.save({"inputs": inputs, "labels": labels, "priv": privs}, shard_path)
+                torch.save({"inputs": inputs, "labels": labels}, shard_path)
                 print(f"[Collect] saved {shard_path} | inputs={inputs.shape} labels={labels.shape}")
                 shard_inputs.clear()
                 shard_labels.clear()
-                shard_priv.clear()
                 shard_idx += 1
 
             # stop condition
@@ -244,9 +240,8 @@ def main(env_cfg, agent_cfg):
                 if len(shard_inputs) > 0:
                     inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
                     labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
-                    privs = torch.stack(shard_priv, dim=0).reshape(-1, priv_dim)
                     shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
-                    torch.save({"inputs": inputs, "labels": labels, "priv": privs}, shard_path)
+                    torch.save({"inputs": inputs, "labels": labels}, shard_path)
                     print(f"[Collect] saved {shard_path} | inputs={inputs.shape} labels={labels.shape}")
 
                 # write meta + stats

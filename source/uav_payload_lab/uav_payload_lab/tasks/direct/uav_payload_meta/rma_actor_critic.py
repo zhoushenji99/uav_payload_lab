@@ -135,6 +135,7 @@ class RMAActorCritic(nn.Module):
         self.last_z: torch.Tensor | None = None
         self.last_z_exp: torch.Tensor | None = None
         self.last_z_imp: torch.Tensor | None = None
+        self.last_e: torch.Tensor | None = None  # <--- NEW: cache privileged e for phys anchor
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -162,9 +163,11 @@ class RMAActorCritic(nn.Module):
 
     def _compute_z(self, tail: torch.Tensor) -> torch.Tensor:
         if self.use_mu:
+            self.last_e = tail
             z = self.mu(tail)
         else:
             # Phase2: tail is already z_hat from φ(history)
+            self.last_e = None
             if tail.shape[-1] != self.z_dim:
                 raise ValueError(f"Phase2 expects tail dim={self.z_dim}, got {tail.shape[-1]}")
             z = tail
@@ -262,6 +265,13 @@ class RMAActorCritic(nn.Module):
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
     # --- in rma_actor_critic.py ---
+    def aux_phys_loss(self) -> torch.Tensor | None:
+        """Anchor z_exp to privileged slow vars: ||z_exp - e[:z_exp_dim]||^2."""
+        if (not self.use_mu) or (self.last_z_exp is None) or (self.last_e is None):
+            return None
+        # e 的前两维就是 m_norm, l_norm（你的 env 就是这么拼的）
+        target = self.last_e[..., : self.z_exp_dim]
+        return (self.last_z_exp - target).pow(2).mean()
 
     def load_state_dict(self, state_dict, strict: bool = True):
         # Allow older checkpoints without probe.*
