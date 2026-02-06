@@ -10,7 +10,7 @@ import math
 # === Analysis window (seconds) ===
 TIME_WINDOW_S = 35   # set None to disable cropping
 
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-02-06_02-02-11/payload_data.csv" 
+simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-02-06_14-29-11/11000.csv" 
 paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
 
 # 坐标系校正 (World -> Task)

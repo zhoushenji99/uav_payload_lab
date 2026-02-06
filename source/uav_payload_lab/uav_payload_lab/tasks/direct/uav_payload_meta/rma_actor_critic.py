@@ -41,7 +41,7 @@ class RMAActorCritic(nn.Module):
         # -------- RMA knobs --------
         proprio_obs_dim: int = 17,
         privileged_obs_dim: int = 5,
-        z_dim: int = 5,
+        z_dim: int = 12,
         z_exp_dim: int = 2,                   # optional split for logging
         use_mu: bool = True,                  # Phase-1 True, Phase-2 False
         mu_hidden_dims: tuple[int] | list[int] = [64, 64],
