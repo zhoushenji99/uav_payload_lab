@@ -315,13 +315,20 @@ class PPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
-            # ---- Phys anchor loss: only if policy provides aux_phys_loss() ----
-            phys_anchor_loss = None
-            aux_fn = getattr(self.policy, "aux_phys_loss", None)
-            if callable(aux_fn):
-                phys_anchor_loss = aux_fn()
-                if phys_anchor_loss is not None:
-                    loss = loss + self.phys_anchor_coef * phys_anchor_loss
+            # [修改] 使用新的显式接口
+            if hasattr(self.policy, "compute_physics_loss"):
+                # 传入当前的 obs_batch
+                phys_loss = self.policy.compute_physics_loss(obs_batch)
+                
+                # [双保险] 检查 NaN，防止一颗老鼠屎坏了一锅粥
+                if torch.isnan(phys_loss):
+                    # 如果算出来是 NaN，说明网络权重已经坏了，或者输入数据有问题
+                    # 这里可以选择打印警告并跳过，或者直接报错
+                    pass 
+                else:
+                    # 权重建议：先给 1.0，稳住再加
+                    loss += 1.0 * phys_loss
+                    mean_phys_anchor += phys_loss.item()
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions
@@ -399,8 +406,7 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            if phys_anchor_loss is not None:
-                mean_phys_anchor += float(phys_anchor_loss.item())
+
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates

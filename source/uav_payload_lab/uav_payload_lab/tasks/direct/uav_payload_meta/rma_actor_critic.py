@@ -264,15 +264,37 @@ class RMAActorCritic(nn.Module):
             self.actor_obs_normalizer.update(self.get_actor_obs(obs))
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
-    # --- in rma_actor_critic.py ---
-    def aux_phys_loss(self) -> torch.Tensor | None:
-        """Anchor z_exp to privileged slow vars: ||z_exp - e[:z_exp_dim]||^2."""
-        if (not self.use_mu) or (self.last_z_exp is None) or (self.last_e is None):
-            return None
-        # e 的前两维就是 m_norm, l_norm（你的 env 就是这么拼的）
-        target = self.last_e[..., : self.z_exp_dim]
-        return (self.last_z_exp - target).pow(2).mean()
+    def compute_physics_loss(self, obs) -> torch.Tensor:
+        """
+        显式计算物理监督 Loss
+        Input: obs (TensorDict or Tensor)
+        """
+        # === [修复 1]：拆快递 ===
+        # Isaac Lab 的 obs 是一个 TensorDict，真正的数据在 "policy" 键里
+        # 如果传入的是 TensorDict，必须先提取出来
+        if hasattr(obs, "get") and obs.get("policy") is not None:
+            raw_obs = obs["policy"]
+        else:
+            raw_obs = obs
+            
+        # 此时 raw_obs 才是 (Batch, 22) 的 Tensor
+        
+        # 1. 切分出 Priv 信息
+        priv = raw_obs[:, self.proprio_dim : self.proprio_dim + self.priv_dim]
+        
+        # 2. 提取真值 (前两维是 Mass, Length)
+        gt_phys = priv[:, :2]
 
+        # 3. 现场重新计算 Encoder
+        z = self.mu(priv)
+        
+        # 4. 提取预测值
+        pred_phys = z[:, :2]
+
+        # 5. MSE Loss
+        loss = (pred_phys - gt_phys).pow(2).mean()
+        return loss
+    
     def load_state_dict(self, state_dict, strict: bool = True):
         # Allow older checkpoints without probe.*
         allowed_missing = {"probe.weight", "probe.bias"}
