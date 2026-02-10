@@ -33,7 +33,7 @@ parser = argparse.ArgumentParser(description="Phase-2 Play: Teacher(mu(priv)) vs
 # phase-2 specific
 parser.add_argument("--mode", type=str, default="student", choices=["student", "teacher"])
 parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
-parser.add_argument("--history_len", type=int, default=50)
+parser.add_argument("--history_len", type=int, default=250)
 parser.add_argument("--trace_env", type=int, default=0, help="Which env index to log to CSV.")
 parser.add_argument("--stop_on_done", action="store_true", default=True, help="Stop when trace_env episode ends (default: True).")
 parser.add_argument("--no_stop_on_done", dest="stop_on_done", action="store_false", help="Do not stop on done; keep running until max_steps.")
@@ -117,7 +117,7 @@ def _default_csv_path(resume_path: str, mode: str) -> str:
 # student encoder (must match train_student_z.py)
 # ----------------------------
 class CNNStudentEncoder(nn.Module):
-    def __init__(self, input_dim=21, history_len=50, output_dim=5):
+    def __init__(self, input_dim=21, history_len=250, output_dim=5):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(input_dim, 64, 5, 1, 2), nn.ReLU(), nn.BatchNorm1d(64),
@@ -167,7 +167,8 @@ def main(env_cfg, agent_cfg):
         env = multi_agent_to_single_agent(env)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     base_env = env.unwrapped
-
+    if hasattr(base_env, "episode_length_buf"):
+        base_env.episode_length_buf[:] = 0
     # ---- runner + policy ----
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     print(f"[INFO] Loading checkpoint (model-only): {resume_path}")
@@ -245,92 +246,82 @@ def main(env_cfg, agent_cfg):
     step_count = 0
     t0 = time.time()
 
+    # ----------------------------
+    # Main rollout loop (single-step, aligned logging)
+    # ----------------------------
     while simulation_app.is_running() and step_count < int(args_cli.max_steps):
         start = time.time()
         with torch.inference_mode():
-            obs_tensor = _get_obs_tensor(obs)  # (N, 22)
-            obs_proprio = obs_tensor[:, :proprio_dim]
-            priv = obs_tensor[:, proprio_dim:proprio_dim + priv_dim]
 
-            # history: [proprio(17), last_action(4)] => 21 dims (MUST match collect_z_dataset.py)
-            feat = torch.cat([obs_proprio, last_actions], dim=1)
+            # ---- 0) current obs(t) -> tensor ----
+            obs_tensor = _get_obs_tensor(obs)  # (N, proprio_dim + priv_dim) e.g. (N, 22)
+            obs_proprio = obs_tensor[:, :proprio_dim]  # (N, 17)
+            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]  # (N, 5)  == e(t)
+
+            # ---- 1) update history with (s_t, a_{t-1}) ----
+            # feature_t = [proprio(t), last_action(t-1)]  (MUST match collect_z_dataset.py)
+            feat = torch.cat([obs_proprio, last_actions], dim=1)  # (N, 21)
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
-            # teacher z: mu(priv)
+            # ---- 2) compute z_teacher (for logging/label) and z_hat (student prediction) ----
             if hasattr(policy_nn, "mu"):
-                z_teacher = policy_nn.mu(priv)
+                z_teacher = policy_nn.mu(priv)  # (N, z_dim)
             else:
-                z_teacher = priv
-
-            # student z_hat
-            if args_cli.mode == "teacher":
-                z_hat = z_teacher
-            else:
-                z_hat = encoder(obs_history)
-            # ---- build obs dict for policy (RMAActorCritic expects TensorDict/dict with group keys) ----
-            # Start from raw env obs (22-dim): [proprio(17), tail(5)]
-            raw_in = obs_tensor.clone()
+                z_teacher = priv  # fallback (shouldn't happen if RMAActorCritic is used)
 
             if args_cli.mode == "teacher":
-                # Phase-1 teacher: tail is privileged e, policy internally does z=mu(e)
+                # teacher: policy sees e(t) and internally uses z = mu(e)
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = True
-                z_hat_for_policy = priv  # keep original tail as e
+                z_hat = z_teacher  # for logging only
+                policy_in = obs_tensor  # tail stays as priv=e
             else:
-                # Phase-2 student: replace tail with z_hat, and policy treats tail as z directly
+                # student: policy sees z_hat directly
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
-                raw_in[:, proprio_dim:proprio_dim + priv_dim] = z_hat
-                z_hat_for_policy = z_hat
+                z_hat = encoder(obs_history).detach()  # (N, z_dim)
+                policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 17+z_dim)
 
-            # Build obs input for actor. Use existing group names if possible.
-            # Most IsaacLab setups use obs["policy"] only; we also provide "critic" if present.
-            obs_in = {}
-            obs_in["policy"] = raw_in
+            # ---- 3) build obs dict for policy ----
+            obs_in = {"policy": policy_in}
             if isinstance(obs, dict) and ("critic" in obs):
-                obs_in["critic"] = raw_in
+                obs_in["critic"] = policy_in
 
-            # Action inference (returns unclipped action)
+            # ---- 4) action inference (t) ----
             if not hasattr(policy_nn, "act_inference"):
                 raise RuntimeError("policy_nn has no act_inference(); unexpected policy type.")
-            actions_raw = policy_nn.act_inference(obs_in)
-            actions_clamp = actions_raw.clamp(-1.0, 1.0)
+            actions_raw = policy_nn.act_inference(obs_in)             # (N, act_dim)
+            actions = actions_raw.clamp(-1.0, 1.0)                    # (N, act_dim)
 
-            # step env
-            obs, _, dones, _ = env.step(actions_clamp)
-            last_actions = actions_clamp.detach()
-
-            # reset history for done envs
-            if torch.any(dones):
-                obs_history[dones] = 0.0
-                last_actions[dones] = 0.0
-                if hasattr(policy_nn, "reset"):
-                    policy_nn.reset(dones)
-
-            # ---- log trace env ----
+            # ---- 5) LOG at time t (BEFORE env.step) ----
             e = trace_env
-            # positions from env (more trustworthy than reconstructing)
+
+            # state (t): from base_env (aligned with obs_tensor)
             uav_pos = base_env._robot.data.root_pos_w[e].detach().cpu().numpy().tolist()
             payload_pos = base_env._robot.data.body_pos_w[e, base_env._payload_id, :].detach().cpu().numpy().tolist()
             goal_pos = base_env._desired_pos_w[e].detach().cpu().numpy().tolist()
-            payload_err = obs_tensor[e, 0:3].detach().cpu().numpy().tolist()
 
+            # obs-derived (t)
+            payload_err = obs_tensor[e, 0:3].detach().cpu().numpy().tolist()
             theta_x = float(obs_tensor[e, 3].detach().cpu())
             theta_y = float(obs_tensor[e, 4].detach().cpu())
             theta_dx = float(obs_tensor[e, 5].detach().cpu())
             theta_dy = float(obs_tensor[e, 6].detach().cpu())
 
+            # env params (t)
             rope_L = float(base_env._rope_lengths[e].detach().cpu())
             pay_m = float(base_env._payload_mass[e].detach().cpu())
 
+            # z compare (t)
             priv_e = priv[e].detach().cpu().numpy().tolist()
             zT = z_teacher[e].detach().cpu().numpy().tolist()
             zH = z_hat[e].detach().cpu().numpy().tolist()
             z_rmse = float(torch.sqrt(torch.mean((z_teacher[e] - z_hat[e]) ** 2)).detach().cpu())
 
+            # actions (t)
             a_raw = actions_raw[e].detach().cpu().numpy().tolist()
-            a_clp = actions_clamp[e].detach().cpu().numpy().tolist()
+            a_clp = actions[e].detach().cpu().numpy().tolist()
 
             w.writerow([
                 step_count * dt,
@@ -350,7 +341,19 @@ def main(env_cfg, agent_cfg):
                 *a_clp,
             ])
 
-            # stop if traced env ended (for single-episode comparability)
+            # ---- 6) SINGLE env.step: advance to obs(t+1) ----
+            obs, _, dones, _ = env.step(actions)
+
+            # ---- 7) update last_actions & reset history for done envs ----
+            last_actions = actions.detach()
+
+            if torch.any(dones):
+                obs_history[dones] = 0.0
+                last_actions[dones] = 0.0
+                if hasattr(policy_nn, "reset"):
+                    policy_nn.reset(dones)
+
+            # stop exactly at episode boundary of trace_env
             if bool(args_cli.stop_on_done) and bool(dones[e].item()):
                 print(f"[INFO] trace_env done at step={step_count}. stop_on_done=True -> exit.")
                 break
@@ -363,9 +366,13 @@ def main(env_cfg, agent_cfg):
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
+    # ----------------------------
+    # Cleanup
+    # ----------------------------
     f.close()
     env.close()
     print(f"[DONE] steps={step_count} wall={time.time()-t0:.2f}s -> {csv_path}")
+
 
 
 if __name__ == "__main__":

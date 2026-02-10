@@ -26,7 +26,7 @@ def parse_args():
     return p.parse_args()
 
 class CNNStudentEncoder(nn.Module):
-    def __init__(self, input_dim=21, history_len=50, output_dim=5):
+    def __init__(self, input_dim=21, history_len=250, output_dim=5):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(input_dim, 64, 5, 1, 2), nn.ReLU(), nn.BatchNorm1d(64),

@@ -14,7 +14,7 @@ import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description="Collect Phase-2 dataset: history -> z_teacher + trace + meta stats.")
 parser.add_argument("--steps", type=int, default=1000, help="Steps to collect (per-env steps).")
-parser.add_argument("--history_len", type=int, default=50)
+parser.add_argument("--history_len", type=int, default=250)
 parser.add_argument("--save_every", type=int, default=25, help="Save a shard every N steps.")
 parser.add_argument("--out_name", type=str, default="student_z_dataset", help="Output folder name under log_dir.")
 
@@ -32,6 +32,12 @@ parser.add_argument("--task", type=str, default=None)
 parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
 parser.add_argument("--real-time", action="store_true", default=False)
 
+parser.add_argument("--probe_sec", type=float, default=2.0,
+                    help="Seconds of probing excitation at episode start (0 disables).")
+parser.add_argument("--probe_amp", type=float, default=0.35,
+                    help="Amplitude of probing lateral command in action space.")
+parser.add_argument("--probe_freq", type=float, default=1.0,
+                    help="Hz of probing sine.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -117,7 +123,7 @@ def main(env_cfg, agent_cfg):
 
     obs = env.get_observations()
     dt = env.unwrapped.step_dt
-
+    probe_steps = int(args_cli.probe_sec / dt)
     # history buffer: (N, H, 21)
     obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=env.device)
     last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
@@ -154,30 +160,49 @@ def main(env_cfg, agent_cfg):
     while simulation_app.is_running():
         start_time = time.time()
         with torch.inference_mode():
-            actions_raw = policy(obs)
-            actions_clamp = actions_raw.clamp(-1.0, 1.0)
+            # ---- 0) compute teacher action from current obs(t) ----
+            actions_raw = policy(obs)                          # (N,4)
+            actions_clamp = actions_raw.clamp(-1.0, 1.0)       # (N,4)
 
-            obs_tensor = _get_obs_tensor(obs)
+            # ---- 1) OPTIONAL probe: override action for first probe_steps ----
+            actions_to_step = actions_clamp
 
-            # proprio + last_action -> history
-            obs_proprio = obs_tensor[:, :proprio_dim]
-            feat = torch.cat([obs_proprio, last_actions], dim=1)  # (N,21)
+            probe_start = warmup
+            probe_end = warmup + probe_steps   # probe_steps 仍然由 probe_sec/dt 决定
+
+            if probe_steps > 0 and (probe_start <= step_count < probe_end):
+                t = (step_count - probe_start) * float(dt)
+                s = math.sin(2.0 * math.pi * float(args_cli.probe_freq) * t)
+
+                actions_to_step = actions_clamp.clone()
+                actions_to_step[:, 1] = float(args_cli.probe_amp) * s
+                actions_to_step[:, 2] = -float(args_cli.probe_amp) * s
+                actions_to_step[:, 3] = 0.0
+                actions_to_step = actions_to_step.clamp(-1.0, 1.0)
+
+
+            # ---- 2) build history input from obs(t) and last_action(t-1) ----
+            obs_tensor = _get_obs_tensor(obs)                  # (N,22)
+            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,17)
+            feat = torch.cat([obs_proprio, last_actions], dim=1)   # (N,21)
 
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
-            # teacher priv + z_teacher
-            priv = obs_tensor[:, 17:17 + priv_dim]
-            if getattr(policy_nn, "last_z", None) is None:
-                raise RuntimeError("policy_nn.last_z is None. Ensure RMAActorCritic sets last_z in _compute_z().")
-            z_teacher = policy_nn.last_z.detach()
+            # ---- 3) teacher label z_teacher: use mu(priv) (robust; no dependency on last_z timing) ----
+            priv = obs_tensor[:, 17:17 + priv_dim]             # (N,5)
+            if hasattr(policy_nn, "mu"):
+                z_teacher = policy_nn.mu(priv).detach()        # (N,5)
+            else:
+                # fallback (shouldn't happen in your setup)
+                z_teacher = priv.detach()
 
-            # store after warmup
+            # ---- 4) store sample after warmup ----
             if step_count >= warmup:
                 shard_inputs.append(obs_history.detach().clone().cpu().to(torch.float16))
                 shard_labels.append(z_teacher.detach().clone().cpu().to(torch.float32))
 
-                # update stats (use batch mean on CPU)
+                # stats (CPU)
                 z_cpu = z_teacher.detach().cpu()
                 z_sum += z_cpu.sum(dim=0)
                 z_sumsq += (z_cpu * z_cpu).sum(dim=0)
@@ -190,32 +215,30 @@ def main(env_cfg, agent_cfg):
                 priv_min = torch.minimum(priv_min, p_cpu.min(dim=0).values)
                 priv_max = torch.maximum(priv_max, p_cpu.max(dim=0).values)
 
-                # env0 trace (ONLY 1 env, cheap, for plots)
+                # trace
                 if args_cli.trace_csv and trace_env < env.num_envs:
                     e = trace_env
-                    # basic metrics from obs
                     payload_err = obs_tensor[e, 0:3].detach().cpu().numpy()
                     theta_deg = obs_tensor[e, 3:5].detach().cpu().numpy()
                     theta_dot_deg_s = obs_tensor[e, 5:7].detach().cpu().numpy()
                     pos_err = float(torch.norm(obs_tensor[e, 0:3]).cpu())
 
                     trace_rows.append([
-                        (step_count - warmup) * dt,
+                        (step_count - warmup) * float(dt),
                         *priv[e].detach().cpu().numpy().tolist(),
                         *z_teacher[e].detach().cpu().numpy().tolist(),
                         pos_err,
                         theta_deg[0], theta_deg[1],
                         theta_dot_deg_s[0], theta_dot_deg_s[1],
                         *actions_raw[e].detach().cpu().numpy().tolist(),
-                        *actions_clamp[e].detach().cpu().numpy().tolist(),
+                        *actions_to_step[e].detach().cpu().numpy().tolist(),   # 注意这里记录实际 step 的动作
                     ])
-                    if args_cli.trace_max_steps > 0 and len(trace_rows) >= args_cli.trace_max_steps:
-                        pass  # just stop adding more rows; still collect shards
 
-            # step env
-            obs, _, dones, _ = env.step(actions_clamp)
-            last_actions = actions_clamp.detach()
+            # ---- 5) step env ONCE using actions_to_step ----
+            obs, _, dones, _ = env.step(actions_to_step)
 
+            # ---- 6) update last_actions & reset buffers for done envs ----
+            last_actions = actions_to_step.detach()
             if torch.any(dones):
                 obs_history[dones] = 0.0
                 last_actions[dones] = 0.0
@@ -223,7 +246,7 @@ def main(env_cfg, agent_cfg):
 
             step_count += 1
 
-            # save shard
+            # ---- 7) save shards & stop ----
             if (step_count >= warmup) and ((step_count - warmup + 1) % args_cli.save_every == 0):
                 inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
                 labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
