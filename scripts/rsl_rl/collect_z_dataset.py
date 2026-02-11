@@ -14,7 +14,7 @@ import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description="Collect Phase-2 dataset: history -> z_teacher + trace + meta stats.")
 parser.add_argument("--steps", type=int, default=1000, help="Steps to collect (per-env steps).")
-parser.add_argument("--history_len", type=int, default=250)
+parser.add_argument("--history_len", type=int, default=50)
 parser.add_argument("--save_every", type=int, default=25, help="Save a shard every N steps.")
 parser.add_argument("--out_name", type=str, default="student_z_dataset", help="Output folder name under log_dir.")
 

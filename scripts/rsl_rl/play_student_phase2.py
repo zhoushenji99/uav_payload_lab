@@ -33,7 +33,7 @@ parser = argparse.ArgumentParser(description="Phase-2 Play: Teacher(mu(priv)) vs
 # phase-2 specific
 parser.add_argument("--mode", type=str, default="student", choices=["student", "teacher"])
 parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
-parser.add_argument("--history_len", type=int, default=250)
+parser.add_argument("--history_len", type=int, default=50)
 parser.add_argument("--trace_env", type=int, default=0, help="Which env index to log to CSV.")
 parser.add_argument("--stop_on_done", action="store_true", default=True, help="Stop when trace_env episode ends (default: True).")
 parser.add_argument("--no_stop_on_done", dest="stop_on_done", action="store_false", help="Do not stop on done; keep running until max_steps.")
@@ -117,7 +117,7 @@ def _default_csv_path(resume_path: str, mode: str) -> str:
 # student encoder (must match train_student_z.py)
 # ----------------------------
 class CNNStudentEncoder(nn.Module):
-    def __init__(self, input_dim=21, history_len=250, output_dim=5):
+    def __init__(self, input_dim=21, history_len=50, output_dim=5):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(input_dim, 64, 5, 1, 2), nn.ReLU(), nn.BatchNorm1d(64),
