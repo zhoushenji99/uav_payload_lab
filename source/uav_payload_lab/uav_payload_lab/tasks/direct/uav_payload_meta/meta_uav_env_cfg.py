@@ -210,3 +210,14 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # μ(e)->z 的网络结构（Phase1 联训）
     rma_mu_hidden_dims = (64, 64)
     rma_activation = "elu"
+    
+    # ---------------------------------------------------------------------
+    # Observation noise (Sim2Real)
+    # ---------------------------------------------------------------------
+    enable_obs_noise = True
+
+    # 对应 obs 的 17 维里这些块
+    obs_noise_e_load_std_m = 0.02      # e_load (m)
+    obs_noise_tilt_std_deg = 0.7       # theta_x, theta_y (deg)
+    obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
+    obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)

@@ -117,6 +117,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._prev_tilt_deg = None
         self._tilt_vel_deg = None
         self._has_prev_tilt = None
+        # noisy obs history (only for policy observation)
+        self._obs_prev_tilt_deg = None
+        self._obs_has_prev_tilt = None
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
         # Wind disturbance module (optional)
@@ -271,46 +274,95 @@ class UavPayloadMetaEnv(DirectRLEnv):
         w_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
 
         # --- 4) 打包 obs ---------------------------------------------------
-        obs = torch.cat(
+        # =========================
+        # Observation noise
+        # reward still uses clean self._tilt_vel_deg
+        # =========================
+        if getattr(self.cfg, "enable_obs_noise", False):
+            # 1) additive noise on clean signals
+            e_load_obs = e_load + torch.randn_like(e_load) * float(self.cfg.obs_noise_e_load_std_m)
+            tilt_deg_obs = tilt_deg + torch.randn_like(tilt_deg) * float(self.cfg.obs_noise_tilt_std_deg)
+            v_b_obs = v_b + torch.randn_like(v_b) * float(self.cfg.obs_noise_v_b_std_mps)
+            w_b_obs = w_b + torch.randn_like(w_b) * float(self.cfg.obs_noise_w_b_std_rps)
+
+            # 2) quat: v1 先不加噪，避免归一化/参数化问题
+            root_quat_w_obs = root_quat_w
+
+            # 3) noisy theta_dot = diff(noisy tilt)
+            if self._obs_prev_tilt_deg is None:
+                self._obs_prev_tilt_deg = torch.zeros_like(tilt_deg_obs)
+                self._obs_has_prev_tilt = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=self.device
+                )
+
+            delta_tilt_obs = tilt_deg_obs - self._obs_prev_tilt_deg
+            w_deg_obs = torch.where(
+                self._obs_has_prev_tilt.unsqueeze(-1),
+                delta_tilt_obs / max(self.step_dt, 1e-6),
+                torch.zeros_like(delta_tilt_obs),
+            )
+
+            self._obs_prev_tilt_deg = tilt_deg_obs.clone()
+            self._obs_has_prev_tilt[:] = True
+
+        else:
+            e_load_obs = e_load
+            tilt_deg_obs = tilt_deg
+            w_deg_obs = w_deg
+            root_quat_w_obs = root_quat_w
+            v_b_obs = v_b
+            w_b_obs = w_b
+
+        # noisy obs for policy
+        obs_policy = torch.cat(
             [
-                e_load,       # 0-2
-                tilt_deg,     # 3-4
-                w_deg,        # 5-6
-                root_quat_w,  # 7-10
-                v_b,          # 11-13
-                w_b,          # 14-16
+                e_load_obs,       # 0-2
+                tilt_deg_obs,     # 3-4
+                w_deg_obs,        # 5-6
+                root_quat_w_obs,  # 7-10
+                v_b_obs,          # 11-13
+                w_b_obs,          # 14-16
             ],
             dim=-1,
         )
-        # --- Oracle: append true payload mass (normalized to [0,1]) ---
-         # --- 3) 全知模式拼接 (Oracle Mode) ---
-        # 如果 Config 里开了 True，就把 Mass 和 Length 拼进去
+
+        # clean obs for critic
+        obs_critic = torch.cat(
+            [
+                e_load,        # 0-2
+                tilt_deg,      # 3-4
+                w_deg,         # 5-6
+                root_quat_w,   # 7-10
+                v_b,           # 11-13
+                w_b,           # 14-16
+            ],
+            dim=-1,
+        )
+
+        # --- Oracle: append true payload mass / rope length / wind ---
         if getattr(self.cfg, "use_oracle_mass_obs", False):
-            # A. 处理 Mass
+            # A. Mass
             lo_m, hi_m = self.cfg.payload_mass_range
             denom_m = max(float(hi_m) - float(lo_m), 1e-6)
             m_norm = (self._payload_mass - float(lo_m)) / denom_m
             m_norm = torch.clamp(m_norm, 0.0, 1.0).unsqueeze(-1)
-            
-            # B. 处理 Rope Length
+
+            # B. Rope length
             lo_l, hi_l = self.cfg.rope_length_range
             denom_l = max(float(hi_l) - float(lo_l), 1e-6)
-            l_norm = (self._rope_lengths - float(lo_l)) / denom_l 
+            l_norm = (self._rope_lengths - float(lo_l)) / denom_l
             l_norm = torch.clamp(l_norm, 0.0, 1.0).unsqueeze(-1)
-            # C. 【新增】处理 Wind (转机体系 + 归一化)
-            # 1. 获取世界系风加速度 (N, 3)
-            wind_w = self._wind_acc_w 
-            # 2. 旋转到机体系 (使用当前四元数 root_quat_w)
-            #    _quat_rotate_inverse 是把世界系向量转回机体系
+
+            # C. Wind in body frame (clean)
+            wind_w = self._wind_acc_w
             wind_b = self._quat_rotate_inverse(root_quat_w, wind_w)
-            # 3. 归一化 (除以配置中的最大风力)
-            #    防止神经网络输入过大，一般除以 wind_total_accel_max
             max_wind = getattr(self.cfg, "wind_total_accel_max", 3.0)
             wind_norm = wind_b / max(max_wind, 1e-6)
-            # C. 最终拼接：17 + 1 + 1 + 3 = 22
-            obs = torch.cat([obs, m_norm, l_norm, wind_norm], dim=-1)
-            
-        return {"policy": obs,"critic": obs}
+
+            obs_policy = torch.cat([obs_policy, m_norm, l_norm, wind_norm], dim=-1)
+            obs_critic = torch.cat([obs_critic, m_norm, l_norm, wind_norm], dim=-1)
+
+        return {"policy": obs_policy, "critic": obs_critic}
 
 
 
@@ -529,7 +581,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
             self._prev_tilt_deg[env_ids] = 0.0
             self._tilt_vel_deg[env_ids] = 0.0
             self._has_prev_tilt[env_ids] = False
-
+        if isinstance(self._obs_prev_tilt_deg, torch.Tensor):
+            self._obs_prev_tilt_deg[env_ids] = 0.0
+        if isinstance(self._obs_has_prev_tilt, torch.Tensor):
+            self._obs_has_prev_tilt[env_ids] = False
         # 8. 父类逻辑 (必须调用)
         super()._reset_idx(env_ids)
         
