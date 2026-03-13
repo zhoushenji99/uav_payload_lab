@@ -120,6 +120,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # noisy obs history (only for policy observation)
         self._obs_prev_tilt_deg = None
         self._obs_has_prev_tilt = None
+        self._obs_w_deg_filt = None
+        self._obs_has_prev_w = None
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
         # Wind disturbance module (optional)
@@ -145,8 +147,11 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._raw_actions = actions.clone()
         self._actions = actions.clone().clamp(-1.0, 1.0)
         self._thrust[:, 0, 2] = self._F_max * (self._actions[:, 0] + 1.0) / 2.0
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
-        # [新增] wind state update (OU + gust), store wind accel in world frame
+        # tau_x, tau_y
+        self._moment[:, 0, 0:2] = self.cfg.moment_scale_xy * self._actions[:, 1:3]
+
+        # tau_z (a3) 单独更小
+        self._moment[:, 0, 2] = self.cfg.moment_scale_z * self._actions[:, 3]        # [新增] wind state update (OU + gust), store wind accel in world frame
         self._wind_step(self.step_dt)
 
     def _apply_action(self):
@@ -296,12 +301,28 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 )
 
             delta_tilt_obs = tilt_deg_obs - self._obs_prev_tilt_deg
-            w_deg_obs = torch.where(
+            w_deg_obs_raw = torch.where(
                 self._obs_has_prev_tilt.unsqueeze(-1),
                 delta_tilt_obs / max(self.step_dt, 1e-6),
                 torch.zeros_like(delta_tilt_obs),
             )
 
+            if self._obs_w_deg_filt is None:
+                self._obs_w_deg_filt = torch.zeros_like(w_deg_obs_raw)
+                self._obs_has_prev_w = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=self.device
+                )
+
+            alpha = float(self.cfg.obs_theta_dot_lpf_alpha)
+
+            w_deg_obs = torch.where(
+                self._obs_has_prev_w.unsqueeze(-1),
+                alpha * self._obs_w_deg_filt + (1.0 - alpha) * w_deg_obs_raw,
+                w_deg_obs_raw,
+            )
+
+            self._obs_w_deg_filt = w_deg_obs.clone()
+            self._obs_has_prev_w[:] = True
             self._obs_prev_tilt_deg = tilt_deg_obs.clone()
             self._obs_has_prev_tilt[:] = True
 
@@ -585,6 +606,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
             self._obs_prev_tilt_deg[env_ids] = 0.0
         if isinstance(self._obs_has_prev_tilt, torch.Tensor):
             self._obs_has_prev_tilt[env_ids] = False
+        if isinstance(self._obs_w_deg_filt, torch.Tensor):
+            self._obs_w_deg_filt[env_ids] = 0.0
+        if isinstance(self._obs_has_prev_w, torch.Tensor):
+            self._obs_has_prev_w[env_ids] = False
         # 8. 父类逻辑 (必须调用)
         super()._reset_idx(env_ids)
         

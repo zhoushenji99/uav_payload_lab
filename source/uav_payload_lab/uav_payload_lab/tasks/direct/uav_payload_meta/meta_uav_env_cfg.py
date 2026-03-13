@@ -131,8 +131,8 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # robot（quadcopter）
     robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9 #无量纲参数，意思是“最大推力大概是机重的多少倍”
-    moment_scale = 0.4 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
-    
+    moment_scale_xy = 0.4 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
+    moment_scale_z = 0.12
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
     rope_length_range = (0.3, 0.8)  # 绳长随机范围 (米)
     
@@ -210,7 +210,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # μ(e)->z 的网络结构（Phase1 联训）
     rma_mu_hidden_dims = (64, 64)
     rma_activation = "elu"
-    
+
     # ---------------------------------------------------------------------
     # Observation noise (Sim2Real)
     # ---------------------------------------------------------------------
@@ -218,6 +218,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     # 对应 obs 的 17 维里这些块
     obs_noise_e_load_std_m = 0.02      # e_load (m)
-    obs_noise_tilt_std_deg = 0.7       # theta_x, theta_y (deg)
+    obs_noise_tilt_std_deg = 0.5       # theta_x, theta_y (deg)
+    obs_theta_dot_lpf_alpha = 0.5
     obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
     obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)
