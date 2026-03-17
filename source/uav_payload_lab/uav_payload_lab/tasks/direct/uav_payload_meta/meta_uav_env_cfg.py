@@ -144,9 +144,9 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # ---------------------------------------------------------------------
     # Wind disturbance (optional)
     # ---------------------------------------------------------------------
-    enable_wind = True                 # 总开关：True 才启用风扰
-    wind_apply_to_uav = True            # 是否对 UAV 本体施加风扰
-    wind_apply_to_payload = True        # 是否对 payload 刚体施加风扰（你想要的默认就是 True）
+    enable_wind = False                 # 总开关：True 才启用风扰 False
+    wind_apply_to_uav = False            # 是否对 UAV 本体施加风扰
+    wind_apply_to_payload = False        # 是否对 payload 刚体施加风扰（你想要的默认就是 True）
     wind_axis = "xy"                    # "xy"：只水平风；"xyz"：允许垂直扰动（一般先别开）
 
     # 风扰用“等效加速度”建模（更稳：不同质量不会被同一牛顿力吹飞）
@@ -182,15 +182,16 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # reward scales
     # === Reward 参数：payload 到点 + 消摆 ===
     sigma_pos = 0.2            # 位置高斯尺度（m）
-    sigma_tilt_deg = 10.0       # 摆角高斯尺度（deg） 这里本来是10,但为了风扰饱和输出而妥协为40，风扰晃动和reward冲突，agent想拉回来payload但是reward会惩罚大角度
-    sigma_swing_deg_s = 10.0   # 摆角角速度高斯尺度（deg/s）
+    sigma_tilt_deg = 20.0       # 摆角高斯尺度（deg） 这里本来是10,但为了风扰饱和输出而妥协为40，风扰晃动和reward冲突，agent想拉回来payload但是reward会惩罚大角度
+    sigma_swing_deg_s = 50.0   # 摆角角速度高斯尺度（deg/s）
     pos_weight = 0.3           # 位置主项权重
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
-    action_l2_penalty_scale = 0.01
+    action_l2_penalty_scale = 0.02 #0.015有效抑制
     spin_weight = 0.15   # 【新增】自旋惩罚权重
     heading_weight = 0.5     # 【新增】航向对齐权重，用于抑制 Yaw 角度 (P控制)
+    action_smooth_penalty_scale = 0.005
     # === 任务设置（相对每个 env 的原点，ENU）===
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     #斜飞start_pos_w = (0.5, 1.0, 1.2)

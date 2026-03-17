@@ -8,9 +8,9 @@ import math
 # [修改] 默认读取当前目录下的 payload_data.csv (根据你的实际文件名修改)
 
 # === Analysis window (seconds) ===
-TIME_WINDOW_S = 35   # set None to disable cropping
+TIME_WINDOW_S = 10   # set None to disable cropping
 
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-03-12_12-59-53/payload_data.csv" 
+simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-03-16_23-25-28/payload_data.csv" 
 paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
 
 # 坐标系校正 (World -> Task)
