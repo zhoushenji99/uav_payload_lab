@@ -116,7 +116,7 @@ def main(env_cfg, agent_cfg):
         policy_nn.use_mu = True
 
     history_len = int(args_cli.history_len)
-    proprio_dim = 17
+    proprio_dim = 21 #这里加上了last action
     action_dim = 4
     z_dim = getattr(policy_nn, "z_dim", 5)
     priv_dim = z_dim  # in your current teacher: priv = mlw(5)
@@ -182,10 +182,10 @@ def main(env_cfg, agent_cfg):
 
 
             # ---- 2) build history input from obs(t) and last_action(t-1) ----
-            obs_tensor = _get_obs_tensor(obs)                  # (N,22)
-            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,17)
-            feat = torch.cat([obs_proprio, last_actions], dim=1)   # (N,21)
-
+            obs_tensor = _get_obs_tensor(obs)                  # (N,26)
+            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,21)
+            feat = obs_proprio   # (N, 21)
+            
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 

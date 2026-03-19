@@ -39,7 +39,7 @@ class RMAActorCritic(nn.Module):
         noise_std_type: str = "log",          # IMPORTANT: "log" guarantees std>0
         state_dependent_std: bool = False,
         # -------- RMA knobs --------
-        proprio_obs_dim: int = 17,
+        proprio_obs_dim: int = 21,
         privileged_obs_dim: int = 5,
         z_dim: int = 5,
         z_exp_dim: int = 2,                   # optional split for logging

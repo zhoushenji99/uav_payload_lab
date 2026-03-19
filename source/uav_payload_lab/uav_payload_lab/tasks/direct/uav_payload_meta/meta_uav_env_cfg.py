@@ -92,7 +92,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     decimation = 2                      # 每执行一次 RL action，物理 step 多少次
     episode_length_s = 35.0             # 一局多长时间（秒）
     action_space = 4
-    observation_space = 22          #oracle就是17+2ML+3wind,不是就是17
+    observation_space = 26          #oracle就是17+2ML+3wind,不是就是17 3.17还得加lastaction 4维
     state_space = 0
     debug_vis = True
 
@@ -155,7 +155,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     wind_total_accel_max = 1.5          # 总风加速度限幅 (m/s^2)
 
     # gust 分段常值持续时间（秒）
-    wind_gust_dt_min = 0.5
+    wind_gust_dt_min = 0.0
     wind_gust_dt_max = 2.0
 
     # OU 平滑噪声参数：dx = -theta*x*dt + sigma*sqrt(dt)*N(0,1)
@@ -182,13 +182,13 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # reward scales
     # === Reward 参数：payload 到点 + 消摆 ===
     sigma_pos = 0.2            # 位置高斯尺度（m）
-    sigma_tilt_deg = 20.0       # 摆角高斯尺度（deg） 这里本来是10,但为了风扰饱和输出而妥协为40，风扰晃动和reward冲突，agent想拉回来payload但是reward会惩罚大角度
-    sigma_swing_deg_s = 50.0   # 摆角角速度高斯尺度（deg/s）
+    sigma_tilt_deg = 10.0       # 摆角高斯尺度（deg） 这里本来是10,但为了风扰饱和输出而妥协为40，风扰晃动和reward冲突，agent想拉回来payload但是reward会惩罚大角度
+    sigma_swing_deg_s = 40.0   # 摆角角速度高斯尺度（deg/s）
     pos_weight = 0.3           # 位置主项权重
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
-    action_l2_penalty_scale = 0.02 #0.015有效抑制
+    action_l2_penalty_scale = 0.03 #0.015 0.02有效抑制
     spin_weight = 0.15   # 【新增】自旋惩罚权重
     heading_weight = 0.5     # 【新增】航向对齐权重，用于抑制 Yaw 角度 (P控制)
     action_smooth_penalty_scale = 0.005
@@ -202,7 +202,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     #平飞goal_pos_w = (-2.0, 0.0, 1.2)
     goal_pos_w = (2.0, 0.0, 2.0)
     # ---------------- RMA Phase-1 (teacher) ----------------
-    proprio_obs_dim = 17          # 可观测部分
+    proprio_obs_dim = 21          # 可观测部分 还得加last action
     privileged_obs_dim = 5        # e_t = [m_norm, l_norm, wind_norm(3)]
     rma_z_dim = 5                 # z_t dim (这里先设为5，匹配你的“mlw5->z”)
     rma_z_exp_dim = 2             # z前2维当 z_exp（对应慢变量）

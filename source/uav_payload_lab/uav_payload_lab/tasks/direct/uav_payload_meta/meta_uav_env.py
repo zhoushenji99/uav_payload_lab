@@ -344,6 +344,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 root_quat_w_obs,  # 7-10
                 v_b_obs,          # 11-13
                 w_b_obs,          # 14-16
+                self._prev_actions, # 17-20: [新增] 上一帧动作 a_{t-1}
             ],
             dim=-1,
         )
@@ -357,6 +358,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 root_quat_w,   # 7-10
                 v_b,           # 11-13
                 w_b,           # 14-16
+                self._prev_actions, # 17-20: [新增] 上一帧动作 a_{t-1}
             ],
             dim=-1,
         )
