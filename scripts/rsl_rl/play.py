@@ -17,7 +17,7 @@ import time
 import numpy as np
 import torch
 import gymnasium as gym
-
+import random
 from isaaclab.app import AppLauncher
 
 # local imports
@@ -93,7 +93,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    
+    # ===== force deterministic eval seed =====
+    if args_cli.seed is not None:
+        agent_cfg.seed = int(args_cli.seed)
 
+    seed = int(agent_cfg.seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    env_cfg.seed = seed
+
+    print(f"[DEBUG] play seed = {seed}")
+    print(f"[DEBUG] env_cfg.seed = {env_cfg.seed}")
+    print(f"[DEBUG] agent_cfg.seed = {agent_cfg.seed}")
+    
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed

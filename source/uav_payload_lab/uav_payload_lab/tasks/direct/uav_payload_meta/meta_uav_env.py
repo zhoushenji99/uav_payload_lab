@@ -128,6 +128,21 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # Wind disturbance module (optional)
         self._init_wind_module()
 
+        #[新增] 记录网络原始输出，用于惩罚计算
+        self._raw_actions = torch.zeros_like(self._actions)
+        self._prev_raw_actions = torch.zeros_like(self._actions)
+
+        # [新增] 动作延迟队列 (形状: num_envs, delay_steps, action_dim)
+        # 注意处理 delay_steps 为 0 的边界情况
+        self._action_delay_steps = self.cfg.action_delay_steps
+        if self._action_delay_steps > 0:
+            self._action_queue = torch.zeros(
+                (self.num_envs, self._action_delay_steps, self._actions.shape[-1]), 
+                device=self.device
+            )
+        
+        # [新增] 低通滤波内部状态
+        self._filtered_actions = torch.zeros_like(self._actions)
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
@@ -145,8 +160,28 @@ class UavPayloadMetaEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self._raw_actions = actions.clone()
-        self._actions = actions.clone().clamp(-1.0, 1.0)
+        # 1. 记录上一帧的原始动作
+        self._prev_raw_actions = self._raw_actions.clone()
+        
+        # 2. 截断当前网络输出
+        self._raw_actions = actions.clone().clamp(-1.0, 1.0)
+        
+        # 3. 经过延迟队列 (Lagging)
+        if self._action_delay_steps > 0:
+            # 整体左移，丢弃最老的一帧，将最新的一帧放在队尾 (-1)
+            self._action_queue = torch.roll(self._action_queue, shifts=-1, dims=1)
+            self._action_queue[:, -1, :] = self._raw_actions
+            # 取出队头 (0) 作为此时应当执行的动作
+            delayed_actions = self._action_queue[:, 0, :]
+        else:
+            delayed_actions = self._raw_actions
+
+        # 4. 经过一阶低通滤波 (LPF)
+        alpha = self.cfg.action_lpf_alpha
+        self._filtered_actions = (1.0 - alpha) * self._filtered_actions + alpha * delayed_actions
+        
+        # 5. 覆写 self._actions 供实际物理引擎计算推力使用
+        self._actions = self._filtered_actions.clone()
         self._thrust[:, 0, 2] = self._F_max * (self._actions[:, 0] + 1.0) / 2.0
         # tau_x, tau_y
         self._moment[:, 0, 0:2] = self.cfg.moment_scale_xy * self._actions[:, 1:3]
@@ -455,16 +490,12 @@ class UavPayloadMetaEnv(DirectRLEnv):
         ) ** 2
 
         # === 5) 动作惩罚 ===
-        # 5.1 动作幅值惩罚（已有）
-        r_action_l2 = -float(self.cfg.action_l2_penalty_scale) * (
-            self._raw_actions ** 2
-        ).sum(dim=1)
-
-        # 5.2 [新增] 动作连续性惩罚（统一作用于4通道，使用执行后的clamped action）
-        delta_action = self._actions - self._prev_actions
-        r_action_smooth = -float(self.cfg.action_smooth_penalty_scale) * (
-            delta_action ** 2
-        ).sum(dim=1)
+        # [修改] 惩罚原始动作跳变
+        delta_raw_action = self._raw_actions - self._prev_raw_actions
+        r_action_smooth = -float(self.cfg.action_smooth_penalty_scale) * torch.sum(delta_raw_action ** 2, dim=1)
+        
+        # [新增] 惩罚绝对输出过大
+        r_action_l2 = -float(self.cfg.action_l2_penalty_scale) * torch.sum(self._raw_actions ** 2, dim=1)
 
         r_action_total = r_action_l2 + r_action_smooth
 
@@ -638,7 +669,13 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 9. 错峰 Reset (Spread out)
         if len(env_ids) == self.num_envs:
             self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
-        
+        # [新增] 清空动作相关的历史缓存
+        self._raw_actions[env_ids] = 0.0
+        self._prev_raw_actions[env_ids] = 0.0
+        if self._action_delay_steps > 0:
+            self._action_queue[env_ids] = 0.0
+        self._filtered_actions[env_ids] = 0.0
+
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
         

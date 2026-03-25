@@ -130,7 +130,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     # robot（quadcopter）
     robot: ArticulationCfg = IRIS_PAYLOAD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    thrust_to_weight = 1.9 #无量纲参数，意思是“最大推力大概是机重的多少倍”
+    thrust_to_weight = 2.5 #无量纲参数，意思是“最大推力大概是机重的多少倍”
     moment_scale_xy = 0.4 #$\tau = J \cdot \alpha$   $$\tau_{max} = 0.01 \, (\text{kg}\cdot\text{m}^2) \times 20 \, (\text{rad/s}^2) = \mathbf{0.2 \, \text{Nm}}$$
     moment_scale_z = 0.12
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
@@ -144,9 +144,9 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # ---------------------------------------------------------------------
     # Wind disturbance (optional)
     # ---------------------------------------------------------------------
-    enable_wind = False                 # 总开关：True 才启用风扰 False
-    wind_apply_to_uav = False            # 是否对 UAV 本体施加风扰
-    wind_apply_to_payload = False        # 是否对 payload 刚体施加风扰（你想要的默认就是 True）
+    enable_wind = True                 # 总开关：True 才启用风扰 False
+    wind_apply_to_uav = True            # 是否对 UAV 本体施加风扰
+    wind_apply_to_payload = True        # 是否对 payload 刚体施加风扰（你想要的默认就是 True）
     wind_axis = "xy"                    # "xy"：只水平风；"xyz"：允许垂直扰动（一般先别开）
 
     # 风扰用“等效加速度”建模（更稳：不同质量不会被同一牛顿力吹飞）
@@ -188,10 +188,10 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     tilt_weight = 0.15          # 摆角 / 摆速 shaping 权重
     time_penalty = 0.01         # 每秒时间惩罚系数（越大越鼓励快完成）
     death_penalty = 20       # 摔机一次性扣多少（可以先 10，觉得不够再加大）
-    action_l2_penalty_scale = 0.03 #0.015 0.02有效抑制
+    action_l2_penalty_scale = 0.03 #0.015 0.02有效抑制 0.03也ok
     spin_weight = 0.15   # 【新增】自旋惩罚权重
     heading_weight = 0.5     # 【新增】航向对齐权重，用于抑制 Yaw 角度 (P控制)
-    action_smooth_penalty_scale = 0.005
+    action_smooth_penalty_scale = 0.03
     # === 任务设置（相对每个 env 的原点，ENU）===
     # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
     #斜飞start_pos_w = (0.5, 1.0, 1.2)
@@ -207,7 +207,21 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     rma_z_dim = 5                 # z_t dim (这里先设为5，匹配你的“mlw5->z”)
     rma_z_exp_dim = 2             # z前2维当 z_exp（对应慢变量）
     rma_use_mu = True             # Phase1: True; Phase2部署/评估: False
-
+    rma_use_physics_anchor = True
+    rma_phys_anchor_coef = 1.0
+    #split + physics anchor 版
+    # rma_use_mu = True
+    # rma_z_exp_dim = 2
+    # rma_use_physics_anchor = True
+    # rma_phys_anchor_coef = 1.0
+    
+    # #black-box RMA 版 coupled版
+    # rma_use_mu = True
+    # rma_z_exp_dim = 2   # 或 0，都行；见下文
+    # rma_use_physics_anchor = False
+    # rma_phys_anchor_coef = 0.0
+    
+    
     # μ(e)->z 的网络结构（Phase1 联训）
     rma_mu_hidden_dims = (64, 64)
     rma_activation = "elu"
@@ -223,3 +237,19 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     obs_theta_dot_lpf_alpha = 0.5
     obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
     obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)
+
+    # ==========================================
+    # [新增] Sim2Real: 延迟与动力学建模
+    # ==========================================
+    # 模拟纯链路延迟 (假设你的控制频率是50Hz，2帧即40ms延迟)
+    action_delay_steps: int = 2  
+    
+    # 模拟电机的物理低通滤波 (0.2表示当前指令占20%，80%继承系统惯性)
+    action_lpf_alpha: float = 0.2  
+
+    # ==========================================
+    # [修改] 动作惩罚项
+    # ==========================================
+    # 必须大幅提高平滑惩罚，逼迫网络输出低频平滑曲线
+    action_smooth_penalty_scale: float = 0.05  # 替换你原来的 0.005
+    action_l2_penalty_scale: float = 0.01      # 新增：惩罚网络无脑输出满油门

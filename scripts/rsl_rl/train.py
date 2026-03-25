@@ -209,6 +209,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
+    runner.alg.use_phys_anchor = True
+    runner.alg.phys_anchor_coef = 1.0
+    runner.alg.policy.use_physics_anchor = True
+
+    print("[DEBUG] alg.use_phys_anchor =", runner.alg.use_phys_anchor)
+    print("[DEBUG] alg.phys_anchor_coef =", runner.alg.phys_anchor_coef)
+    print("[DEBUG] policy.use_physics_anchor =", getattr(runner.alg.policy, "use_physics_anchor", None))
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 

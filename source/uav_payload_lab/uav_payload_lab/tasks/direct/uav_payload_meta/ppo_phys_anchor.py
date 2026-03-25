@@ -40,6 +40,8 @@ class PPO:
         desired_kl: float = 0.01,
         device: str = "cpu",
         normalize_advantage_per_mini_batch: bool = False,
+        phys_anchor_coef: float = 0.0,
+        use_phys_anchor: bool = True,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -123,6 +125,8 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         # --- phys anchor (fixed for this experiment) ---
         self.phys_anchor_coef = 1e-3   # 先用 1e-3；后面你再调 1e-2 / 5e-3
+        self.phys_anchor_coef = phys_anchor_coef
+        self.use_phys_anchor = use_phys_anchor
 
     def init_storage(
         self,
@@ -316,18 +320,10 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             # [修改] 使用新的显式接口
-            if hasattr(self.policy, "compute_physics_loss"):
-                # 传入当前的 obs_batch
+            if self.use_phys_anchor and hasattr(self.policy, "compute_physics_loss"):
                 phys_loss = self.policy.compute_physics_loss(obs_batch)
-                
-                # [双保险] 检查 NaN，防止一颗老鼠屎坏了一锅粥
-                if torch.isnan(phys_loss):
-                    # 如果算出来是 NaN，说明网络权重已经坏了，或者输入数据有问题
-                    # 这里可以选择打印警告并跳过，或者直接报错
-                    pass 
-                else:
-                    # 权重建议：先给 1.0，稳住再加
-                    loss += 1.0 * phys_loss
+                if not torch.isnan(phys_loss):
+                    loss += self.phys_anchor_coef * phys_loss
                     mean_phys_anchor += phys_loss.item()
             # Symmetry loss
             if self.symmetry:

@@ -46,6 +46,7 @@ class RMAActorCritic(nn.Module):
         use_mu: bool = True,                  # Phase-1 True, Phase-2 False
         mu_hidden_dims: tuple[int] | list[int] = [64, 64],
         mu_activation: str | None = None,     # default use `activation`
+        use_physics_anchor: bool = True,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -56,7 +57,9 @@ class RMAActorCritic(nn.Module):
         self.obs_groups = obs_groups
         self.num_actions = num_actions
         self.state_dependent_std = state_dependent_std
-
+        
+        self.use_physics_anchor = bool(use_physics_anchor)
+        
         self.proprio_dim = int(proprio_obs_dim)
         self.priv_dim = int(privileged_obs_dim)
         self.z_dim = int(z_dim)
@@ -265,33 +268,19 @@ class RMAActorCritic(nn.Module):
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
     def compute_physics_loss(self, obs) -> torch.Tensor:
-        """
-        显式计算物理监督 Loss
-        Input: obs (TensorDict or Tensor)
-        """
-        # === [修复 1]：拆快递 ===
-        # Isaac Lab 的 obs 是一个 TensorDict，真正的数据在 "policy" 键里
-        # 如果传入的是 TensorDict，必须先提取出来
+        if not self.use_physics_anchor:
+            device = obs["policy"].device if hasattr(obs, "get") and obs.get("policy") is not None else obs.device
+            return torch.zeros((), device=device)
+
         if hasattr(obs, "get") and obs.get("policy") is not None:
             raw_obs = obs["policy"]
         else:
             raw_obs = obs
-            
-        # 此时 raw_obs 才是 (Batch, 22) 的 Tensor
-        
-        # 1. 切分出 Priv 信息
+
         priv = raw_obs[:, self.proprio_dim : self.proprio_dim + self.priv_dim]
-        
-        # 2. 提取真值 (前两维是 Mass, Length)
         gt_phys = priv[:, :2]
-
-        # 3. 现场重新计算 Encoder
         z = self.mu(priv)
-        
-        # 4. 提取预测值
         pred_phys = z[:, :2]
-
-        # 5. MSE Loss
         loss = (pred_phys - gt_phys).pow(2).mean()
         return loss
     
