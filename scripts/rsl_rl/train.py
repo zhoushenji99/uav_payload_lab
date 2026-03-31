@@ -209,9 +209,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    runner.alg.use_phys_anchor = True
-    runner.alg.phys_anchor_coef = 1.0
-    runner.alg.policy.use_physics_anchor = True
+    runner.alg.use_phys_anchor = bool(env_cfg.rma_use_physics_anchor)
+    runner.alg.phys_anchor_coef = float(env_cfg.rma_phys_anchor_coef)
+    runner.alg.policy.use_physics_anchor = bool(env_cfg.rma_use_physics_anchor)
 
     print("[DEBUG] alg.use_phys_anchor =", runner.alg.use_phys_anchor)
     print("[DEBUG] alg.phys_anchor_coef =", runner.alg.phys_anchor_coef)

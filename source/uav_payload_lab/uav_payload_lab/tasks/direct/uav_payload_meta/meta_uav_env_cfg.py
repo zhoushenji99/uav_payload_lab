@@ -215,11 +215,11 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # rma_use_physics_anchor = True
     # rma_phys_anchor_coef = 1.0
     
-    # #black-box RMA 版 coupled版
-    # rma_use_mu = True
-    # rma_z_exp_dim = 2   # 或 0，都行；见下文
-    # rma_use_physics_anchor = False
-    # rma_phys_anchor_coef = 0.0
+    #black-box RMA 版 coupled版
+    rma_use_mu = True
+    rma_z_exp_dim = 2   # 或 0，都行；见下文
+    rma_use_physics_anchor = False
+    rma_phys_anchor_coef = 0.0
     
     
     # μ(e)->z 的网络结构（Phase1 联训）

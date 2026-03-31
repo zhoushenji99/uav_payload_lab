@@ -172,7 +172,13 @@ def plot_fig1_payload_pos_and_swing(teacher: Series, student: Series, out_dir: P
 
     fig, axs = plt.subplots(2, 3, figsize=(14, 7))
     axs = axs.reshape(2, 3)
-
+    # --- helper: only for plotting, not for metrics ---
+    def _smooth(y, win=7):
+        import numpy as np
+        if win <= 1:
+            return y
+        k = np.ones(win) / win
+        return np.convolve(y, k, mode="same")
     # payload position x/y/z
     refs = {
         "x": (teacher.goal_ref[0], "goal_x"),
@@ -181,26 +187,46 @@ def plot_fig1_payload_pos_and_swing(teacher: Series, student: Series, out_dir: P
     }
     for j, axis in enumerate(["x", "y", "z"]):
         ax = axs[0, j]
-        ax.plot(teacher.t(), teacher.df[f"payload_{axis}"], label="teacher")
-        ax.plot(student.t(), student.df[f"payload_{axis}"], label="student")
+        yT = teacher.df[f"payload_{axis}"].to_numpy(dtype=float)
+        yS = student.df[f"payload_{axis}"].to_numpy(dtype=float)
+
+        # optional display smoothing
+        yT_plot = _smooth(yT, win=7)
+        yS_plot = _smooth(yS, win=7)
+
+        ax.plot(teacher.t(), yT_plot, label="teacher")
+        ax.plot(student.t(), yS_plot, label="student")
         ax.axhline(float(refs[axis][0]), linestyle="--", linewidth=1.0, label="ref")
+
         ax.set_title(f"Payload {axis.upper()} (task frame)")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(f"{axis} (m)")
         ax.grid(True, linestyle=":", linewidth=0.6)
-        ax.legend()
+
+        # ---- nicer axis limits ----
+        if axis == "y":
+            ax.set_ylim(-3.0, 3.0)
 
     # swing angles theta_x / theta_y
     for j, (col, title) in enumerate([("theta_x_deg", "Swing θx (deg)"), ("theta_y_deg", "Swing θy (deg)")]):
         ax = axs[1, j]
-        ax.plot(teacher.t(), teacher.df[col], label="teacher")
-        ax.plot(student.t(), student.df[col], label="student")
+
+        thT = teacher.df[col].to_numpy(dtype=float)
+        thS = student.df[col].to_numpy(dtype=float)
+
+        # optional display smoothing
+        thT_plot = _smooth(thT, win=7)
+        thS_plot = _smooth(thS, win=7)
+
+        ax.plot(teacher.t(), thT_plot, label="teacher")
+        ax.plot(student.t(), thS_plot, label="student")
         ax.axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
+
         ax.set_title(title)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("deg")
         ax.grid(True, linestyle=":", linewidth=0.6)
-        ax.legend()
+        ax.set_ylim(-30.0, 30.0)
 
     # last panel: payload error norm (optional quick sanity)
     ax = axs[1, 2]
