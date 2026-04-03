@@ -5,8 +5,8 @@
 # Logs env{trace_env} to CSV for paper-grade plots (UAV pos, payload pos, swing, z, energy proxies).
 #
 # Key fixes vs your "Ultimate" script:
-# 1) Teacher action input MUST be [proprio(17), z_teacher(5)], NOT [proprio(17), priv(5)].
-# 2) Student encoder input MUST match collect_z_dataset.py: feature_t = [proprio(17), last_action(4)] => 21 dims.
+# 1) Teacher action input MUST be [proprio(21), z_teacher(5)], NOT [proprio21), priv(5)].
+# 2) Student encoder input MUST match collect_z_dataset.py: feature_t = [proprio(21), last_action(4)] => 21 dims.
 # 3) Use IsaacLab's hydra_task_config + parse_known_args pattern (same as official play.py) so CLI works.
 
 from __future__ import annotations
@@ -193,15 +193,15 @@ def main(env_cfg, agent_cfg):
 
     # ---- buffers ----
     history_len = int(args_cli.history_len)
-    proprio_dim = 17
+    proprio_dim = 21   # observed policy part，已经包含 prev_action(4)
     action_dim = 4
     z_dim = getattr(policy_nn, "z_dim", 5)
-    priv_dim = z_dim  # current env appends mlw(5): m_norm, l_norm, wind_norm(3)
+    priv_dim = z_dim
 
     obs = env.get_observations()
     dt = float(base_env.step_dt)
-    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=env.device)
-    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
+    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
+    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 暂时保留，不参与 feat 拼接
 
     trace_env = int(args_cli.trace_env)
     if trace_env < 0 or trace_env >= env.num_envs:
@@ -254,13 +254,12 @@ def main(env_cfg, agent_cfg):
         with torch.inference_mode():
 
             # ---- 0) current obs(t) -> tensor ----
-            obs_tensor = _get_obs_tensor(obs)  # (N, proprio_dim + priv_dim) e.g. (N, 22)
-            obs_proprio = obs_tensor[:, :proprio_dim]  # (N, 17)
-            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]  # (N, 5)  == e(t)
+            obs_tensor = _get_obs_tensor(obs)  # (N, 26)
+            obs_proprio = obs_tensor[:, :proprio_dim]  # (N, 21)
+            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]  # (N, 5)
 
-            # ---- 1) update history with (s_t, a_{t-1}) ----
-            # feature_t = [proprio(t), last_action(t-1)]  (MUST match collect_z_dataset.py)
-            feat = torch.cat([obs_proprio, last_actions], dim=1)  # (N, 21)
+            # history 输入必须和 collect_z_dataset.py 完全一致
+            feat = obs_proprio   # (N, 21)
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
@@ -280,8 +279,8 @@ def main(env_cfg, agent_cfg):
                 # student: policy sees z_hat directly
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
-                z_hat = encoder(obs_history).detach()  # (N, z_dim)
-                policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 17+z_dim)
+                    z_hat = encoder(obs_history).detach()  # (N, z_dim)
+                    policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 21+5=26)
 
             # ---- 3) build obs dict for policy ----
             obs_in = {"policy": policy_in}
@@ -347,14 +346,20 @@ def main(env_cfg, agent_cfg):
             # ---- 7) update last_actions & reset history for done envs ----
             last_actions = actions.detach()
 
-            if torch.any(dones):
-                obs_history[dones] = 0.0
-                last_actions[dones] = 0.0
+            done_mask = dones
+            if not isinstance(done_mask, torch.Tensor):
+                done_mask = torch.as_tensor(done_mask, device=env.device)
+
+            done_mask = done_mask.to(dtype=torch.bool).view(-1)
+
+            if torch.any(done_mask):
+                obs_history[done_mask] = 0.0
+                last_actions[done_mask] = 0.0
                 if hasattr(policy_nn, "reset"):
-                    policy_nn.reset(dones)
+                    policy_nn.reset(done_mask)
 
             # stop exactly at episode boundary of trace_env
-            if bool(args_cli.stop_on_done) and bool(dones[e].item()):
+            if bool(args_cli.stop_on_done) and bool(done_mask[e].item()):
                 print(f"[INFO] trace_env done at step={step_count}. stop_on_done=True -> exit.")
                 break
 

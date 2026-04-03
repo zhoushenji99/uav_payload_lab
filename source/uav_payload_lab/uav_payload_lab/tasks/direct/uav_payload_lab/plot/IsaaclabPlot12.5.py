@@ -10,13 +10,18 @@ import math
 # === Analysis window (seconds) ===
 TIME_WINDOW_S = 35  # set None to disable cropping
 
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-03-29_02-19-09/coupledseed42M49000.csv" 
-paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
+simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-03-23_17-19-52/payload_data.csv" 
+# paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
 
 # 坐标系校正 (World -> Task)
-OFFSET_X = 21.0
-OFFSET_Y = -15.0
-
+OFFSET_X = 0.0
+OFFSET_Y = 0.0
+# === Task reference (current task) ===
+REF_X = 2.0
+REF_Y = 0.0
+REF_Z = 2.0
+REF_THETA_X = 0.0
+REF_THETA_Y = 0.0
 # --- 2. 加载仿真数据 ---
 try:
     df_sim = pd.read_csv(simulation_data_path)
@@ -48,30 +53,30 @@ if "Payload_X" in df_sim.columns:
 
     print(f"[Sim] 数据预处理完成: 坐标已校正, 欧拉角已计算。")
 
-# --- 3. 加载并清洗论文数据 (保持原有逻辑) ---
-paper_data = {} 
-paper_available = False
+# # --- 3. 加载并清洗论文数据 (保持原有逻辑) ---
+# paper_data = {} 
+# paper_available = False
 
-try:
-    df_paper = pd.read_csv(paper_data_path, header=None)
-    print(f"[Paper] 成功加载 '{paper_data_path}'")
-    paper_available = True
+# try:
+#     df_paper = pd.read_csv(paper_data_path, header=None)
+#     print(f"[Paper] 成功加载 '{paper_data_path}'")
+#     paper_available = True
     
-    groups = {
-        "px": (0, 1), "py": (2, 3), "pz": (4, 5),
-        "thetax": (6, 7), "thetay": (8, 9)
-    }
+#     groups = {
+#         "px": (0, 1), "py": (2, 3), "pz": (4, 5),
+#         "thetax": (6, 7), "thetay": (8, 9)
+#     }
     
-    for key, (t_col, v_col) in groups.items():
-        if v_col < df_paper.shape[1]:
-            sub_df = df_paper[[t_col, v_col]].dropna()
-            sub_df.columns = ["time", "value"]
-            sub_df = sub_df.sort_values(by="time")
-            paper_data[key] = sub_df
-            print(f"  - {key}: {len(sub_df)} 点")
+#     for key, (t_col, v_col) in groups.items():
+#         if v_col < df_paper.shape[1]:
+#             sub_df = df_paper[[t_col, v_col]].dropna()
+#             sub_df.columns = ["time", "value"]
+#             sub_df = sub_df.sort_values(by="time")
+#             paper_data[key] = sub_df
+#             print(f"  - {key}: {len(sub_df)} 点")
 
-except Exception as e:
-    print(f"[Paper] 未加载论文数据或读取失败 (可忽略): {e}")
+# except Exception as e:
+#     print(f"[Paper] 未加载论文数据或读取失败 (可忽略): {e}")
 
 # ==========================================
 #               绘图部分
@@ -81,14 +86,11 @@ except Exception as e:
 # Figure 1: Payload 轨迹对比
 # ------------------------------------------
 fig1, axs1 = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
-fig1.suptitle(f"Figure 1: Payload Control Performance (Sim vs Paper)", fontsize=16, weight="bold")
+fig1.suptitle("Figure 1: Payload Control Performance (Sim Only)", fontsize=16, weight="bold")
 
-def plot_curve(ax, sim_x, sim_y, key_paper, title, ref=None, ylabel="Position (m)"):
+def plot_curve(ax, sim_x, sim_y, title, ref=None, ylabel="Position (m)"):
     ax.set_title(title, fontsize=12)
     ax.plot(sim_x, sim_y, label="My RL (Sim)", linewidth=2.5, color='tab:blue')
-    if paper_available and key_paper in paper_data:
-        pdf = paper_data[key_paper]
-        ax.plot(pdf["time"], pdf["value"], linestyle="--", label="Hean Hua (Paper)", linewidth=2, color='tab:orange')
     if ref is not None:
         ax.axhline(y=ref, linestyle=":", color='gray', alpha=0.8, label=f"Ref: {ref}")
     ax.set_xlabel("Time (s)")
@@ -96,11 +98,11 @@ def plot_curve(ax, sim_x, sim_y, key_paper, title, ref=None, ylabel="Position (m
     ax.legend()
     ax.grid(True, linestyle=":", alpha=0.6)
 
-plot_curve(axs1[0, 0], df_sim["time"], df_sim["payload_x"], "px", "Payload X", -0.5)
-plot_curve(axs1[0, 1], df_sim["time"], df_sim["payload_y"], "py", "Payload Y", 0.0)
-plot_curve(axs1[0, 2], df_sim["time"], df_sim["payload_z"], "pz", "Payload Z", 1.2)
-plot_curve(axs1[1, 0], df_sim["time"], df_sim["theta_x_deg"], "thetax", "Swing Theta X", 0.0, "Angle (deg)")
-plot_curve(axs1[1, 1], df_sim["time"], df_sim["theta_y_deg"], "thetay", "Swing Theta Y", 0.0, "Angle (deg)")
+plot_curve(axs1[0, 0], df_sim["time"], df_sim["payload_x"], "Payload X", REF_X)
+plot_curve(axs1[0, 1], df_sim["time"], df_sim["payload_y"], "Payload Y", REF_Y)
+plot_curve(axs1[0, 2], df_sim["time"], df_sim["payload_z"], "Payload Z", REF_Z)
+plot_curve(axs1[1, 0], df_sim["time"], df_sim["theta_x_deg"], "Swing Theta X", REF_THETA_X, "Angle (deg)")
+plot_curve(axs1[1, 1], df_sim["time"], df_sim["theta_y_deg"], "Swing Theta Y", REF_THETA_Y, "Angle (deg)")
 axs1[1, 2].axis('off')
 
 # ------------------------------------------
