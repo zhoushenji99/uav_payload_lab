@@ -116,18 +116,17 @@ def main(env_cfg, agent_cfg):
         policy_nn.use_mu = True
 
     history_len = int(args_cli.history_len)
-    proprio_dim = 21   # 这里的21已经包含 prev_action(4)
+    proprio_dim = 21  # 这里的 21 已经包含 prev_action(4)
     action_dim = 4
     z_dim = getattr(policy_nn, "z_dim", 5)
-    priv_dim = z_dim   # 当前 teacher 的 privileged = [m,l,wind(3)] 共5维
+    priv_dim = z_dim  # in your current teacher: priv = mlw(5)
 
     obs = env.get_observations()
     dt = env.unwrapped.step_dt
     probe_steps = int(args_cli.probe_sec / dt)
-
-    # history encoder 的输入就是 21 维 observed policy part
+    # history buffer: (N, H, 21)
     obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
-    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 暂时保留，不参与 feat 拼接
+    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
 
     out_dir = os.path.join(log_dir, args_cli.out_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -184,14 +183,14 @@ def main(env_cfg, agent_cfg):
 
             # ---- 2) build history input from obs(t) and last_action(t-1) ----
             obs_tensor = _get_obs_tensor(obs)                  # (N,26)
-            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,21) = observed policy part
-            feat = obs_proprio                                 # history 输入就是这21维
+            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,21)
+            feat = obs_proprio                                 # (N,21)
 
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
-            # privileged 必须是最后5维，不要把 prev_action 混进去
-            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]   # (N,5) = [m,l,wind]
+            # ---- 3) teacher label z_teacher: use mu(priv) (robust; no dependency on last_z timing) ----
+            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]   # 即 21:26
             if hasattr(policy_nn, "mu"):
                 z_teacher = policy_nn.mu(priv).detach()        # (N,5)
             else:
@@ -240,10 +239,18 @@ def main(env_cfg, agent_cfg):
 
             # ---- 6) update last_actions & reset buffers for done envs ----
             last_actions = actions_to_step.detach()
-            done_mask = dones
-            if not isinstance(done_mask, torch.Tensor):
-                done_mask = torch.as_tensor(done_mask, device=env.device)
-            done_mask = done_mask.to(dtype=torch.bool).view(-1)
+            if not isinstance(dones, torch.Tensor):
+                dones = torch.as_tensor(dones, device=env.device)
+
+            done_mask = dones.to(device=env.device)
+            if done_mask.dtype != torch.bool:
+                done_mask = done_mask != 0
+            done_mask = done_mask.reshape(-1)
+
+            if done_mask.numel() != env.num_envs:
+                raise RuntimeError(
+                    f"Unexpected dones shape: {tuple(done_mask.shape)} for num_envs={env.num_envs}"
+                )
 
             if torch.any(done_mask):
                 obs_history[done_mask] = 0.0

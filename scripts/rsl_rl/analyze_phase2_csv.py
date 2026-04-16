@@ -129,26 +129,17 @@ class Series:
                     self.df[f"{prefix}_{axis}"] = self.df[wcol].to_numpy(dtype=float) - float(o[idx])
 
     def add_derivatives(self) -> None:
-        """Add uav/payload velocities, and uav accelerations, in TASK frame."""
+        """Add uav_vx/vy/vz and uav_ax/ay/az in TASK frame by numerical differentiation."""
         t = self.t()
-
-        # UAV velocity + acceleration
         for axis in ["x", "y", "z"]:
             pcol = f"uav_{axis}"
-            if pcol in self.df.columns:
-                p = self.df[pcol].to_numpy(dtype=float)
-                v = _gradient(p, t)
-                a = _gradient(v, t)
-                self.df[f"uav_v{axis}"] = v
-                self.df[f"uav_a{axis}"] = a
-
-        # payload velocity
-        for axis in ["x", "y", "z"]:
-            pcol = f"payload_{axis}"
-            if pcol in self.df.columns:
-                p = self.df[pcol].to_numpy(dtype=float)
-                v = _gradient(p, t)
-                self.df[f"payload_v{axis}"] = v
+            if pcol not in self.df.columns:
+                continue
+            p = self.df[pcol].to_numpy(dtype=float)
+            v = _gradient(p, t)
+            a = _gradient(v, t)
+            self.df[f"uav_v{axis}"] = v
+            self.df[f"uav_a{axis}"] = a
 
     def clip_time(self, t_max: float | None) -> "Series":
         if t_max is None:
@@ -167,87 +158,7 @@ def load_series(path: Path, name: str, start_ref: np.ndarray, goal_ref: np.ndarr
     s.add_task_frame()
     s.add_derivatives()
     return s
-def _first_true(mask: np.ndarray):
-    idx = np.where(mask)[0]
-    return None if len(idx) == 0 else int(idx[0])
 
-def _first_sustained(mask: np.ndarray, min_len: int):
-    if min_len <= 1:
-        return _first_true(mask)
-    run = 0
-    for i, m in enumerate(mask):
-        if m:
-            run += 1
-            if run >= min_len:
-                return i - min_len + 1
-        else:
-            run = 0
-    return None
-
-def compute_summary(series: Series, goal_radius: float = 0.1, stable_time: float = 1.0):
-    df = series.df
-    t = series.t()
-
-    if all(c in df.columns for c in ["payload_err_x", "payload_err_y", "payload_err_z"]):
-        err = np.linalg.norm(df[["payload_err_x", "payload_err_y", "payload_err_z"]].to_numpy(dtype=float), axis=1)
-    else:
-        err = np.linalg.norm(
-            df[["payload_x", "payload_y", "payload_z"]].to_numpy(dtype=float)
-            - series.goal_ref.reshape(1, 3),
-            axis=1,
-        )
-
-    theta = np.sqrt(
-        df["theta_x_deg"].to_numpy(dtype=float) ** 2
-        + df["theta_y_deg"].to_numpy(dtype=float) ** 2
-    )
-
-    payload_speed = np.sqrt(
-        df.get("payload_vx", pd.Series(np.zeros_like(t))).to_numpy(dtype=float) ** 2
-        + df.get("payload_vy", pd.Series(np.zeros_like(t))).to_numpy(dtype=float) ** 2
-        + df.get("payload_vz", pd.Series(np.zeros_like(t))).to_numpy(dtype=float) ** 2
-    )
-
-    uav_speed = np.sqrt(
-        df.get("uav_vx", pd.Series(np.zeros_like(t))).to_numpy(dtype=float) ** 2
-        + df.get("uav_vy", pd.Series(np.zeros_like(t))).to_numpy(dtype=float) ** 2
-        + df.get("uav_vz", pd.Series(np.zeros_like(t))).to_numpy(dtype=float) ** 2
-    )
-
-    dt = float(np.nanmedian(np.diff(t))) if len(t) >= 2 else 0.0
-    stable_steps = max(1, int(round(stable_time / max(dt, 1e-9))))
-
-    hit_mask = err <= goal_radius
-    idx_hit = _first_true(hit_mask)
-    idx_stable = _first_sustained(hit_mask, stable_steps)
-
-    def pick(arr, idx):
-        return None if idx is None else float(arr[idx])
-
-    summary = {
-        "final_error_m": float(err[-1]),
-        "tail2_mean_error_m": float(np.mean(err[t >= (t[-1] - 2.0)])) if len(t) else None,
-        "tail5_mean_error_m": float(np.mean(err[t >= (t[-1] - 5.0)])) if len(t) else None,
-        "peak_theta_deg": float(np.max(theta)),
-        "theta_p95_deg": float(np.percentile(theta, 95)),
-        "final_theta_deg": float(theta[-1]),
-        "first_hit_time_s": pick(t, idx_hit),
-        "first_hit_payload_speed_mps": pick(payload_speed, idx_hit),
-        "first_hit_uav_speed_mps": pick(uav_speed, idx_hit),
-        "stable_hit_time_s": pick(t, idx_stable),
-        "stable_hit_payload_speed_mps": pick(payload_speed, idx_stable),
-        "stable_hit_uav_speed_mps": pick(uav_speed, idx_stable),
-    }
-
-    if all(c in df.columns for c in ["a0_raw","a1_raw","a2_raw","a3_raw"]):
-        a_raw = df[["a0_raw","a1_raw","a2_raw","a3_raw"]].to_numpy(dtype=float)
-        summary["action_abs_mean"] = float(np.mean(np.abs(a_raw)))
-        summary["action_sat_ratio"] = float(np.mean(np.abs(a_raw) >= 0.999))
-
-    if "z_rmse" in df.columns:
-        summary["z_rmse_mean"] = float(df["z_rmse"].mean())
-
-    return summary
 
 # ----------------------------
 # Plots
@@ -261,13 +172,7 @@ def plot_fig1_payload_pos_and_swing(teacher: Series, student: Series, out_dir: P
 
     fig, axs = plt.subplots(2, 3, figsize=(14, 7))
     axs = axs.reshape(2, 3)
-    # --- helper: only for plotting, not for metrics ---
-    def _smooth(y, win=7):
-        import numpy as np
-        if win <= 1:
-            return y
-        k = np.ones(win) / win
-        return np.convolve(y, k, mode="same")
+
     # payload position x/y/z
     refs = {
         "x": (teacher.goal_ref[0], "goal_x"),
@@ -276,46 +181,26 @@ def plot_fig1_payload_pos_and_swing(teacher: Series, student: Series, out_dir: P
     }
     for j, axis in enumerate(["x", "y", "z"]):
         ax = axs[0, j]
-        yT = teacher.df[f"payload_{axis}"].to_numpy(dtype=float)
-        yS = student.df[f"payload_{axis}"].to_numpy(dtype=float)
-
-        # optional display smoothing
-        yT_plot = _smooth(yT, win=7)
-        yS_plot = _smooth(yS, win=7)
-
-        ax.plot(teacher.t(), yT_plot, label="teacher")
-        ax.plot(student.t(), yS_plot, label="student")
+        ax.plot(teacher.t(), teacher.df[f"payload_{axis}"], label="teacher")
+        ax.plot(student.t(), student.df[f"payload_{axis}"], label="student")
         ax.axhline(float(refs[axis][0]), linestyle="--", linewidth=1.0, label="ref")
-
         ax.set_title(f"Payload {axis.upper()} (task frame)")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(f"{axis} (m)")
         ax.grid(True, linestyle=":", linewidth=0.6)
-
-        # ---- nicer axis limits ----
-        if axis == "y":
-            ax.set_ylim(-3.0, 3.0)
+        ax.legend()
 
     # swing angles theta_x / theta_y
     for j, (col, title) in enumerate([("theta_x_deg", "Swing θx (deg)"), ("theta_y_deg", "Swing θy (deg)")]):
         ax = axs[1, j]
-
-        thT = teacher.df[col].to_numpy(dtype=float)
-        thS = student.df[col].to_numpy(dtype=float)
-
-        # optional display smoothing
-        thT_plot = _smooth(thT, win=7)
-        thS_plot = _smooth(thS, win=7)
-
-        ax.plot(teacher.t(), thT_plot, label="teacher")
-        ax.plot(student.t(), thS_plot, label="student")
+        ax.plot(teacher.t(), teacher.df[col], label="teacher")
+        ax.plot(student.t(), student.df[col], label="student")
         ax.axhline(0.0, linestyle="--", linewidth=1.0, label="ref")
-
         ax.set_title(title)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("deg")
         ax.grid(True, linestyle=":", linewidth=0.6)
-        ax.set_ylim(-30.0, 30.0)
+        ax.legend()
 
     # last panel: payload error norm (optional quick sanity)
     ax = axs[1, 2]
@@ -578,22 +463,7 @@ def main():
     tw = float(args.time_window)
     tmax = None if tw <= 0 else tw
     plot_fig4_energy_combined(teacher, student, out_dir, tmax, float(args.smooth_window))
-    teacher_summary = compute_summary(teacher)
-    student_summary = compute_summary(student)
 
-    import json
-    with open(out_dir / "summary_teacher.json", "w") as f:
-        json.dump(teacher_summary, f, indent=2)
-    with open(out_dir / "summary_student.json", "w") as f:
-        json.dump(student_summary, f, indent=2)
-
-    print("[SUMMARY][teacher]")
-    for k, v in teacher_summary.items():
-        print(f"  {k}: {v}")
-
-    print("[SUMMARY][student]")
-    for k, v in student_summary.items():
-        print(f"  {k}: {v}")
     print(f"[DONE] Figures saved to: {out_dir}")
 
 if __name__ == "__main__":

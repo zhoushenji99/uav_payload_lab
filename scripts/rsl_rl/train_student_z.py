@@ -6,8 +6,6 @@ import os
 import glob
 import json
 import argparse
-import time
-import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,7 +23,6 @@ def parse_args():
     p.add_argument("--save_name", type=str, default="best_student_encoder_z.pth")
     p.add_argument("--use_weighted_mse", action="store_true", default=True)
     p.add_argument("--no_weighted_mse", dest="use_weighted_mse", action="store_false")
-    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 class CNNStudentEncoder(nn.Module):
@@ -67,13 +64,9 @@ def compute_z_stats_from_meta(meta_path: str, z_dim: int):
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_wall_start = time.time()
+
     shard_files = sorted(glob.glob(os.path.join(args.data_dir, "shard_*.pt")))
     assert len(shard_files) > 0, f"No shard_*.pt found in {args.data_dir}"
 
@@ -109,7 +102,7 @@ def main():
 
     model = CNNStudentEncoder(input_dim=in_dim, history_len=H, output_dim=z_dim).to(device)
     opt = optim.Adam(model.parameters(), lr=args.lr)
-    num_params = sum(p.numel() for p in model.parameters())
+
     def mse_loss(pred, target):
         return torch.mean((pred - target) ** 2)
 
@@ -118,8 +111,6 @@ def main():
         return torch.mean(((pred - target) ** 2) * w)
 
     best_val = float("inf")
-    best_epoch = -1
-    best_rmse_dim = None
     train_hist = []
     val_hist = []
 
@@ -189,16 +180,13 @@ def main():
 
         if va < best_val:
             best_val = va
-            best_epoch = epoch + 1
-            best_rmse_dim = rmse_dim.tolist()
             save_path = os.path.join(args.out_dir, args.save_name)
             torch.save(model.state_dict(), save_path)
             print(f"[Save] {save_path} (best_val={best_val:.6e})")
+
     # ---- final report ----
     report = {
         "best_val": best_val,
-        "best_epoch": best_epoch,
-        "best_rmse_dim": best_rmse_dim,
         "use_weighted_mse": bool(args.use_weighted_mse),
         "z_std": z_std.cpu().tolist(),
         "z_mean": z_mean.cpu().tolist() if z_mean is not None else None,
@@ -210,9 +198,6 @@ def main():
         "batch_size": args.batch_size,
         "lr": args.lr,
         "epochs": args.epochs,
-        "seed": args.seed,
-        "num_params": int(num_params),
-        "wall_clock_sec": float(time.time() - train_wall_start),
     }
     report_path = os.path.join(args.out_dir, "report.json")
     with open(report_path, "w") as f:

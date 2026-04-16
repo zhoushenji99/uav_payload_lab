@@ -5,8 +5,8 @@
 # Logs env{trace_env} to CSV for paper-grade plots (UAV pos, payload pos, swing, z, energy proxies).
 #
 # Key fixes vs your "Ultimate" script:
-# 1) Teacher action input MUST be [proprio(21), z_teacher(5)], NOT [proprio21), priv(5)].
-# 2) Student encoder input MUST match collect_z_dataset.py: feature_t = [proprio(21), last_action(4)] => 21 dims.
+# 1) Teacher action input MUST be [proprio(17), z_teacher(5)], NOT [proprio(17), priv(5)].
+# 2) Student encoder input MUST match collect_z_dataset.py: feature_t = [proprio(17), last_action(4)] => 21 dims.
 # 3) Use IsaacLab's hydra_task_config + parse_known_args pattern (same as official play.py) so CLI works.
 
 from __future__ import annotations
@@ -193,15 +193,15 @@ def main(env_cfg, agent_cfg):
 
     # ---- buffers ----
     history_len = int(args_cli.history_len)
-    proprio_dim = 21   # observed policy part，已经包含 prev_action(4)
+    proprio_dim = 21
     action_dim = 4
     z_dim = getattr(policy_nn, "z_dim", 5)
-    priv_dim = z_dim
+    priv_dim = z_dim  # current env appends mlw(5): m_norm, l_norm, wind_norm(3)
 
     obs = env.get_observations()
     dt = float(base_env.step_dt)
     obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
-    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 暂时保留，不参与 feat 拼接
+    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 可保留给日志/重置，但不参与 feat
 
     trace_env = int(args_cli.trace_env)
     if trace_env < 0 or trace_env >= env.num_envs:
@@ -254,12 +254,13 @@ def main(env_cfg, agent_cfg):
         with torch.inference_mode():
 
             # ---- 0) current obs(t) -> tensor ----
-            obs_tensor = _get_obs_tensor(obs)  # (N, 26)
-            obs_proprio = obs_tensor[:, :proprio_dim]  # (N, 21)
-            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]  # (N, 5)
+            obs_tensor = _get_obs_tensor(obs)  # (N,26)
+            obs_proprio = obs_tensor[:, :proprio_dim]  # (N,21)
+            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]  # (N,5) => 21:26
 
-            # history 输入必须和 collect_z_dataset.py 完全一致
-            feat = obs_proprio   # (N, 21)
+            # ---- 1) update history with (s_t, a_{t-1}) ----
+            # feature_t = [proprio(t), last_action(t-1)]  (MUST match collect_z_dataset.py)
+            feat = obs_proprio
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
@@ -279,8 +280,8 @@ def main(env_cfg, agent_cfg):
                 # student: policy sees z_hat directly
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
-                    z_hat = encoder(obs_history).detach()  # (N, z_dim)
-                    policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 21+5=26)
+                z_hat = encoder(obs_history).detach()  # (N, z_dim)
+                policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 17+z_dim)
 
             # ---- 3) build obs dict for policy ----
             obs_in = {"policy": policy_in}
@@ -340,17 +341,26 @@ def main(env_cfg, agent_cfg):
                 *a_clp,
             ])
 
-            # ---- 6) SINGLE env.step: advance to obs(t+1) ----
             obs, _, dones, _ = env.step(actions)
+            if step_count == 0:
+                print(f"[DEBUG] dones dtype={dones.dtype if isinstance(dones, torch.Tensor) else type(dones)}")
+                print(f"[DEBUG] dones shape={tuple(dones.shape) if isinstance(dones, torch.Tensor) else 'scalar'}")
+                print(f"[DEBUG] dones value={dones}")
+            # 统一把 dones 规范成 bool mask: shape = (num_envs,)
+            if not isinstance(dones, torch.Tensor):
+                dones = torch.as_tensor(dones, device=env.device)
 
-            # ---- 7) update last_actions & reset history for done envs ----
+            done_mask = dones.to(device=env.device)
+            if done_mask.dtype != torch.bool:
+                done_mask = done_mask != 0
+            done_mask = done_mask.reshape(-1)
+
+            if done_mask.numel() != env.num_envs:
+                raise RuntimeError(
+                    f"Unexpected dones shape: {tuple(done_mask.shape)} for num_envs={env.num_envs}"
+                )
+
             last_actions = actions.detach()
-
-            done_mask = dones
-            if not isinstance(done_mask, torch.Tensor):
-                done_mask = torch.as_tensor(done_mask, device=env.device)
-
-            done_mask = done_mask.to(dtype=torch.bool).view(-1)
 
             if torch.any(done_mask):
                 obs_history[done_mask] = 0.0
@@ -358,7 +368,6 @@ def main(env_cfg, agent_cfg):
                 if hasattr(policy_nn, "reset"):
                     policy_nn.reset(done_mask)
 
-            # stop exactly at episode boundary of trace_env
             if bool(args_cli.stop_on_done) and bool(done_mask[e].item()):
                 print(f"[INFO] trace_env done at step={step_count}. stop_on_done=True -> exit.")
                 break
