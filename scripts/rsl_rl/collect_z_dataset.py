@@ -116,7 +116,7 @@ def main(env_cfg, agent_cfg):
         policy_nn.use_mu = True
 
     history_len = int(args_cli.history_len)
-    proprio_dim = 21  # 这里的 21 已经包含 prev_action(4)
+    proprio_dim = 17
     action_dim = 4
     z_dim = getattr(policy_nn, "z_dim", 5)
     priv_dim = z_dim  # in your current teacher: priv = mlw(5)
@@ -125,7 +125,7 @@ def main(env_cfg, agent_cfg):
     dt = env.unwrapped.step_dt
     probe_steps = int(args_cli.probe_sec / dt)
     # history buffer: (N, H, 21)
-    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
+    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=env.device)
     last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
 
     out_dir = os.path.join(log_dir, args_cli.out_name)
@@ -182,15 +182,15 @@ def main(env_cfg, agent_cfg):
 
 
             # ---- 2) build history input from obs(t) and last_action(t-1) ----
-            obs_tensor = _get_obs_tensor(obs)                  # (N,26)
-            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,21)
-            feat = obs_proprio                                 # (N,21)
+            obs_tensor = _get_obs_tensor(obs)                  # (N,22)
+            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,17)
+            feat = torch.cat([obs_proprio, last_actions], dim=1)   # (N,21)
 
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
             # ---- 3) teacher label z_teacher: use mu(priv) (robust; no dependency on last_z timing) ----
-            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]   # 即 21:26
+            priv = obs_tensor[:, 17:17 + priv_dim]             # (N,5)
             if hasattr(policy_nn, "mu"):
                 z_teacher = policy_nn.mu(priv).detach()        # (N,5)
             else:
@@ -239,29 +239,16 @@ def main(env_cfg, agent_cfg):
 
             # ---- 6) update last_actions & reset buffers for done envs ----
             last_actions = actions_to_step.detach()
-            if not isinstance(dones, torch.Tensor):
-                dones = torch.as_tensor(dones, device=env.device)
-
-            done_mask = dones.to(device=env.device)
-            if done_mask.dtype != torch.bool:
-                done_mask = done_mask != 0
-            done_mask = done_mask.reshape(-1)
-
-            if done_mask.numel() != env.num_envs:
-                raise RuntimeError(
-                    f"Unexpected dones shape: {tuple(done_mask.shape)} for num_envs={env.num_envs}"
-                )
-
-            if torch.any(done_mask):
-                obs_history[done_mask] = 0.0
-                last_actions[done_mask] = 0.0
-                policy_nn.reset(done_mask)
+            if torch.any(dones):
+                obs_history[dones] = 0.0
+                last_actions[dones] = 0.0
+                policy_nn.reset(dones)
 
             step_count += 1
 
             # ---- 7) save shards & stop ----
             if (step_count >= warmup) and ((step_count - warmup + 1) % args_cli.save_every == 0):
-                inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim)
+                inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
                 labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
                 shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
                 torch.save({"inputs": inputs, "labels": labels}, shard_path)
@@ -274,7 +261,7 @@ def main(env_cfg, agent_cfg):
             if step_count >= (args_cli.steps + warmup):
                 # flush remaining
                 if len(shard_inputs) > 0:
-                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim)
+                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
                     labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
                     shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
                     torch.save({"inputs": inputs, "labels": labels}, shard_path)
@@ -301,10 +288,9 @@ def main(env_cfg, agent_cfg):
                     "steps": args_cli.steps,
                     "save_every": args_cli.save_every,
                     "obs_layout": {
-                        "observed_policy(21)": "err(3),theta(2),theta_dot(2),quat(4),lin_vel(3),ang_vel(3),prev_action(4)",
-                        "priv(5)": "m_norm(1), l_norm(1), wind_norm(3)",
-                        "teacher_raw_obs(26)": "[observed_policy(21), priv(5)]",
-                        "student_raw_obs(26)": "[observed_policy(21), z_hat(5)]",
+                        "proprio(17)": "err(3),theta(2),theta_dot(2),quat(4),lin_vel(3),ang_vel(3)",
+                        "priv(5)": "mlw(5) in current teacher",
+                        "policy_input": "[proprio(17), z(5)]",
                     },
                     "z_stats": {
                         "mean": z_mean.tolist(),
