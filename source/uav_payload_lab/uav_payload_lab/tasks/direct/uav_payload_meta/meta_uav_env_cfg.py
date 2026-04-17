@@ -173,7 +173,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, #4096
+        num_envs=96, #4096
         env_spacing=6,
         replicate_physics=True,
         clone_in_fabric=True,

@@ -16,7 +16,7 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 
-
+print("[PPO_PHYS][FILE]", __file__)
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
@@ -125,9 +125,10 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         # --- phys anchor (fixed for this experiment) ---
         self.phys_anchor_coef = 1e-3   # 先用 1e-3；后面你再调 1e-2 / 5e-3
-        self.phys_anchor_coef = phys_anchor_coef
-        self.use_phys_anchor = use_phys_anchor
-
+        self.phys_anchor_coef = 1.0
+        self.use_phys_anchor = True
+        print(f"[PPO_PHYS] use_phys_anchor={use_phys_anchor}, phys_anchor_coef={phys_anchor_coef}")
+    
     def init_storage(
         self,
         training_type: str,
