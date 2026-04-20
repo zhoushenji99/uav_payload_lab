@@ -173,7 +173,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     # 场景：并行 env 数 / 间距
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=96, #4096
+        num_envs=4096, #4096
         env_spacing=6,
         replicate_physics=True,
         clone_in_fabric=True,
@@ -229,36 +229,20 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # ---------------------------------------------------------------------
     # Observation noise (Sim2Real)
     # ---------------------------------------------------------------------
-    enable_obs_noise = True
+    enable_obs_noise = False
 
     # 对应 obs 的 17 维里这些块
-    # obs_noise_e_load_std_m = 0.02      # e_load (m)
-    # obs_noise_tilt_std_deg = 0.5       # theta_x, theta_y (deg)
-    # obs_theta_dot_lpf_alpha = 0.5
-    # obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
-    # obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)
-
-    obs_noise_e_load_std_m = 0.02
-    obs_noise_tilt_std_deg = 0.5
-    obs_noise_v_b_std_mps = 0.05
-    obs_noise_w_b_std_rps = 0.03
-
-    # theta_dot 噪声诊断模式：
-    # "diff_noisy_tilt" = 当前旧方法（高风险）
-    # "direct_noise_on_clean_w" = 推荐诊断法
-    # "clean_w" = 不给 theta_dot 加噪，只保留 theta 噪声
-    obs_theta_dot_noise_mode = "diff_noisy_tilt"
-
-    # 仅在 direct_noise_on_clean_w 模式下使用
-    obs_noise_theta_dot_std_deg_s = 3.0
-
-    # 仅在 diff_noisy_tilt 模式下使用
+    obs_noise_e_load_std_m = 0.02      # e_load (m)
+    obs_noise_tilt_std_deg = 0.5       # theta_x, theta_y (deg)
     obs_theta_dot_lpf_alpha = 0.5
+    obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
+    obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)
+
     # ==========================================
     # [新增] Sim2Real: 延迟与动力学建模
     # ==========================================
     # 模拟纯链路延迟 (假设你的控制频率是50Hz，2帧即40ms延迟)
-    action_delay_steps: int = 2  
+    action_delay_steps: int =   0
     
     # 模拟电机的物理低通滤波 (0.2表示当前指令占20%，80%继承系统惯性)
     action_lpf_alpha: float = 0.2  

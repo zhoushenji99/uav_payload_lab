@@ -38,6 +38,8 @@ parser.add_argument("--probe_amp", type=float, default=0.35,
                     help="Amplitude of probing lateral command in action space.")
 parser.add_argument("--probe_freq", type=float, default=1.0,
                     help="Hz of probing sine.")
+parser.add_argument("--sample_stride", type=int, default=5,
+                    help="Store one sample every K env steps after warmup.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -114,19 +116,17 @@ def main(env_cfg, agent_cfg):
     # teacher collection must use_mu=True so z_teacher = mu(priv)
     if hasattr(policy_nn, "use_mu"):
         policy_nn.use_mu = True
-
     history_len = int(args_cli.history_len)
-    proprio_dim = 17
-    action_dim = 4
+    input_dim = 21            # 当前 teacher 真正看到的 proprio 维度，已经包含 prev_actions(4)
     z_dim = getattr(policy_nn, "z_dim", 5)
-    priv_dim = z_dim  # in your current teacher: priv = mlw(5)
+    priv_dim = z_dim          # 当前 teacher 的 privileged tail = 5
 
     obs = env.get_observations()
     dt = env.unwrapped.step_dt
     probe_steps = int(args_cli.probe_sec / dt)
+
     # history buffer: (N, H, 21)
-    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=env.device)
-    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
+    obs_history = torch.zeros((env.num_envs, history_len, input_dim), device=env.device)
 
     out_dir = os.path.join(log_dir, args_cli.out_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -137,7 +137,7 @@ def main(env_cfg, agent_cfg):
     shard_idx = 0
     step_count = 0
     warmup = history_len
-
+    stored_steps = 0
     # meta stats accumulators (CPU)
     z_sum = torch.zeros(z_dim)
     z_sumsq = torch.zeros(z_dim)
@@ -182,15 +182,14 @@ def main(env_cfg, agent_cfg):
 
 
             # ---- 2) build history input from obs(t) and last_action(t-1) ----
-            obs_tensor = _get_obs_tensor(obs)                  # (N,22)
-            obs_proprio = obs_tensor[:, :proprio_dim]          # (N,17)
-            feat = torch.cat([obs_proprio, last_actions], dim=1)   # (N,21)
+            obs_tensor = _get_obs_tensor(obs)      # (N,26)
+            feat = obs_tensor[:, :input_dim]       # (N,21)
 
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
             # ---- 3) teacher label z_teacher: use mu(priv) (robust; no dependency on last_z timing) ----
-            priv = obs_tensor[:, 17:17 + priv_dim]             # (N,5)
+            priv = obs_tensor[:, 21:26]             # (N,5)
             if hasattr(policy_nn, "mu"):
                 z_teacher = policy_nn.mu(priv).detach()        # (N,5)
             else:
@@ -198,10 +197,10 @@ def main(env_cfg, agent_cfg):
                 z_teacher = priv.detach()
 
             # ---- 4) store sample after warmup ----
-            if step_count >= warmup:
+            if step_count >= warmup and ((step_count - warmup) % args_cli.sample_stride == 0):
                 shard_inputs.append(obs_history.detach().clone().cpu().to(torch.float16))
                 shard_labels.append(z_teacher.detach().clone().cpu().to(torch.float32))
-
+                stored_steps += 1
                 # stats (CPU)
                 z_cpu = z_teacher.detach().cpu()
                 z_sum += z_cpu.sum(dim=0)
@@ -238,17 +237,16 @@ def main(env_cfg, agent_cfg):
             obs, _, dones, _ = env.step(actions_to_step)
 
             # ---- 6) update last_actions & reset buffers for done envs ----
-            last_actions = actions_to_step.detach()
-            if torch.any(dones):
-                obs_history[dones] = 0.0
-                last_actions[dones] = 0.0
-                policy_nn.reset(dones)
+            done_mask = dones.to(dtype=torch.bool).reshape(-1)
+            if torch.any(done_mask):
+                obs_history[done_mask] = 0.0
+                policy_nn.reset(done_mask)
 
             step_count += 1
 
             # ---- 7) save shards & stop ----
             if (step_count >= warmup) and ((step_count - warmup + 1) % args_cli.save_every == 0):
-                inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
+                inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)                
                 labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
                 shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
                 torch.save({"inputs": inputs, "labels": labels}, shard_path)
@@ -261,14 +259,14 @@ def main(env_cfg, agent_cfg):
             if step_count >= (args_cli.steps + warmup):
                 # flush remaining
                 if len(shard_inputs) > 0:
-                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, proprio_dim + action_dim)
+                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
                     labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
                     shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
                     torch.save({"inputs": inputs, "labels": labels}, shard_path)
                     print(f"[Collect] saved {shard_path} | inputs={inputs.shape} labels={labels.shape}")
 
-                # write meta + stats
-                total_samples = (step_count - warmup) * env.num_envs
+                # write meta + stat
+                total_samples = stored_steps * env.num_envs
                 z_mean = z_sum / max(1, total_samples)
                 z_var = z_sumsq / max(1, total_samples) - z_mean * z_mean
                 z_std = torch.sqrt(torch.clamp(z_var, min=1e-12))
@@ -281,16 +279,16 @@ def main(env_cfg, agent_cfg):
                     "checkpoint": resume_path,
                     "num_envs": env.num_envs,
                     "history_len": history_len,
-                    "proprio_dim": proprio_dim,
-                    "action_dim": action_dim,
+                    "input_dim": input_dim,
+                    "sample_stride": args_cli.sample_stride,
                     "priv_dim": priv_dim,
                     "z_dim": z_dim,
                     "steps": args_cli.steps,
                     "save_every": args_cli.save_every,
                     "obs_layout": {
-                        "proprio(17)": "err(3),theta(2),theta_dot(2),quat(4),lin_vel(3),ang_vel(3)",
-                        "priv(5)": "mlw(5) in current teacher",
-                        "policy_input": "[proprio(17), z(5)]",
+                        "policy_obs(21)": "err(3),theta(2),theta_dot(2),quat(4),lin_vel(3),ang_vel(3),prev_actions(4)",
+                        "priv(5)": "m_norm(1), l_norm(1), wind_norm(3)",
+                        "student_input": "history of policy_obs(21)",
                     },
                     "z_stats": {
                         "mean": z_mean.tolist(),

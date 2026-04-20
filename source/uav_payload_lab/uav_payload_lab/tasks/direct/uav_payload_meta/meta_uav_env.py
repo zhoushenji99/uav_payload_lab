@@ -330,53 +330,37 @@ class UavPayloadMetaEnv(DirectRLEnv):
             root_quat_w_obs = root_quat_w
 
             # 3) noisy theta_dot = diff(noisy tilt)
-            # 3) theta_dot observation noise mode
-            noise_mode = str(getattr(self.cfg, "obs_theta_dot_noise_mode", "diff_noisy_tilt"))
-
-            if noise_mode == "diff_noisy_tilt":
-                # === 旧方法：noisy theta -> diff -> LPF ===
-                if self._obs_prev_tilt_deg is None:
-                    self._obs_prev_tilt_deg = torch.zeros_like(tilt_deg_obs)
-                    self._obs_has_prev_tilt = torch.zeros(
-                        self.num_envs, dtype=torch.bool, device=self.device
-                    )
-
-                delta_tilt_obs = tilt_deg_obs - self._obs_prev_tilt_deg
-                w_deg_obs_raw = torch.where(
-                    self._obs_has_prev_tilt.unsqueeze(-1),
-                    delta_tilt_obs / max(self.step_dt, 1e-6),
-                    torch.zeros_like(delta_tilt_obs),
+            if self._obs_prev_tilt_deg is None:
+                self._obs_prev_tilt_deg = torch.zeros_like(tilt_deg_obs)
+                self._obs_has_prev_tilt = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=self.device
                 )
 
-                if self._obs_w_deg_filt is None:
-                    self._obs_w_deg_filt = torch.zeros_like(w_deg_obs_raw)
-                    self._obs_has_prev_w = torch.zeros(
-                        self.num_envs, dtype=torch.bool, device=self.device
-                    )
+            delta_tilt_obs = tilt_deg_obs - self._obs_prev_tilt_deg
+            w_deg_obs_raw = torch.where(
+                self._obs_has_prev_tilt.unsqueeze(-1),
+                delta_tilt_obs / max(self.step_dt, 1e-6),
+                torch.zeros_like(delta_tilt_obs),
+            )
 
-                alpha = float(self.cfg.obs_theta_dot_lpf_alpha)
-                w_deg_obs = torch.where(
-                    self._obs_has_prev_w.unsqueeze(-1),
-                    alpha * self._obs_w_deg_filt + (1.0 - alpha) * w_deg_obs_raw,
-                    w_deg_obs_raw,
+            if self._obs_w_deg_filt is None:
+                self._obs_w_deg_filt = torch.zeros_like(w_deg_obs_raw)
+                self._obs_has_prev_w = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=self.device
                 )
 
-                self._obs_w_deg_filt = w_deg_obs.clone()
-                self._obs_has_prev_w[:] = True
-                self._obs_prev_tilt_deg = tilt_deg_obs.clone()
-                self._obs_has_prev_tilt[:] = True
+            alpha = float(self.cfg.obs_theta_dot_lpf_alpha)
 
-            elif noise_mode == "direct_noise_on_clean_w":
-                # === 推荐诊断法：clean theta_dot + small additive noise ===
-                theta_dot_std = float(getattr(self.cfg, "obs_noise_theta_dot_std_deg_s", 3.0))
-                w_deg_obs = w_deg + torch.randn_like(w_deg) * theta_dot_std
+            w_deg_obs = torch.where(
+                self._obs_has_prev_w.unsqueeze(-1),
+                alpha * self._obs_w_deg_filt + (1.0 - alpha) * w_deg_obs_raw,
+                w_deg_obs_raw,
+            )
 
-            elif noise_mode == "clean_w":
-                # === 诊断上限：theta 有噪声，但 theta_dot 完全用 clean 值 ===
-                w_deg_obs = w_deg
-
-            else:
-                raise ValueError(f"Unknown obs_theta_dot_noise_mode: {noise_mode}")
+            self._obs_w_deg_filt = w_deg_obs.clone()
+            self._obs_has_prev_w[:] = True
+            self._obs_prev_tilt_deg = tilt_deg_obs.clone()
+            self._obs_has_prev_tilt[:] = True
 
         else:
             e_load_obs = e_load
@@ -619,11 +603,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 3. 绳长随机化 & 设置关节目标 (核心修复!)
         if hasattr(self.cfg, "rope_length_range"):
             lo_len, hi_len = self.cfg.rope_length_range
-            # 修复：添加env_ids依赖，避免种子固定时所有episode相同
-            rand_offset = env_ids.float() / (self.num_envs * 10.0)  # 使不同env有不同偏移
-            rand_vals = torch.rand(len(env_ids), device=self.device) + rand_offset
-            rand_vals = rand_vals % 1.0  # 确保在[0,1)
-            L = rand_vals * (hi_len - lo_len) + lo_len
+            L = torch.rand(len(env_ids), device=self.device) * (hi_len - lo_len) + lo_len
             self._rope_lengths[env_ids] = L
             
             # (A) 设置状态：告诉物理引擎现在绳子有多长
@@ -647,11 +627,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
             env_ids_cpu = env_ids.to("cpu")
             # 假设你已经缓存了 _default_masses_cpu
             masses = self._default_masses_cpu.clone() 
-            # 修复：添加env_ids依赖
-            rand_offset = env_ids_cpu.float() / (self.num_envs * 10.0)
-            rand_vals = torch.rand(len(env_ids_cpu), device="cpu") + rand_offset
-            rand_vals = rand_vals % 1.0
-            new_mass = rand_vals * (hi - lo) + lo
+            new_mass = torch.empty((len(env_ids_cpu),), device="cpu").uniform_(float(lo), float(hi))
             masses[env_ids_cpu, self._payload_id] = new_mass
             self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
             # 记录到 buffer
@@ -691,8 +667,13 @@ class UavPayloadMetaEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         
         # 9. 错峰 Reset (Spread out)
-        if len(env_ids) == self.num_envs:
-            self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+        if len(env_ids) == self.num_envs and self.num_envs > 1:
+            self.episode_length_buf = torch.randint_like(
+                self.episode_length_buf,
+                high=int(self.max_episode_length),
+            )
+        else:
+            self.episode_length_buf[env_ids] = 0
         # [新增] 清空动作相关的历史缓存
         self._raw_actions[env_ids] = 0.0
         self._prev_raw_actions[env_ids] = 0.0

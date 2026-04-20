@@ -16,7 +16,7 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 
-print("[PPO_PHYS][FILE]", __file__)
+
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
@@ -124,11 +124,16 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         # --- phys anchor (fixed for this experiment) ---
-        self.phys_anchor_coef = 1e-3   # 先用 1e-3；后面你再调 1e-2 / 5e-3
-        self.phys_anchor_coef = 1.0
-        self.use_phys_anchor = True
-        print(f"[PPO_PHYS] use_phys_anchor={use_phys_anchor}, phys_anchor_coef={phys_anchor_coef}")
-    
+        self.phys_anchor_coef = phys_anchor_coef
+        self.use_phys_anchor = use_phys_anchor
+
+        # debug counters
+        self._phys_dbg_count = 0
+
+        print(
+            f"[PPO_PHYS][INIT] use_phys_anchor={self.use_phys_anchor}, "
+            f"phys_anchor_coef={self.phys_anchor_coef}"
+        )
     def init_storage(
         self,
         training_type: str,
@@ -324,8 +329,17 @@ class PPO:
             if self.use_phys_anchor and hasattr(self.policy, "compute_physics_loss"):
                 phys_loss = self.policy.compute_physics_loss(obs_batch)
                 if not torch.isnan(phys_loss):
-                    loss += self.phys_anchor_coef * phys_loss
+                    weighted_phys = self.phys_anchor_coef * phys_loss
+                    loss += weighted_phys
                     mean_phys_anchor += phys_loss.item()
+
+                    if self._phys_dbg_count < 10:
+                        print(
+                            f"[PPO_PHYS][BATCH] coef={self.phys_anchor_coef:.6f} "
+                            f"phys_loss={float(phys_loss.detach().cpu()):.6e} "
+                            f"weighted={float(weighted_phys.detach().cpu()):.6e}"
+                        )
+                        self._phys_dbg_count += 1
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions

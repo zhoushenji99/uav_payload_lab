@@ -167,8 +167,8 @@ def main(env_cfg, agent_cfg):
         env = multi_agent_to_single_agent(env)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     base_env = env.unwrapped
-    if hasattr(base_env, "episode_length_buf"):
-        base_env.episode_length_buf[:] = 0
+    # if hasattr(base_env, "episode_length_buf"):
+    #     base_env.episode_length_buf[:] = 0
     # ---- runner + policy ----
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     print(f"[INFO] Loading checkpoint (model-only): {resume_path}")
@@ -183,25 +183,52 @@ def main(env_cfg, agent_cfg):
 
     # ---- student encoder ----
     encoder = None
+    student_input_dim = 21
+    student_history_len = int(args_cli.history_len)
+    student_z_dim = 5
+
     if args_cli.mode == "student":
         if not args_cli.encoder:
             raise ValueError("--mode student requires --encoder path")
-        encoder = CNNStudentEncoder(input_dim=21, history_len=int(args_cli.history_len), output_dim=5).to(env.device)
-        encoder.load_state_dict(torch.load(args_cli.encoder, map_location=env.device))
+
+        enc_ckpt = torch.load(args_cli.encoder, map_location=env.device)
+
+        # 兼容两种格式：
+        # 1) 新格式：{"state_dict": ..., "history_len":..., "input_dim":..., "z_dim":...}
+        # 2) 老格式：纯 state_dict
+        if isinstance(enc_ckpt, dict) and "state_dict" in enc_ckpt:
+            enc_state_dict = enc_ckpt["state_dict"]
+            student_history_len = int(enc_ckpt.get("history_len", student_history_len))
+            student_input_dim = int(enc_ckpt.get("input_dim", student_input_dim))
+            student_z_dim = int(enc_ckpt.get("z_dim", student_z_dim))
+        else:
+            enc_state_dict = enc_ckpt
+
+        encoder = CNNStudentEncoder(
+            input_dim=student_input_dim,
+            history_len=student_history_len,
+            output_dim=student_z_dim,
+        ).to(env.device)
+
+        encoder.load_state_dict(enc_state_dict, strict=True)
         encoder.eval()
-        print(f"[INFO] Loaded student encoder: {args_cli.encoder}")
+        print(
+            f"[INFO] Loaded student encoder: {args_cli.encoder} | "
+            f"input_dim={student_input_dim} history_len={student_history_len} z_dim={student_z_dim}"
+        )
 
     # ---- buffers ----
-    history_len = int(args_cli.history_len)
-    proprio_dim = 17
+    # ---- buffers ----
+    history_len = student_history_len if args_cli.mode == "student" else int(args_cli.history_len)
+    proprio_dim = 21
     action_dim = 4
-    z_dim = getattr(policy_nn, "z_dim", 5)
-    priv_dim = z_dim  # current env appends mlw(5): m_norm, l_norm, wind_norm(3)
+    z_dim = student_z_dim if args_cli.mode == "student" else int(getattr(policy_nn, "z_dim", 5))
+    priv_dim = int(getattr(policy_nn, "z_dim", 5))
 
     obs = env.get_observations()
     dt = float(base_env.step_dt)
-    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim + action_dim), device=env.device)
-    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)
+    obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
+    last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 只用于日志/重置，不参与feat
 
     trace_env = int(args_cli.trace_env)
     if trace_env < 0 or trace_env >= env.num_envs:
@@ -254,13 +281,13 @@ def main(env_cfg, agent_cfg):
         with torch.inference_mode():
 
             # ---- 0) current obs(t) -> tensor ----
-            obs_tensor = _get_obs_tensor(obs)  # (N, proprio_dim + priv_dim) e.g. (N, 22)
-            obs_proprio = obs_tensor[:, :proprio_dim]  # (N, 17)
-            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]  # (N, 5)  == e(t)
+            obs_tensor = _get_obs_tensor(obs)           # (N,26)
+            obs_proprio = obs_tensor[:, :proprio_dim]   # (N,21)
+            priv = obs_tensor[:, proprio_dim: proprio_dim + priv_dim]   # 21:26
 
             # ---- 1) update history with (s_t, a_{t-1}) ----
             # feature_t = [proprio(t), last_action(t-1)]  (MUST match collect_z_dataset.py)
-            feat = torch.cat([obs_proprio, last_actions], dim=1)  # (N, 21)
+            feat = obs_proprio
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
 
@@ -281,7 +308,7 @@ def main(env_cfg, agent_cfg):
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
                 z_hat = encoder(obs_history).detach()  # (N, z_dim)
-                policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 17+z_dim)
+                policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 21+z_dim)
 
             # ---- 3) build obs dict for policy ----
             obs_in = {"policy": policy_in}
@@ -344,14 +371,20 @@ def main(env_cfg, agent_cfg):
             # ---- 6) SINGLE env.step: advance to obs(t+1) ----
             obs, _, dones, _ = env.step(actions)
 
-            # ---- 7) update last_actions & reset history for done envs ----
             last_actions = actions.detach()
 
-            if torch.any(dones):
-                obs_history[dones] = 0.0
-                last_actions[dones] = 0.0
+            done_mask = dones.to(dtype=torch.bool).reshape(-1)
+            if done_mask.numel() != env.num_envs:
+                raise RuntimeError(
+                    f"Bad dones shape: got {tuple(dones.shape)}, "
+                    f"after reshape={tuple(done_mask.shape)}, expected num_envs={env.num_envs}"
+                )
+
+            if torch.any(done_mask):
+                obs_history[done_mask] = 0.0
+                last_actions[done_mask] = 0.0
                 if hasattr(policy_nn, "reset"):
-                    policy_nn.reset(dones)
+                    policy_nn.reset(done_mask)
 
             # stop exactly at episode boundary of trace_env
             if bool(args_cli.stop_on_done) and bool(dones[e].item()):

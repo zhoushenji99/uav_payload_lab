@@ -83,7 +83,10 @@ def main():
     in_dim = x0.shape[2]
     z_dim = y0.shape[1]
     print(f"[Data] inferred H={H} in_dim={in_dim} z_dim={z_dim}")
-
+    if in_dim != 21:
+        raise RuntimeError(f"Expected input dim = 21, but got {in_dim}. collect pipeline is inconsistent.")
+    if z_dim != 5:
+        raise RuntimeError(f"Expected z dim = 5, but got {z_dim}.")
     # z stats (for weighted mse)
     z_mean, z_std = compute_z_stats_from_meta(os.path.join(args.data_dir, "meta.pt"), z_dim)
     if z_std is None:
@@ -181,7 +184,17 @@ def main():
         if va < best_val:
             best_val = va
             save_path = os.path.join(args.out_dir, args.save_name)
-            torch.save(model.state_dict(), save_path)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "history_len": H,
+                    "input_dim": in_dim,
+                    "z_dim": z_dim,
+                    "z_mean": z_mean.cpu(),
+                    "z_std": z_std.cpu(),
+                },
+                save_path,
+            )
             print(f"[Save] {save_path} (best_val={best_val:.6e})")
 
     # ---- final report ----
