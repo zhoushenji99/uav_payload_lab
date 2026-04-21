@@ -29,6 +29,8 @@ def parse_args():
         default=0.5,
         help="Auxiliary supervision weight for pred[:, :2] -> [m_norm, l_norm]. 0 disables.",
     )
+    p.add_argument("--resume", action="store_true", help="Resume training from a saved checkpoint.")
+    p.add_argument("--resume_path", type=str, default="", help="Path to checkpoint for resume.")
     return p.parse_args()
 
 class CNNStudentEncoder(nn.Module):
@@ -130,8 +132,37 @@ def main():
     best_val = float("inf")
     train_hist = []
     val_hist = []
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if args.resume:
+        if not args.resume_path:
+            raise RuntimeError("--resume requires --resume_path")
+        ckpt = torch.load(args.resume_path, map_location=device)
+
+        if "state_dict" not in ckpt:
+            raise RuntimeError(f"Resume checkpoint missing 'state_dict': {args.resume_path}")
+
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+
+        if "optimizer_state_dict" in ckpt:
+            opt.load_state_dict(ckpt["optimizer_state_dict"])
+            for param_group in opt.param_groups:
+                param_group["lr"] = args.lr
+            print(f"[Resume] override optimizer lr -> {args.lr}")
+        else:
+            print("[WARN] optimizer_state_dict not found in resume checkpoint. This is only pseudo-resume.")
+
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        best_val = float(ckpt.get("best_val", best_val))
+        train_hist = list(ckpt.get("train_hist", train_hist))
+        val_hist = list(ckpt.get("val_hist", val_hist))
+
+        print(
+            f"[Resume] loaded {args.resume_path} | "
+            f"start_epoch={start_epoch} best_val={best_val:.6e}"
+        )
+
+    for epoch in range(start_epoch, args.epochs):
         # ---- train ----
         model.train()
         train_losses = []
@@ -241,6 +272,11 @@ def main():
             torch.save(
                 {
                     "state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "epoch": epoch,
+                    "best_val": best_val,
+                    "train_hist": train_hist,
+                    "val_hist": val_hist,
                     "history_len": H,
                     "input_dim": in_dim,
                     "z_dim": z_dim,
@@ -249,8 +285,24 @@ def main():
                 },
                 save_path,
             )
-            print(f"[Save] {save_path} (best_val={best_val:.6e})")
-
+            print(f"[Save-Best] {save_path} (best_val={best_val:.6e})")
+        last_path = os.path.join(args.out_dir, "last_checkpoint.pth")
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
+                "train_hist": train_hist,
+                "val_hist": val_hist,
+                "history_len": H,
+                "input_dim": in_dim,
+                "z_dim": z_dim,
+                "z_mean": z_mean.cpu(),
+                "z_std": z_std.cpu(),
+            },
+            last_path,
+        )
     # ---- final report ----
     report = {
         "best_val": best_val,
