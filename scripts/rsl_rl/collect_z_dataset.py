@@ -134,6 +134,7 @@ def main(env_cfg, agent_cfg):
     # shard buffers
     shard_inputs = []
     shard_labels = []
+    shard_labels_ml = []
     shard_idx = 0
     step_count = 0
     warmup = history_len
@@ -200,8 +201,10 @@ def main(env_cfg, agent_cfg):
             if step_count >= warmup and ((step_count - warmup) % args_cli.sample_stride == 0):
                 shard_inputs.append(obs_history.detach().clone().cpu().to(torch.float16))
                 shard_labels.append(z_teacher.detach().clone().cpu().to(torch.float32))
+                shard_labels_ml.append(priv[:, :2].detach().clone().cpu().to(torch.float32))
                 stored_steps += 1
-                # stats (CPU)
+
+                # stats (CPU): accumulate per stored sample
                 z_cpu = z_teacher.detach().cpu()
                 z_sum += z_cpu.sum(dim=0)
                 z_sumsq += (z_cpu * z_cpu).sum(dim=0)
@@ -230,7 +233,7 @@ def main(env_cfg, agent_cfg):
                         theta_deg[0], theta_deg[1],
                         theta_dot_deg_s[0], theta_dot_deg_s[1],
                         *actions_raw[e].detach().cpu().numpy().tolist(),
-                        *actions_to_step[e].detach().cpu().numpy().tolist(),   # 注意这里记录实际 step 的动作
+                        *actions_to_step[e].detach().cpu().numpy().tolist(),
                     ])
 
             # ---- 5) step env ONCE using actions_to_step ----
@@ -246,24 +249,50 @@ def main(env_cfg, agent_cfg):
 
             # ---- 7) save shards & stop ----
             if (step_count >= warmup) and ((step_count - warmup + 1) % args_cli.save_every == 0):
-                inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)                
-                labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
-                shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
-                torch.save({"inputs": inputs, "labels": labels}, shard_path)
-                print(f"[Collect] saved {shard_path} | inputs={inputs.shape} labels={labels.shape}")
-                shard_inputs.clear()
-                shard_labels.clear()
-                shard_idx += 1
-
-            # stop condition
-            if step_count >= (args_cli.steps + warmup):
-                # flush remaining
                 if len(shard_inputs) > 0:
                     inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
                     labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
+                    labels_ml = torch.stack(shard_labels_ml, dim=0).reshape(-1, 2)
+
                     shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
-                    torch.save({"inputs": inputs, "labels": labels}, shard_path)
-                    print(f"[Collect] saved {shard_path} | inputs={inputs.shape} labels={labels.shape}")
+                    torch.save(
+                        {
+                            "inputs": inputs,
+                            "labels": labels,
+                            "labels_ml": labels_ml,
+                        },
+                        shard_path,
+                    )
+                    print(
+                        f"[Collect] saved {shard_path} | "
+                        f"inputs={inputs.shape} labels={labels.shape} labels_ml={labels_ml.shape}"
+                    )
+
+                    shard_inputs.clear()
+                    shard_labels.clear()
+                    shard_labels_ml.clear()
+                    shard_idx += 1
+
+            # stop condition
+            if step_count >= (args_cli.steps + warmup):
+                if len(shard_inputs) > 0:
+                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
+                    labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
+                    labels_ml = torch.stack(shard_labels_ml, dim=0).reshape(-1, 2)
+
+                    shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
+                    torch.save(
+                        {
+                            "inputs": inputs,
+                            "labels": labels,
+                            "labels_ml": labels_ml,
+                        },
+                        shard_path,
+                    )
+                    print(
+                        f"[Collect] saved {shard_path} | "
+                        f"inputs={inputs.shape} labels={labels.shape} labels_ml={labels_ml.shape}"
+                    )
 
                 # write meta + stat
                 total_samples = stored_steps * env.num_envs
@@ -290,6 +319,7 @@ def main(env_cfg, agent_cfg):
                         "priv(5)": "m_norm(1), l_norm(1), wind_norm(3)",
                         "student_input": "history of policy_obs(21)",
                     },
+                    "aux_target": "labels_ml = priv[:, :2] = [m_norm, l_norm]",
                     "z_stats": {
                         "mean": z_mean.tolist(),
                         "std": z_std.tolist(),
@@ -306,7 +336,6 @@ def main(env_cfg, agent_cfg):
                 torch.save(meta, os.path.join(out_dir, "meta.pt"))
                 print("[Collect] saved meta.pt")
 
-                # write trace csv
                 if args_cli.trace_csv and len(trace_rows) > 0:
                     with open(trace_path, "w", newline="") as f:
                         w = csv.writer(f)

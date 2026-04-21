@@ -23,6 +23,12 @@ def parse_args():
     p.add_argument("--save_name", type=str, default="best_student_encoder_z.pth")
     p.add_argument("--use_weighted_mse", action="store_true", default=True)
     p.add_argument("--no_weighted_mse", dest="use_weighted_mse", action="store_false")
+    p.add_argument(
+        "--aux_ml_coef",
+        type=float,
+        default=0.5,
+        help="Auxiliary supervision weight for pred[:, :2] -> [m_norm, l_norm]. 0 disables.",
+    )
     return p.parse_args()
 
 class CNNStudentEncoder(nn.Module):
@@ -47,9 +53,10 @@ class CNNStudentEncoder(nn.Module):
 
 def load_shard(path):
     d = torch.load(path, map_location="cpu")
-    x = d["inputs"].float()   # (N, H, 21)
-    y = d["labels"].float()   # (N, 5)
-    return x, y
+    x = d["inputs"].float()        # (N, H, 21)
+    y = d["labels"].float()        # (N, 5)
+    y_ml = d["labels_ml"].float() if "labels_ml" in d else None   # (N, 2)
+    return x, y, y_ml
 
 def compute_z_stats_from_meta(meta_path: str, z_dim: int):
     if not os.path.exists(meta_path):
@@ -78,22 +85,29 @@ def main():
     print(f"[Data] shards={n} train={len(train_files)} val={len(val_files)}")
 
     # infer dims from first shard
-    x0, y0 = load_shard(train_files[0])
+    x0, y0, y0_ml = load_shard(train_files[0])
     H = x0.shape[1]
     in_dim = x0.shape[2]
     z_dim = y0.shape[1]
     print(f"[Data] inferred H={H} in_dim={in_dim} z_dim={z_dim}")
+
     if in_dim != 21:
         raise RuntimeError(f"Expected input dim = 21, but got {in_dim}. collect pipeline is inconsistent.")
     if z_dim != 5:
         raise RuntimeError(f"Expected z dim = 5, but got {z_dim}.")
+
+    has_ml = y0_ml is not None
+    if args.aux_ml_coef > 0.0 and not has_ml:
+        raise RuntimeError("aux_ml_coef > 0 but shard has no labels_ml. Please recollect dataset.")
+    if has_ml and y0_ml.shape[1] != 2:
+        raise RuntimeError(f"Expected labels_ml dim = 2, but got {y0_ml.shape[1]}.")
     # z stats (for weighted mse)
     z_mean, z_std = compute_z_stats_from_meta(os.path.join(args.data_dir, "meta.pt"), z_dim)
     if z_std is None:
         # fallback: compute approx std from first few shards
         ys = []
         for fp in train_files[:min(3, len(train_files))]:
-            _, y = load_shard(fp)
+            _, y, _ = load_shard(fp)
             ys.append(y)
         ycat = torch.cat(ys, dim=0)
         z_mean = ycat.mean(dim=0)
@@ -123,8 +137,13 @@ def main():
         train_losses = []
 
         for fp in train_files:
-            x, y = load_shard(fp)
-            ds = TensorDataset(x, y)
+            x, y, y_ml = load_shard(fp)
+
+            if y_ml is not None:
+                ds = TensorDataset(x, y, y_ml)
+            else:
+                ds = TensorDataset(x, y)
+
             dl = DataLoader(
                 ds,
                 batch_size=args.batch_size,
@@ -133,12 +152,28 @@ def main():
                 pin_memory=True,
                 persistent_workers=(args.num_workers > 0),
             )
-            for bx, by in dl:
+
+            for batch in dl:
+                if y_ml is not None:
+                    bx, by, by_ml = batch
+                    by_ml = by_ml.to(device, non_blocking=True)
+                else:
+                    bx, by = batch
+                    by_ml = None
+
                 bx = bx.to(device, non_blocking=True)
                 by = by.to(device, non_blocking=True)
+
                 opt.zero_grad(set_to_none=True)
                 pred = model(bx)
-                loss = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+
+                loss_main = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+                loss = loss_main
+
+                if by_ml is not None and args.aux_ml_coef > 0.0:
+                    loss_ml = mse_loss(pred[:, :2], by_ml)
+                    loss = loss + args.aux_ml_coef * loss_ml
+
                 loss.backward()
                 opt.step()
                 train_losses.append(loss.item())
@@ -146,13 +181,18 @@ def main():
         # ---- val ----
         model.eval()
         val_losses = []
-        # also compute per-dim rmse on a running basis
         sum_sq = torch.zeros(z_dim, device=device)
         count = 0
+
         with torch.no_grad():
             for fp in val_files:
-                x, y = load_shard(fp)
-                ds = TensorDataset(x, y)
+                x, y, y_ml = load_shard(fp)
+
+                if y_ml is not None:
+                    ds = TensorDataset(x, y, y_ml)
+                else:
+                    ds = TensorDataset(x, y)
+
                 dl = DataLoader(
                     ds,
                     batch_size=args.batch_size,
@@ -161,11 +201,26 @@ def main():
                     pin_memory=True,
                     persistent_workers=(args.num_workers > 0),
                 )
-                for bx, by in dl:
+
+                for batch in dl:
+                    if y_ml is not None:
+                        bx, by, by_ml = batch
+                        by_ml = by_ml.to(device, non_blocking=True)
+                    else:
+                        bx, by = batch
+                        by_ml = None
+
                     bx = bx.to(device, non_blocking=True)
                     by = by.to(device, non_blocking=True)
+
                     pred = model(bx)
-                    loss = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+
+                    loss_main = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+                    loss = loss_main
+                    if by_ml is not None and args.aux_ml_coef > 0.0:
+                        loss_ml = mse_loss(pred[:, :2], by_ml)
+                        loss = loss + args.aux_ml_coef * loss_ml
+
                     val_losses.append(loss.item())
 
                     err = pred - by
@@ -178,7 +233,6 @@ def main():
         val_hist.append(va)
 
         rmse_dim = torch.sqrt(sum_sq / max(1, count)).detach().cpu().numpy()
-
         print(f"Epoch {epoch+1:03d}/{args.epochs} | train={tr:.6e} | val={va:.6e} | rmse_dim={np.round(rmse_dim,3)}")
 
         if va < best_val:
@@ -211,6 +265,8 @@ def main():
         "batch_size": args.batch_size,
         "lr": args.lr,
         "epochs": args.epochs,
+        "aux_ml_coef": args.aux_ml_coef,
+        "has_labels_ml": has_ml,
     }
     report_path = os.path.join(args.out_dir, "report.json")
     with open(report_path, "w") as f:
