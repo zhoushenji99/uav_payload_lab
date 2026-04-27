@@ -17,6 +17,7 @@ import os
 import csv
 import time
 import math
+import json
 from dataclasses import dataclass
 
 import torch
@@ -404,7 +405,29 @@ def main(env_cfg, agent_cfg):
     # ----------------------------
     f.close()
     env.close()
-    print(f"[DONE] steps={step_count} wall={time.time()-t0:.2f}s -> {csv_path}")
+
+    wall_time_sec = float(time.time() - t0)
+    print(f"[DONE] steps={step_count} wall={wall_time_sec:.2f}s -> {csv_path}")
+
+    summary = {
+        "mode": args_cli.mode,
+        "checkpoint": resume_path,
+        "encoder": args_cli.encoder if args_cli.mode == "student" else "",
+        "csv_path": csv_path,
+        "steps": int(step_count),
+        "wall_time_sec": wall_time_sec,
+        "dt": float(dt),
+        "num_envs": int(env.num_envs),
+        "seed": int(args_cli.seed) if args_cli.seed is not None else None,
+        "max_steps": int(args_cli.max_steps),
+        "stop_on_done": bool(args_cli.stop_on_done),
+    }
+
+    summary_name = "phase2_teacher_play_summary.json" if args_cli.mode == "teacher" else "phase2_student_play_summary.json"
+    summary_path = os.path.join(os.path.dirname(csv_path), summary_name)
+    with open(summary_path, "w") as fsum:
+        json.dump(summary, fsum, indent=2)
+    print(f"[Summary] saved {summary_path}")
 
 
 

@@ -8,6 +8,7 @@ import os
 import time
 import csv
 import math
+import json
 import torch
 from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
@@ -130,7 +131,7 @@ def main(env_cfg, agent_cfg):
 
     out_dir = os.path.join(log_dir, args_cli.out_name)
     os.makedirs(out_dir, exist_ok=True)
-
+    collect_t0 = time.time()
     # shard buffers
     shard_inputs = []
     shard_labels = []
@@ -334,6 +335,37 @@ def main(env_cfg, agent_cfg):
                     },
                 }
                 torch.save(meta, os.path.join(out_dir, "meta.pt"))
+                wall_time_sec = time.time() - collect_t0
+                num_shards = shard_idx + (1 if len(shard_inputs) > 0 else 0)
+                total_samples = stored_steps * env.num_envs
+
+                collect_report = {
+                    "checkpoint": resume_path,
+                    "out_dir": out_dir,
+                    "wall_time_sec": wall_time_sec,
+                    "num_envs": int(env.num_envs),
+                    "steps_requested": int(args_cli.steps),
+                    "warmup_steps": int(warmup),
+                    "env_steps_total": int(step_count),
+                    "stored_steps": int(stored_steps),
+                    "total_samples": int(total_samples),
+                    "num_shards": int(num_shards),
+                    "samples_per_sec": float(total_samples / max(wall_time_sec, 1e-9)),
+                    "history_len": int(history_len),
+                    "input_dim": int(input_dim),
+                    "z_dim": int(z_dim),
+                    "sample_stride": int(args_cli.sample_stride),
+                    "save_every": int(args_cli.save_every),
+                    "probe_sec": float(args_cli.probe_sec),
+                    "probe_amp": float(args_cli.probe_amp),
+                    "probe_freq": float(args_cli.probe_freq),
+                    "trace_csv": bool(args_cli.trace_csv),
+                }
+
+                collect_report_path = os.path.join(out_dir, "collect_report.json")
+                with open(collect_report_path, "w") as f:
+                    json.dump(collect_report, f, indent=2)
+                print(f"[Collect] saved collect_report.json -> {collect_report_path}")
                 print("[Collect] saved meta.pt")
 
                 if args_cli.trace_csv and len(trace_rows) > 0:

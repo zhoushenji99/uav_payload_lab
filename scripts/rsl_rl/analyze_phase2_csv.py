@@ -18,6 +18,7 @@ Usage example:
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
@@ -280,8 +281,7 @@ def plot_fig2_swing_angles(teacher: Series, student: Series, out_dir: Path) -> N
 
     _save_fig(fig, out_dir / "fig2_swing_angles.png")
 
-def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None:
-    # student must have zT* and zH*
+def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path, semantic_z01: bool = False) -> None:
     need = [f"zT{i}" for i in range(5)] + [f"zH{i}" for i in range(5)]
     for c in need:
         if c not in student.df.columns:
@@ -289,32 +289,21 @@ def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None
 
     tS = student.t()
     tmax = float(tS[-1])
-
     have_teacher_zT = all(f"zT{i}" in teacher.df.columns for i in range(5))
 
     fig, axs = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
 
     for i in range(5):
         ax = axs[i]
+        ax.plot(tS, student.df[f"zT{i}"], label="student:zT")
+        ax.plot(tS, student.df[f"zH{i}"], label="student:zH")
 
-        # student side
-        ax.plot(tS, student.df[f"zT{i}"], label="student:zT (teacher mu(priv))")
-        ax.plot(tS, student.df[f"zH{i}"], label="student:zH (encoder)")
-
-        # optional teacher reference
         if have_teacher_zT:
             tT = teacher.t()
             m = tT <= tmax
-            ax.plot(
-                tT[m],
-                teacher.df.loc[m, f"zT{i}"],
-                linestyle="--",
-                linewidth=1.0,
-                label="teacher:zT",
-            )
+            ax.plot(tT[m], teacher.df.loc[m, f"zT{i}"], linestyle="--", linewidth=1.0, label="teacher:zT")
 
-        # ---- slow variables: z0/z1 use normalized axis ----
-        if i in [0, 1]:
+        if semantic_z01 and i in [0, 1]:
             priv_col = f"priv{i}"
             if priv_col in student.df.columns:
                 true_priv = float(np.nanmedian(student.df[priv_col].to_numpy(dtype=float)))
@@ -335,7 +324,6 @@ def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None
             ax.set_title(f"Latent z{i} (raw)")
 
         ax.grid(True, linestyle=":", linewidth=0.6)
-
         if i == 0:
             ax.legend()
 
@@ -480,7 +468,93 @@ def plot_fig4_energy_combined(teacher: Series, student: Series, out_dir: Path, t
 
     _save_fig(fig, out_dir / "fig4_energy_combined.png")
 
+def _bias_mae_rmse(pred: np.ndarray, gt: np.ndarray):
+    err = pred - gt
+    return {
+        "bias": float(np.mean(err)),
+        "mae": float(np.mean(np.abs(err))),
+        "rmse": float(np.sqrt(np.mean(err ** 2))),
+    }
 
+def _first_hit_time_and_speed(df: pd.DataFrame, thresh: float):
+    if not all(c in df.columns for c in ["payload_err_x", "payload_err_y", "payload_err_z"]):
+        return None, None
+
+    t = df["time_s"].to_numpy(dtype=float)
+    e = np.linalg.norm(df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
+
+    if not all(c in df.columns for c in ["payload_x", "payload_y", "payload_z"]):
+        return None, None
+    p = df[["payload_x", "payload_y", "payload_z"]].to_numpy(dtype=float)
+    v = np.gradient(p, t, axis=0)
+    speed = np.linalg.norm(v, axis=1)
+
+    idx = np.where(e <= thresh)[0]
+    if len(idx) == 0:
+        return None, None
+    i = int(idx[0])
+    return float(t[i]), float(speed[i])
+
+def _compute_phase2_summary(teacher: Series, student: Series, semantic_z01: bool = False):
+    mass_true = float(np.nanmedian(student.df["priv0"].to_numpy(dtype=float)))
+    length_true = float(np.nanmedian(student.df["priv1"].to_numpy(dtype=float)))
+
+    mass_teacher = None
+    mass_student = None
+    length_teacher = None
+    length_student = None
+
+    if semantic_z01:
+        zT0_t = teacher.df["zT0"].to_numpy(dtype=float) if "zT0" in teacher.df.columns else student.df["zT0"].to_numpy(dtype=float)
+        zT1_t = teacher.df["zT1"].to_numpy(dtype=float) if "zT1" in teacher.df.columns else student.df["zT1"].to_numpy(dtype=float)
+
+        zH0 = student.df["zH0"].to_numpy(dtype=float)
+        zH1 = student.df["zH1"].to_numpy(dtype=float)
+
+        mass_teacher = _bias_mae_rmse(zT0_t, np.full_like(zT0_t, mass_true))
+        mass_student = _bias_mae_rmse(zH0, np.full_like(zH0, mass_true))
+        length_teacher = _bias_mae_rmse(zT1_t, np.full_like(zT1_t, length_true))
+        length_student = _bias_mae_rmse(zH1, np.full_like(zH1, length_true))
+
+    # task metrics
+    def _task_metrics(df: pd.DataFrame):
+        e = np.linalg.norm(df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
+        th = np.sqrt(df["theta_x_deg"].to_numpy(dtype=float)**2 + df["theta_y_deg"].to_numpy(dtype=float)**2)
+
+        t02, v02 = _first_hit_time_and_speed(df, 0.2)
+        t01, v01 = _first_hit_time_and_speed(df, 0.1)
+
+        out = {
+            "hit_t_0p2": t02,
+            "hit_speed_0p2": v02,
+            "hit_t_0p1": t01,
+            "hit_speed_0p1": v01,
+            "final_error": float(e[-1]),
+            "max_swing_deg": float(np.max(th)),
+        }
+        return out
+
+    teacher_task = _task_metrics(teacher.df)
+    student_task = _task_metrics(student.df)
+
+    z_rmse_mean = None
+    if "z_rmse" in student.df.columns:
+        z_rmse_mean = float(np.nanmean(student.df["z_rmse"].to_numpy(dtype=float)))
+
+    summary = {
+        "true_norm": {
+            "mass_norm": mass_true,
+            "length_norm": length_true,
+        },
+        "teacher_mass": mass_teacher,
+        "student_mass": mass_student,
+        "teacher_length": length_teacher,
+        "student_length": length_student,
+        "teacher_task": teacher_task,
+        "student_task": student_task,
+        "student_mean_z_rmse": z_rmse_mean,
+    }
+    return summary
 # ----------------------------
 # Main
 # ----------------------------
@@ -494,6 +568,8 @@ def main():
     ap.add_argument("--goal", type=float, nargs=3, default=[2.0, 0.0, 2.0], help="TASK goal offset (x y z)")
     ap.add_argument("--time_window", type=float, default=5.0, help="Energy plot time window in seconds (like IsaaclabPlot12.5). Use <=0 to disable clipping.")
     ap.add_argument("--smooth_window", type=float, default=0.15, help="Smoothing window seconds for energy curves.")
+    ap.add_argument("--semantic_z01", action="store_true",
+                help="Treat z0/z1 as semantic normalized mass/length (decoupled only).")
     args = ap.parse_args()
 
     teacher_path = Path(args.teacher).expanduser().resolve()
@@ -515,10 +591,28 @@ def main():
     # Plots
     plot_fig1_payload_pos_and_swing(teacher, student, out_dir)
     plot_fig2_swing_angles(teacher, student, out_dir)
-    plot_fig3_z_compare(teacher, student, out_dir)
+    plot_fig3_z_compare(teacher, student, out_dir, semantic_z01=args.semantic_z01)
+
 
     tw = float(args.time_window)
     tmax = None if tw <= 0 else tw
+    summary = _compute_phase2_summary(teacher, student, semantic_z01=args.semantic_z01)
+    summary_path = out_dir / "phase2_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[Summary] saved {summary_path}")
+
+    if args.semantic_z01:
+        print("[Summary] mass teacher/student MAE:",
+            summary["teacher_mass"]["mae"], summary["student_mass"]["mae"])
+        print("[Summary] length teacher/student MAE:",
+            summary["teacher_length"]["mae"], summary["student_length"]["mae"])
+    else:
+        print("[Summary] coupled mode: z0/z1 treated as raw latent, skip mass/length error metrics.")
+    print("[Summary] teacher hit_t_0p1 / student hit_t_0p1:",
+        summary["teacher_task"]["hit_t_0p1"], summary["student_task"]["hit_t_0p1"])
+    print("[Summary] teacher final_error / student final_error:",
+        summary["teacher_task"]["final_error"], summary["student_task"]["final_error"])
     plot_fig4_energy_combined(teacher, student, out_dir, tmax, float(args.smooth_window))
 
     print(f"[DONE] Figures saved to: {out_dir}")

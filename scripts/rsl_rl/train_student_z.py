@@ -5,6 +5,7 @@
 import os
 import glob
 import json
+import time
 import argparse
 import torch
 import torch.nn as nn
@@ -73,7 +74,7 @@ def compute_z_stats_from_meta(meta_path: str, z_dim: int):
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-
+    train_t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     shard_files = sorted(glob.glob(os.path.join(args.data_dir, "shard_*.pt")))
@@ -121,7 +122,7 @@ def main():
 
     model = CNNStudentEncoder(input_dim=in_dim, history_len=H, output_dim=z_dim).to(device)
     opt = optim.Adam(model.parameters(), lr=args.lr)
-
+    num_params = sum(p.numel() for p in model.parameters())
     def mse_loss(pred, target):
         return torch.mean((pred - target) ** 2)
 
@@ -133,7 +134,9 @@ def main():
     train_hist = []
     val_hist = []
     start_epoch = 0
-
+    best_epoch = None
+    best_rmse_dim = None
+    time_to_best_sec = None
     if args.resume:
         if not args.resume_path:
             raise RuntimeError("--resume requires --resume_path")
@@ -268,6 +271,9 @@ def main():
 
         if va < best_val:
             best_val = va
+            best_epoch = int(epoch + 1)
+            best_rmse_dim = [float(x) for x in rmse_dim.tolist()]
+            time_to_best_sec = float(time.time() - train_t0)
             save_path = os.path.join(args.out_dir, args.save_name)
             torch.save(
                 {
@@ -304,8 +310,16 @@ def main():
             last_path,
         )
     # ---- final report ----
+    wall_time_sec = float(time.time() - train_t0)
+
     report = {
         "best_val": best_val,
+        "best_epoch": best_epoch,
+        "best_rmse_dim": best_rmse_dim,
+        "time_to_best_sec": time_to_best_sec,
+        "wall_time_sec": wall_time_sec,
+        "epochs_ran": len(train_hist),
+        "num_params": int(num_params),
         "use_weighted_mse": bool(args.use_weighted_mse),
         "z_std": z_std.cpu().tolist(),
         "z_mean": z_mean.cpu().tolist() if z_mean is not None else None,
@@ -319,6 +333,8 @@ def main():
         "epochs": args.epochs,
         "aux_ml_coef": args.aux_ml_coef,
         "has_labels_ml": has_ml,
+        "resume": bool(args.resume),
+        "resume_path": args.resume_path,
     }
     report_path = os.path.join(args.out_dir, "report.json")
     with open(report_path, "w") as f:

@@ -2,26 +2,363 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-from scipy.spatial.transform import Rotation as R  # [新增] 用于四元数转欧拉角
+import sys
+import argparse
+from scipy.spatial.transform import Rotation as R
 import math
-# --- 1. 配置 ---
-# [修改] 默认读取当前目录下的 payload_data.csv (根据你的实际文件名修改)
+
+# ============================================================
+# IsaaclabPlot12.5.py
+#
+# 单 CSV：
+#   按你原来的 Figure 1-6 详细分析逻辑跑
+#
+# 双 CSV：
+#   自动进入 Phase-1 teacher 对比模式
+#   用于 decoupled teacher vs coupled teacher 画在同一张图里
+# ============================================================
+
+# 默认路径：不传 --csv 时保持你原来的行为
+DEFAULT_SIM_CSV = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-04-21_21-25-05/payload_data.csv"
 
 # === Analysis window (seconds) ===
-TIME_WINDOW_S = 5  # set None to disable cropping
-
-simulation_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-02-09_03-03-57/payload_data_baseline.csv" 
-# paper_data_path = "/home/shenji/uav_payload_lab/uav_payload_lab/source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_lab/plot/普通控制器vs.heanhua.csv" 
+# CLI 里 --time_window -1 表示不裁剪
+DEFAULT_TIME_WINDOW_S = 5.0
 
 # 坐标系校正 (World -> Task)
 OFFSET_X = 0.0
 OFFSET_Y = 0.0
-# === Task reference (current task) ===
+
+# === Task reference ===
 REF_X = 2.0
 REF_Y = 0.0
 REF_Z = 2.0
 REF_THETA_X = 0.0
 REF_THETA_Y = 0.0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Plot IsaacLab UAV-payload CSV. One CSV = original mode; two CSVs = comparison mode."
+    )
+    parser.add_argument(
+        "--csv",
+        nargs="+",
+        default=[DEFAULT_SIM_CSV],
+        help="One CSV for original mode, or two CSVs for comparison mode: Decoupled Coupled.",
+    )
+    parser.add_argument(
+        "--labels",
+        nargs="*",
+        default=None,
+        help="Labels for comparison mode, e.g. --labels Decoupled Coupled",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=".",
+        help="Output directory for comparison figures and metrics.",
+    )
+    parser.add_argument(
+        "--time_window",
+        type=float,
+        default=DEFAULT_TIME_WINDOW_S,
+        help="Crop to [0, time_window] seconds. Use -1 to disable.",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show matplotlib windows after saving.",
+    )
+
+    # 用 parse_known_args，避免 IsaacLab / shell 额外参数导致崩溃
+    args, _ = parser.parse_known_args()
+    return args
+
+
+ARGS = parse_args()
+TIME_WINDOW_S = None if ARGS.time_window is not None and ARGS.time_window < 0 else ARGS.time_window
+
+# 单 CSV 模式下，后面旧代码继续使用 simulation_data_path
+simulation_data_path = ARGS.csv[0]
+
+
+def preprocess_payload_csv(path: str) -> pd.DataFrame:
+    """读取一个 payload CSV，并统一列名，供双 CSV 对比模式使用。"""
+    df = pd.read_csv(path)
+
+    # 兼容你的旧列名
+    rename_map = {}
+    if "Time" in df.columns and "time" not in df.columns:
+        rename_map["Time"] = "time"
+    if "Swing_Deg_X" in df.columns and "theta_x_deg" not in df.columns:
+        rename_map["Swing_Deg_X"] = "theta_x_deg"
+    if "Swing_Deg_Y" in df.columns and "theta_y_deg" not in df.columns:
+        rename_map["Swing_Deg_Y"] = "theta_y_deg"
+
+    df = df.rename(columns=rename_map)
+
+    if "time" not in df.columns:
+        raise ValueError(f"[ERROR] CSV 缺少 time/Time 列: {path}")
+
+    # payload position
+    if "Payload_X" in df.columns:
+        df["payload_x"] = df["Payload_X"] - OFFSET_X
+        df["payload_y"] = df["Payload_Y"] - OFFSET_Y
+        df["payload_z"] = df["Payload_Z"]
+    elif all(c in df.columns for c in ["payload_x", "payload_y", "payload_z"]):
+        pass
+    else:
+        raise ValueError(
+            f"[ERROR] CSV 缺少 Payload_X/Y/Z 或 payload_x/y/z: {path}\n"
+            f"columns={list(df.columns)}"
+        )
+
+    # swing columns
+    if "theta_x_deg" not in df.columns or "theta_y_deg" not in df.columns:
+        raise ValueError(
+            f"[ERROR] CSV 缺少 theta_x_deg/theta_y_deg 或 Swing_Deg_X/Y: {path}\n"
+            f"columns={list(df.columns)}"
+        )
+
+    # 如果有四元数，顺便算欧拉角，方便后续扩展
+    quat_cols = ["UAV_quat_1", "UAV_quat_2", "UAV_quat_3", "UAV_quat_0"]
+    if all(c in df.columns for c in quat_cols):
+        try:
+            quats = df[quat_cols].to_numpy()
+            euler = R.from_quat(quats).as_euler("xyz", degrees=True)
+            df["roll"] = euler[:, 0]
+            df["pitch"] = euler[:, 1]
+            df["yaw"] = euler[:, 2]
+        except Exception as e:
+            print(f"[WARN] 四元数转欧拉角失败，可忽略: {e}")
+
+    # 派生指标
+    df["dist_to_goal"] = np.sqrt(
+        (df["payload_x"] - REF_X) ** 2
+        + (df["payload_y"] - REF_Y) ** 2
+        + (df["payload_z"] - REF_Z) ** 2
+    )
+
+    df["swing_mag_deg"] = np.sqrt(
+        df["theta_x_deg"] ** 2 + df["theta_y_deg"] ** 2
+    )
+
+    # payload speed：优先读现成速度，没有就用位置差分
+    vel_candidates = [
+        ("Payload_vx", "Payload_vy", "Payload_vz"),
+        ("payload_vx", "payload_vy", "payload_vz"),
+        ("Payload_VX", "Payload_VY", "Payload_VZ"),
+    ]
+
+    found_vel = None
+    for cols in vel_candidates:
+        if all(c in df.columns for c in cols):
+            found_vel = cols
+            break
+
+    if found_vel is not None:
+        vx, vy, vz = [df[c].to_numpy(dtype=float) for c in found_vel]
+    else:
+        t = df["time"].to_numpy(dtype=float)
+        vx = np.gradient(df["payload_x"].to_numpy(dtype=float), t)
+        vy = np.gradient(df["payload_y"].to_numpy(dtype=float), t)
+        vz = np.gradient(df["payload_z"].to_numpy(dtype=float), t)
+
+    df["payload_speed"] = np.sqrt(vx * vx + vy * vy + vz * vz)
+
+    # swing energy surrogate
+    if "SwingVel_DegS_X" in df.columns and "SwingVel_DegS_Y" in df.columns:
+        thx = np.deg2rad(df["theta_x_deg"].to_numpy(dtype=float))
+        thy = np.deg2rad(df["theta_y_deg"].to_numpy(dtype=float))
+        thdx = np.deg2rad(df["SwingVel_DegS_X"].to_numpy(dtype=float))
+        thdy = np.deg2rad(df["SwingVel_DegS_Y"].to_numpy(dtype=float))
+
+        L_est = 0.8
+        if "UAV_Z" in df.columns and "Payload_Z" in df.columns:
+            dz = np.abs(
+                df["UAV_Z"].to_numpy(dtype=float)
+                - df["Payload_Z"].to_numpy(dtype=float)
+            )
+            dz = dz[np.isfinite(dz)]
+            if len(dz) > 20:
+                L_est = float(np.median(dz))
+
+        df["E_hat"] = 0.5 * (
+            thdx ** 2
+            + thdy ** 2
+            + (9.81 / max(L_est, 1e-6)) * (thx ** 2 + thy ** 2)
+        )
+
+    return df
+
+
+def crop_time(df: pd.DataFrame, tmax):
+    if tmax is None:
+        return df
+    return df[(df["time"] >= 0.0) & (df["time"] <= float(tmax))].copy()
+
+
+def first_hit_metric(df: pd.DataFrame, threshold: float):
+    hit = df[df["dist_to_goal"] <= threshold]
+    if len(hit) == 0:
+        return np.nan, np.nan
+    idx = hit.index[0]
+    return float(df.loc[idx, "time"]), float(df.loc[idx, "payload_speed"])
+
+
+def compute_summary(df: pd.DataFrame) -> dict:
+    t02, v02 = first_hit_metric(df, 0.2)
+    t01, v01 = first_hit_metric(df, 0.1)
+
+    out = {
+        "hit_t_0p2_s": t02,
+        "speed_at_0p2_mps": v02,
+        "hit_t_0p1_s": t01,
+        "speed_at_0p1_mps": v01,
+        "final_error_m": float(df["dist_to_goal"].iloc[-1]),
+        "max_swing_deg": float(df["swing_mag_deg"].max()),
+        "mean_swing_deg": float(df["swing_mag_deg"].mean()),
+    }
+
+    if "E_hat" in df.columns:
+        out["E_hat_mean"] = float(df["E_hat"].mean())
+        out["E_hat_peak"] = float(df["E_hat"].max())
+
+    return out
+
+
+def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
+    """
+    双 CSV 对比模式：
+    用于 Phase-1 teacher 的 decoupled vs coupled 对比。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    dfs = []
+    for p in csv_paths:
+        df = preprocess_payload_csv(p)
+        df = crop_time(df, time_window)
+        dfs.append(df)
+        print(f"[Compare] loaded {p}: {len(df)} rows after crop")
+
+    # ============================================================
+    # Figure A: payload position + swing angles
+    # ============================================================
+    fig, axs = plt.subplots(2, 3, figsize=(18, 9), constrained_layout=True)
+    fig.suptitle(
+        "Phase-1 Teacher Comparison: Decoupled vs Coupled",
+        fontsize=16,
+        weight="bold",
+    )
+
+    items = [
+        ("payload_x", "Payload X", REF_X, "Position (m)"),
+        ("payload_y", "Payload Y", REF_Y, "Position (m)"),
+        ("payload_z", "Payload Z", REF_Z, "Position (m)"),
+        ("theta_x_deg", "Swing theta_x", REF_THETA_X, "Angle (deg)"),
+        ("theta_y_deg", "Swing theta_y", REF_THETA_Y, "Angle (deg)"),
+        ("swing_mag_deg", "Swing magnitude", 0.0, "Angle (deg)"),
+    ]
+
+    for ax, (col, title, ref, ylabel) in zip(axs.flat, items):
+        for df, lab in zip(dfs, labels):
+            ax.plot(df["time"], df[col], linewidth=2.2, label=lab)
+
+        if ref is not None:
+            ax.axhline(ref, linestyle=":", linewidth=1.2, alpha=0.7)
+
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, linestyle=":", alpha=0.55)
+        ax.legend(fontsize="small")
+
+        if time_window is not None:
+            ax.set_xlim(0.0, float(time_window))
+
+    fig_path = os.path.join(out_dir, "phase1_teacher_compare_payload_swing.png")
+    fig.savefig(fig_path, dpi=300)
+    print(f"[Saved] {fig_path}")
+
+    # ============================================================
+    # Figure B: distance / speed / swing magnitude
+    # ============================================================
+    fig2, axs2 = plt.subplots(3, 1, figsize=(14, 10), constrained_layout=True, sharex=True)
+    fig2.suptitle(
+        "Phase-1 Teacher Comparison: Error, Speed, and Swing",
+        fontsize=16,
+        weight="bold",
+    )
+
+    for df, lab in zip(dfs, labels):
+        axs2[0].plot(df["time"], df["dist_to_goal"], linewidth=2.2, label=lab)
+        axs2[1].plot(df["time"], df["payload_speed"], linewidth=2.2, label=lab)
+        axs2[2].plot(df["time"], df["swing_mag_deg"], linewidth=2.2, label=lab)
+
+    axs2[0].axhline(0.2, linestyle=":", alpha=0.8, label="0.2 m")
+    axs2[0].axhline(0.1, linestyle="--", alpha=0.8, label="0.1 m")
+    axs2[0].set_ylabel("Distance to goal (m)")
+    axs2[1].set_ylabel("Payload speed (m/s)")
+    axs2[2].set_ylabel("Swing magnitude (deg)")
+    axs2[2].set_xlabel("Time (s)")
+
+    for ax in axs2:
+        ax.grid(True, linestyle=":", alpha=0.55)
+        ax.legend(fontsize="small")
+        if time_window is not None:
+            ax.set_xlim(0.0, float(time_window))
+
+    fig2_path = os.path.join(out_dir, "phase1_teacher_compare_error_speed_swing.png")
+    fig2.savefig(fig2_path, dpi=300)
+    print(f"[Saved] {fig2_path}")
+
+    # ============================================================
+    # Metrics CSV
+    # ============================================================
+    rows = []
+    for p, df, lab in zip(csv_paths, dfs, labels):
+        row = {"label": lab, "csv": p}
+        row.update(compute_summary(df))
+        rows.append(row)
+
+    metrics = pd.DataFrame(rows)
+    metrics_path = os.path.join(out_dir, "phase1_teacher_compare_metrics.csv")
+    metrics.to_csv(metrics_path, index=False)
+
+    print("\n[Metrics]")
+    print(metrics.to_string(index=False))
+    print(f"[Saved] {metrics_path}")
+
+    if ARGS.show:
+        plt.show()
+    else:
+        plt.close("all")
+
+
+# ============================================================
+# 双 CSV：进入 Phase-1 teacher 对比模式，然后提前退出
+# ============================================================
+if len(ARGS.csv) == 2:
+    labels = (
+        ARGS.labels
+        if ARGS.labels is not None and len(ARGS.labels) == 2
+        else ["Decoupled", "Coupled"]
+    )
+
+    plot_phase1_teacher_compare(
+        csv_paths=ARGS.csv,
+        labels=labels,
+        out_dir=ARGS.out_dir,
+        time_window=TIME_WINDOW_S,
+    )
+    sys.exit(0)
+
+elif len(ARGS.csv) != 1:
+    raise SystemExit(
+        "[ERROR] --csv 只能给 1 个或 2 个路径。"
+        "1 个=原图模式；2 个=对比模式。"
+    )
 # --- 2. 加载仿真数据 ---
 try:
     df_sim = pd.read_csv(simulation_data_path)
