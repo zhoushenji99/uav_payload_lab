@@ -18,7 +18,6 @@ Usage example:
 from __future__ import annotations
 
 import argparse
-import json
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
@@ -281,7 +280,8 @@ def plot_fig2_swing_angles(teacher: Series, student: Series, out_dir: Path) -> N
 
     _save_fig(fig, out_dir / "fig2_swing_angles.png")
 
-def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path, semantic_z01: bool = False) -> None:
+def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None:
+    # student must have zT* and zH*
     need = [f"zT{i}" for i in range(5)] + [f"zH{i}" for i in range(5)]
     for c in need:
         if c not in student.df.columns:
@@ -289,46 +289,27 @@ def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path, semanti
 
     tS = student.t()
     tmax = float(tS[-1])
+
+    # teacher zT optional
     have_teacher_zT = all(f"zT{i}" in teacher.df.columns for i in range(5))
 
     fig, axs = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
-
     for i in range(5):
         ax = axs[i]
-        ax.plot(tS, student.df[f"zT{i}"], label="student:zT")
-        ax.plot(tS, student.df[f"zH{i}"], label="student:zH")
-
+        ax.plot(tS, student.df[f"zT{i}"], label="student:zT (teacher mu(priv))")
+        ax.plot(tS, student.df[f"zH{i}"], label="student:zH (encoder)")
         if have_teacher_zT:
+            # align by time index (same dt) – good enough for visual reference
             tT = teacher.t()
             m = tT <= tmax
             ax.plot(tT[m], teacher.df.loc[m, f"zT{i}"], linestyle="--", linewidth=1.0, label="teacher:zT")
-
-        if semantic_z01 and i in [0, 1]:
-            priv_col = f"priv{i}"
-            if priv_col in student.df.columns:
-                true_priv = float(np.nanmedian(student.df[priv_col].to_numpy(dtype=float)))
-                ax.axhline(
-                    true_priv,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="k",
-                    label="true priv" if i == 0 else None,
-                )
-
-            ax.set_ylim(0.0, 1.0)
-            ax.set_yticks(np.linspace(0.0, 1.0, 6))
-            ax.set_ylabel(f"z[{i}] (norm)")
-            ax.set_title("Mass latent z0 (normalized)" if i == 0 else "Length latent z1 (normalized)")
-        else:
-            ax.set_ylabel(f"z[{i}]")
-            ax.set_title(f"Latent z{i} (raw)")
-
+        ax.set_ylabel(f"z[{i}]")
         ax.grid(True, linestyle=":", linewidth=0.6)
         if i == 0:
             ax.legend()
 
     axs[-1].set_xlabel("Time (s)")
-    fig.suptitle("Latent z comparison", y=0.995)
+    fig.suptitle("Latent z comparison (student encoder vs teacher priv->mu)", y=0.995)
     _save_fig(fig, out_dir / "fig3_z_compare.png")
 
 def _compute_energy(df: pd.DataFrame, goal_ref: np.ndarray, smooth_window_s: float = 0.15):
@@ -468,115 +449,786 @@ def plot_fig4_energy_combined(teacher: Series, student: Series, out_dir: Path, t
 
     _save_fig(fig, out_dir / "fig4_energy_combined.png")
 
-def _bias_mae_rmse(pred: np.ndarray, gt: np.ndarray):
-    err = pred - gt
-    return {
-        "bias": float(np.mean(err)),
-        "mae": float(np.mean(np.abs(err))),
-        "rmse": float(np.sqrt(np.mean(err ** 2))),
-    }
 
-def _first_hit_time_and_speed(df: pd.DataFrame, thresh: float):
-    if not all(c in df.columns for c in ["payload_err_x", "payload_err_y", "payload_err_z"]):
-        return None, None
 
+
+# ----------------------------
+# Cross-method Phase-II comparison
+# ----------------------------
+
+def _payload_error_norm(df: pd.DataFrame, goal_ref: np.ndarray | None = None) -> np.ndarray:
+    """Return payload-to-goal error norm. Prefer logged payload_err_* columns."""
+    if all(c in df.columns for c in ["payload_err_x", "payload_err_y", "payload_err_z"]):
+        return np.linalg.norm(df[["payload_err_x", "payload_err_y", "payload_err_z"]].to_numpy(dtype=float), axis=1)
+    if goal_ref is None:
+        raise ValueError("goal_ref is required when payload_err_* columns are missing")
+    p = df[["payload_x", "payload_y", "payload_z"]].to_numpy(dtype=float)
+    return np.linalg.norm(p - goal_ref.reshape(1, 3), axis=1)
+
+
+def _swing_mag_deg(df: pd.DataFrame) -> np.ndarray:
+    return np.sqrt(
+        df["theta_x_deg"].to_numpy(dtype=float) ** 2
+        + df["theta_y_deg"].to_numpy(dtype=float) ** 2
+    )
+
+
+def _payload_speed(df: pd.DataFrame) -> np.ndarray:
     t = df["time_s"].to_numpy(dtype=float)
-    e = np.linalg.norm(df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
-
-    if not all(c in df.columns for c in ["payload_x", "payload_y", "payload_z"]):
-        return None, None
     p = df[["payload_x", "payload_y", "payload_z"]].to_numpy(dtype=float)
     v = np.gradient(p, t, axis=0)
-    speed = np.linalg.norm(v, axis=1)
+    return np.linalg.norm(v, axis=1)
 
-    idx = np.where(e <= thresh)[0]
-    if len(idx) == 0:
-        return None, None
-    i = int(idx[0])
-    return float(t[i]), float(speed[i])
 
-def _compute_phase2_summary(teacher: Series, student: Series, semantic_z01: bool = False):
-    mass_true = float(np.nanmedian(student.df["priv0"].to_numpy(dtype=float)))
-    length_true = float(np.nanmedian(student.df["priv1"].to_numpy(dtype=float)))
+def _interp_to(t_ref: np.ndarray, t_src: np.ndarray, y_src: np.ndarray) -> np.ndarray:
+    return np.interp(t_ref, t_src, y_src)
 
-    mass_teacher = None
-    mass_student = None
-    length_teacher = None
-    length_student = None
 
-    if semantic_z01:
-        zT0_t = teacher.df["zT0"].to_numpy(dtype=float) if "zT0" in teacher.df.columns else student.df["zT0"].to_numpy(dtype=float)
-        zT1_t = teacher.df["zT1"].to_numpy(dtype=float) if "zT1" in teacher.df.columns else student.df["zT1"].to_numpy(dtype=float)
+def _method_metrics(method: str, role: str, s: Series) -> dict:
+    df = s.df
+    t = df["time_s"].to_numpy(dtype=float)
+    err = _payload_error_norm(df, s.goal_ref)
+    swing = _swing_mag_deg(df)
+    speed = _payload_speed(df)
 
-        zH0 = student.df["zH0"].to_numpy(dtype=float)
-        zH1 = student.df["zH1"].to_numpy(dtype=float)
+    def first_hit(thresh: float):
+        idx = np.where(err <= thresh)[0]
+        if len(idx) == 0:
+            return np.nan, np.nan
+        i = int(idx[0])
+        return float(t[i]), float(speed[i])
 
-        mass_teacher = _bias_mae_rmse(zT0_t, np.full_like(zT0_t, mass_true))
-        mass_student = _bias_mae_rmse(zH0, np.full_like(zH0, mass_true))
-        length_teacher = _bias_mae_rmse(zT1_t, np.full_like(zT1_t, length_true))
-        length_student = _bias_mae_rmse(zH1, np.full_like(zH1, length_true))
+    t02, v02 = first_hit(0.2)
+    t01, v01 = first_hit(0.1)
 
-    # task metrics
-    def _task_metrics(df: pd.DataFrame):
-        e = np.linalg.norm(df[["payload_err_x","payload_err_y","payload_err_z"]].to_numpy(dtype=float), axis=1)
-        th = np.sqrt(df["theta_x_deg"].to_numpy(dtype=float)**2 + df["theta_y_deg"].to_numpy(dtype=float)**2)
-
-        t02, v02 = _first_hit_time_and_speed(df, 0.2)
-        t01, v01 = _first_hit_time_and_speed(df, 0.1)
-
-        out = {
-            "hit_t_0p2": t02,
-            "hit_speed_0p2": v02,
-            "hit_t_0p1": t01,
-            "hit_speed_0p1": v01,
-            "final_error": float(e[-1]),
-            "max_swing_deg": float(np.max(th)),
-        }
-        return out
-
-    teacher_task = _task_metrics(teacher.df)
-    student_task = _task_metrics(student.df)
-
-    z_rmse_mean = None
-    if "z_rmse" in student.df.columns:
-        z_rmse_mean = float(np.nanmean(student.df["z_rmse"].to_numpy(dtype=float)))
-
-    summary = {
-        "true_norm": {
-            "mass_norm": mass_true,
-            "length_norm": length_true,
-        },
-        "teacher_mass": mass_teacher,
-        "student_mass": mass_student,
-        "teacher_length": length_teacher,
-        "student_length": length_student,
-        "teacher_task": teacher_task,
-        "student_task": student_task,
-        "student_mean_z_rmse": z_rmse_mean,
+    row = {
+        "method": method,
+        "role": role,
+        "hit_t_0p2_s": t02,
+        "speed_at_0p2_mps": v02,
+        "hit_t_0p1_s": t01,
+        "speed_at_0p1_mps": v01,
+        "final_error_m": float(err[-1]),
+        "tail5_error_m": float(np.nanmean(err[t >= max(0.0, t[-1] - 5.0)])),
+        "max_swing_deg": float(np.nanmax(swing)),
+        "mean_swing_deg": float(np.nanmean(swing)),
     }
-    return summary
+
+    energy = _compute_energy(df, s.goal_ref, smooth_window_s=0.15)
+    if energy is not None:
+        row["E_hat_mean"] = float(np.nanmean(energy["E_hat"]))
+        row["E_hat_peak"] = float(np.nanmax(energy["E_hat"]))
+        e5_mask = energy["t"] >= 5.0
+        row["E_hat_after5_mean"] = float(np.nanmean(energy["E_hat"][e5_mask])) if np.any(e5_mask) else np.nan
+    return row
+
+
+def _pair_gap_metrics(method: str, teacher: Series, student: Series) -> dict:
+    """Student-teacher realization gap for task-level curves."""
+    tT = teacher.t()
+    tS = student.t()
+    t0 = max(float(tT[0]), float(tS[0]))
+    t1 = min(float(tT[-1]), float(tS[-1]))
+    m = (tT >= t0) & (tT <= t1)
+    t = tT[m]
+
+    eT = _payload_error_norm(teacher.df, teacher.goal_ref)[m]
+    eS = _interp_to(t, tS, _payload_error_norm(student.df, student.goal_ref))
+    thT = _swing_mag_deg(teacher.df)[m]
+    thS = _interp_to(t, tS, _swing_mag_deg(student.df))
+
+    return {
+        "method": method,
+        "mean_abs_error_gap_m": float(np.nanmean(np.abs(eS - eT))),
+        "max_abs_error_gap_m": float(np.nanmax(np.abs(eS - eT))),
+        "mean_abs_swing_gap_deg": float(np.nanmean(np.abs(thS - thT))),
+        "max_abs_swing_gap_deg": float(np.nanmax(np.abs(thS - thT))),
+    }
+
+
+def plot_phase2_cross_method_compare(
+    dec_teacher: Series,
+    dec_student: Series,
+    coup_teacher: Series,
+    coup_student: Series,
+    out_dir: Path,
+    time_window_s: float | None,
+    smooth_window_s: float,
+    labels: tuple[str, str] = ("Decoupled", "Coupled"),
+) -> None:
+    """
+    Compare Decoupled and Coupled Phase-II results in one seed.
+
+    Important: do not directly compare z0/z1 between methods. Decoupled z0/z1 are semantic
+    mass/length contexts, while Coupled z dimensions are black-box latent coordinates.
+    Therefore this function compares task curves and student-teacher realization gaps.
+    """
+    _ensure_out_dir(out_dir)
+
+    series = [dec_teacher, dec_student, coup_teacher, coup_student]
+    names = [f"{labels[0]} teacher", f"{labels[0]} student", f"{labels[1]} teacher", f"{labels[1]} student"]
+
+    # clip all to common duration and optional requested window
+    common_tmax = min(float(s.t()[-1]) for s in series)
+    if time_window_s is not None:
+        common_tmax = min(common_tmax, float(time_window_s))
+    series = [s.clip_time(common_tmax) for s in series]
+    dec_teacher, dec_student, coup_teacher, coup_student = series
+
+    # -------------------- Fig A: task curves --------------------
+    fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle("Phase-II cross-method comparison: task curves", fontsize=14, weight="bold")
+
+    for s, name in zip(series, names):
+        t = s.t()
+        axs[0].plot(t, _payload_error_norm(s.df, s.goal_ref), linewidth=1.8, label=name)
+        axs[1].plot(t, _swing_mag_deg(s.df), linewidth=1.8, label=name)
+
+    axs[0].axhline(0.2, linestyle=":", linewidth=1.0, label="0.2 m")
+    axs[0].axhline(0.1, linestyle="--", linewidth=1.0, label="0.1 m")
+    axs[0].set_ylabel("Payload error (m)")
+    axs[0].set_title("Payload-to-goal error")
+
+    axs[1].set_ylabel("Swing magnitude (deg)")
+    axs[1].set_title("Payload swing magnitude")
+
+    # z_rmse only compares teacher-vs-student within each method, not raw latent dimensions across methods
+    if "z_rmse" in dec_student.df.columns:
+        axs[2].plot(dec_student.t(), dec_student.df["z_rmse"].to_numpy(dtype=float), linewidth=1.8, label=f"{labels[0]} z RMSE")
+    if "z_rmse" in coup_student.df.columns:
+        axs[2].plot(coup_student.t(), coup_student.df["z_rmse"].to_numpy(dtype=float), linewidth=1.8, label=f"{labels[1]} z RMSE")
+    axs[2].set_ylabel("z RMSE")
+    axs[2].set_title("Student latent realization error")
+    axs[2].set_xlabel("Time (s)")
+
+    for ax in axs:
+        ax.grid(True, linestyle=":", linewidth=0.6)
+        ax.legend(fontsize="small", ncol=2)
+
+    _save_fig(fig, out_dir / "phase2_compare_task_curves.png")
+
+    # -------------------- Fig B: student-teacher gap curves --------------------
+    fig, axs = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig.suptitle("Phase-II student-teacher realization gap", fontsize=14, weight="bold")
+
+    def plot_gap(ax_err, ax_swing, teacher: Series, student: Series, label: str):
+        tT = teacher.t()
+        tS = student.t()
+        t0 = max(float(tT[0]), float(tS[0]))
+        t1 = min(float(tT[-1]), float(tS[-1]))
+        m = (tT >= t0) & (tT <= t1)
+        t = tT[m]
+        eT = _payload_error_norm(teacher.df, teacher.goal_ref)[m]
+        eS = _interp_to(t, tS, _payload_error_norm(student.df, student.goal_ref))
+        thT = _swing_mag_deg(teacher.df)[m]
+        thS = _interp_to(t, tS, _swing_mag_deg(student.df))
+        ax_err.plot(t, np.abs(eS - eT), linewidth=1.8, label=label)
+        ax_swing.plot(t, np.abs(thS - thT), linewidth=1.8, label=label)
+
+    plot_gap(axs[0], axs[1], dec_teacher, dec_student, labels[0])
+    plot_gap(axs[0], axs[1], coup_teacher, coup_student, labels[1])
+
+    axs[0].set_ylabel("|student-teacher| error gap (m)")
+    axs[0].set_title("Payload error realization gap")
+    axs[1].set_ylabel("|student-teacher| swing gap (deg)")
+    axs[1].set_title("Swing realization gap")
+    axs[1].set_xlabel("Time (s)")
+    for ax in axs:
+        ax.grid(True, linestyle=":", linewidth=0.6)
+        ax.legend()
+    _save_fig(fig, out_dir / "phase2_compare_realization_gap.png")
+
+    # -------------------- Fig C: decoupled semantic z only --------------------
+    # This is for the proposed method only. Coupled latent dimensions are not semantically aligned.
+    if all(c in dec_student.df.columns for c in ["zH0", "zH1", "priv0", "priv1"]):
+        fig, axs = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+        fig.suptitle("Decoupled semantic context recovery", fontsize=14, weight="bold")
+        t = dec_student.t()
+        axs[0].plot(t, dec_student.df["zH0"].to_numpy(dtype=float), label="student zH0")
+        if "zT0" in dec_student.df.columns:
+            axs[0].plot(t, dec_student.df["zT0"].to_numpy(dtype=float), linestyle="--", label="teacher zT0")
+        axs[0].axhline(float(np.nanmedian(dec_student.df["priv0"].to_numpy(dtype=float))), linestyle=":", label="true mass")
+        axs[0].set_ylim(0.0, 1.0)
+        axs[0].set_ylabel("mass context")
+        axs[0].grid(True, linestyle=":", linewidth=0.6)
+        axs[0].legend()
+
+        axs[1].plot(t, dec_student.df["zH1"].to_numpy(dtype=float), label="student zH1")
+        if "zT1" in dec_student.df.columns:
+            axs[1].plot(t, dec_student.df["zT1"].to_numpy(dtype=float), linestyle="--", label="teacher zT1")
+        axs[1].axhline(float(np.nanmedian(dec_student.df["priv1"].to_numpy(dtype=float))), linestyle=":", label="true length")
+        axs[1].set_ylim(0.0, 1.0)
+        axs[1].set_ylabel("length context")
+        axs[1].set_xlabel("Time (s)")
+        axs[1].grid(True, linestyle=":", linewidth=0.6)
+        axs[1].legend()
+        _save_fig(fig, out_dir / "phase2_decoupled_semantic_z01.png")
+
+    # -------------------- CSV summary --------------------
+    rows = []
+    rows.append(_method_metrics(labels[0], "teacher", dec_teacher))
+    rows.append(_method_metrics(labels[0], "student", dec_student))
+    rows.append(_method_metrics(labels[1], "teacher", coup_teacher))
+    rows.append(_method_metrics(labels[1], "student", coup_student))
+    metrics_df = pd.DataFrame(rows)
+    metrics_df.to_csv(out_dir / "phase2_compare_metrics.csv", index=False)
+
+    gaps_df = pd.DataFrame([
+        _pair_gap_metrics(labels[0], dec_teacher, dec_student),
+        _pair_gap_metrics(labels[1], coup_teacher, coup_student),
+    ])
+    gaps_df.to_csv(out_dir / "phase2_compare_realization_gap_metrics.csv", index=False)
+
+    print("[Compare] saved:")
+    print("  - phase2_compare_task_curves.png")
+    print("  - phase2_compare_realization_gap.png")
+    print("  - phase2_decoupled_semantic_z01.png (if columns exist)")
+    print("  - phase2_compare_metrics.csv")
+    print("  - phase2_compare_realization_gap_metrics.csv")
+
+
+
+
+def plot_phase2_multiseed_compare(
+    dec_teachers: list[Series],
+    dec_students: list[Series],
+    coup_teachers: list[Series],
+    coup_students: list[Series],
+    seed_labels: list[str],
+    out_dir: Path,
+    time_window_s: float | None,
+    labels: tuple[str, str] = ("Decoupled", "Coupled"),
+) -> None:
+    """
+    Plot Decoupled vs Coupled Phase-II results for multiple evaluation seeds in ONE figure.
+
+    This is the correct multi-seed visualization for the paper:
+      - rows = seeds
+      - columns = task-level quantities
+      - curves = dec/coup teacher/student within each seed
+
+    We do NOT directly compare decoupled z0/z1 against coupled z0/z1, because
+    decoupled z0/z1 are semantic mass/length variables, while coupled z dimensions
+    are black-box latent coordinates.
+    """
+    _ensure_out_dir(out_dir)
+
+    n = len(seed_labels)
+    if not (len(dec_teachers) == len(dec_students) == len(coup_teachers) == len(coup_students) == n):
+        raise ValueError("multi-seed lists must have the same length")
+
+    # -------------------- Figure 1: student/teacher task curves across seeds --------------------
+    fig, axs = plt.subplots(n, 2, figsize=(14, max(3.2 * n, 4.0)), sharex=False)
+    if n == 1:
+        axs = np.asarray([axs])
+
+    fig.suptitle("Phase-II multi-seed comparison: Decoupled vs Coupled", fontsize=14, weight="bold")
+
+    for i, seed in enumerate(seed_labels):
+        dT, dS, cT, cS = dec_teachers[i], dec_students[i], coup_teachers[i], coup_students[i]
+        common_tmax = min(float(s.t()[-1]) for s in [dT, dS, cT, cS])
+        if time_window_s is not None:
+            common_tmax = min(common_tmax, float(time_window_s))
+        dT, dS, cT, cS = [s.clip_time(common_tmax) for s in [dT, dS, cT, cS]]
+
+        ax_e = axs[i, 0]
+        ax_s = axs[i, 1]
+
+        # Error norm: teacher dashed, student solid
+        ax_e.plot(dT.t(), _payload_error_norm(dT.df, dT.goal_ref), linestyle="--", linewidth=1.2, label=f"{labels[0]} teacher")
+        ax_e.plot(dS.t(), _payload_error_norm(dS.df, dS.goal_ref), linestyle="-", linewidth=1.8, label=f"{labels[0]} student")
+        ax_e.plot(cT.t(), _payload_error_norm(cT.df, cT.goal_ref), linestyle="--", linewidth=1.2, label=f"{labels[1]} teacher")
+        ax_e.plot(cS.t(), _payload_error_norm(cS.df, cS.goal_ref), linestyle="-", linewidth=1.8, label=f"{labels[1]} student")
+        ax_e.axhline(0.2, linestyle=":", linewidth=0.9)
+        ax_e.axhline(0.1, linestyle=":", linewidth=0.9)
+        ax_e.set_title(f"{seed}: payload error")
+        ax_e.set_ylabel("error (m)")
+        ax_e.grid(True, linestyle=":", linewidth=0.6)
+
+        # Swing magnitude
+        ax_s.plot(dT.t(), _swing_mag_deg(dT.df), linestyle="--", linewidth=1.2, label=f"{labels[0]} teacher")
+        ax_s.plot(dS.t(), _swing_mag_deg(dS.df), linestyle="-", linewidth=1.8, label=f"{labels[0]} student")
+        ax_s.plot(cT.t(), _swing_mag_deg(cT.df), linestyle="--", linewidth=1.2, label=f"{labels[1]} teacher")
+        ax_s.plot(cS.t(), _swing_mag_deg(cS.df), linestyle="-", linewidth=1.8, label=f"{labels[1]} student")
+        ax_s.set_title(f"{seed}: swing magnitude")
+        ax_s.set_ylabel("swing (deg)")
+        ax_s.grid(True, linestyle=":", linewidth=0.6)
+
+        if i == n - 1:
+            ax_e.set_xlabel("Time (s)")
+            ax_s.set_xlabel("Time (s)")
+        if i == 0:
+            ax_e.legend(fontsize="small", ncol=2)
+            ax_s.legend(fontsize="small", ncol=2)
+
+    _save_fig(fig, out_dir / "phase2_multiseed_task_curves.png")
+
+    # -------------------- Figure 2: student-teacher realization gap across seeds --------------------
+    fig, axs = plt.subplots(n, 2, figsize=(14, max(3.2 * n, 4.0)), sharex=False)
+    if n == 1:
+        axs = np.asarray([axs])
+
+    fig.suptitle("Phase-II multi-seed student-teacher realization gap", fontsize=14, weight="bold")
+
+    def _gap_arrays(teacher: Series, student: Series):
+        tT = teacher.t()
+        tS = student.t()
+        t0 = max(float(tT[0]), float(tS[0]))
+        t1 = min(float(tT[-1]), float(tS[-1]))
+        if time_window_s is not None:
+            t1 = min(t1, float(time_window_s))
+        m = (tT >= t0) & (tT <= t1)
+        t = tT[m]
+        eT = _payload_error_norm(teacher.df, teacher.goal_ref)[m]
+        eS = _interp_to(t, tS, _payload_error_norm(student.df, student.goal_ref))
+        thT = _swing_mag_deg(teacher.df)[m]
+        thS = _interp_to(t, tS, _swing_mag_deg(student.df))
+        return t, np.abs(eS - eT), np.abs(thS - thT)
+
+    gap_rows = []
+    metric_rows = []
+    for i, seed in enumerate(seed_labels):
+        dT, dS, cT, cS = dec_teachers[i], dec_students[i], coup_teachers[i], coup_students[i]
+
+        td, ed, sd = _gap_arrays(dT, dS)
+        tc, ec, sc = _gap_arrays(cT, cS)
+
+        axs[i, 0].plot(td, ed, linewidth=1.8, label=labels[0])
+        axs[i, 0].plot(tc, ec, linewidth=1.8, label=labels[1])
+        axs[i, 0].set_title(f"{seed}: payload error gap")
+        axs[i, 0].set_ylabel("|student-teacher| (m)")
+        axs[i, 0].grid(True, linestyle=":", linewidth=0.6)
+
+        axs[i, 1].plot(td, sd, linewidth=1.8, label=labels[0])
+        axs[i, 1].plot(tc, sc, linewidth=1.8, label=labels[1])
+        axs[i, 1].set_title(f"{seed}: swing gap")
+        axs[i, 1].set_ylabel("|student-teacher| (deg)")
+        axs[i, 1].grid(True, linestyle=":", linewidth=0.6)
+
+        if i == n - 1:
+            axs[i, 0].set_xlabel("Time (s)")
+            axs[i, 1].set_xlabel("Time (s)")
+        if i == 0:
+            axs[i, 0].legend()
+            axs[i, 1].legend()
+
+        r = _pair_gap_metrics(labels[0], dT, dS); r["seed"] = seed; gap_rows.append(r)
+        r = _pair_gap_metrics(labels[1], cT, cS); r["seed"] = seed; gap_rows.append(r)
+
+        for method, role, s in [
+            (labels[0], "teacher", dT),
+            (labels[0], "student", dS),
+            (labels[1], "teacher", cT),
+            (labels[1], "student", cS),
+        ]:
+            row = _method_metrics(method, role, s)
+            row["seed"] = seed
+            metric_rows.append(row)
+
+    _save_fig(fig, out_dir / "phase2_multiseed_realization_gap.png")
+
+    metrics_df = pd.DataFrame(metric_rows)
+    # Put seed first for readability
+    metrics_df = metrics_df[["seed"] + [c for c in metrics_df.columns if c != "seed"]]
+    metrics_df.to_csv(out_dir / "phase2_multiseed_metrics.csv", index=False)
+
+    gaps_df = pd.DataFrame(gap_rows)
+    gaps_df = gaps_df[["seed"] + [c for c in gaps_df.columns if c != "seed"]]
+    gaps_df.to_csv(out_dir / "phase2_multiseed_gap_metrics.csv", index=False)
+
+    # Mean/std summary for paper tables
+    summary_cols = [
+        "hit_t_0p2_s", "speed_at_0p2_mps", "hit_t_0p1_s", "speed_at_0p1_mps",
+        "final_error_m", "tail5_error_m", "max_swing_deg", "mean_swing_deg",
+        "E_hat_mean", "E_hat_peak", "E_hat_after5_mean",
+    ]
+    exist = [c for c in summary_cols if c in metrics_df.columns]
+    summary = metrics_df.groupby(["method", "role"])[exist].agg(["mean", "std"])
+    summary.to_csv(out_dir / "phase2_multiseed_metrics_mean_std.csv")
+
+    gap_summary_cols = [
+        "mean_abs_error_gap_m", "max_abs_error_gap_m",
+        "mean_abs_swing_gap_deg", "max_abs_swing_gap_deg",
+    ]
+    exist_g = [c for c in gap_summary_cols if c in gaps_df.columns]
+    gap_summary = gaps_df.groupby(["method"])[exist_g].agg(["mean", "std"])
+    gap_summary.to_csv(out_dir / "phase2_multiseed_gap_mean_std.csv")
+
+    print("[MultiSeed] saved:")
+    print("  - phase2_multiseed_task_curves.png")
+    print("  - phase2_multiseed_realization_gap.png")
+    print("  - phase2_multiseed_metrics.csv")
+    print("  - phase2_multiseed_gap_metrics.csv")
+    print("  - phase2_multiseed_metrics_mean_std.csv")
+    print("  - phase2_multiseed_gap_mean_std.csv")
+
+
+
+def _available_z_dim(student: Series, max_dim: int = 5) -> int:
+    """Infer available z dimensions from zT*/zH* columns in a phase2 student CSV."""
+    dims = []
+    for i in range(max_dim):
+        if (f"zH{i}" in student.df.columns) or (f"zT{i}" in student.df.columns):
+            dims.append(i)
+    return (max(dims) + 1) if dims else 0
+
+
+def _get_z_teacher_student_for_plot(teacher: Series, student: Series, i: int):
+    """
+    Return (t, z_teacher, z_student) for z_i.
+    Prefer student CSV's zT_i and zH_i because they are logged on the same time base.
+    Fallback to teacher CSV's zT_i interpolated onto student time.
+    """
+    tS = student.t()
+
+    # student-estimated latent
+    if f"zH{i}" in student.df.columns:
+        z_student = student.df[f"zH{i}"].to_numpy(dtype=float)
+    elif f"z{i}" in student.df.columns:
+        z_student = student.df[f"z{i}"].to_numpy(dtype=float)
+    else:
+        z_student = np.full_like(tS, np.nan, dtype=float)
+
+    # teacher/reference latent on student time base
+    if f"zT{i}" in student.df.columns:
+        z_teacher = student.df[f"zT{i}"].to_numpy(dtype=float)
+    elif f"zT{i}" in teacher.df.columns:
+        z_teacher = _interp_to(tS, teacher.t(), teacher.df[f"zT{i}"].to_numpy(dtype=float))
+    elif f"z{i}" in teacher.df.columns:
+        z_teacher = _interp_to(tS, teacher.t(), teacher.df[f"z{i}"].to_numpy(dtype=float))
+    else:
+        z_teacher = np.full_like(tS, np.nan, dtype=float)
+
+    return tS, z_teacher, z_student
+
+
+def _plot_one_method_multiseed_z(
+    method_label: str,
+    teachers: list[Series],
+    students: list[Series],
+    seed_labels: list[str],
+    out_path: Path,
+    time_window_s: float | None,
+    z_dim: int = 5,
+    semantic_z01: bool = False,
+) -> None:
+    """
+    One method, all seeds, teacher/student z in ONE compact figure.
+
+    Correct layout for Phase-II latent comparison:
+      rows = z dimensions
+      one subplot per z dimension
+      within each subplot: all seeds are overlaid
+        - same color = same seed
+        - dashed = teacher zT
+        - solid  = student zH
+
+    This matches the intended figure: seed38/40/42 are all shown inside the same z0 subplot,
+    not split into separate rows.
+    """
+    n = len(seed_labels)
+    if n == 0:
+        return
+
+    # infer actual z dim, but cap at z_dim
+    actual = max([_available_z_dim(stu, max_dim=z_dim) for stu in students] + [0])
+    if actual <= 0:
+        print(f"[WARN] {method_label}: no z columns found, skip {out_path.name}")
+        return
+    z_dim = min(z_dim, actual)
+
+    # Taller figure: one row per z dimension. This is compact and paper-friendly.
+    fig, axs = plt.subplots(
+        z_dim,
+        1,
+        figsize=(12.0, max(2.0 * z_dim, 4.0)),
+        sharex=True,
+        squeeze=False,
+    )
+    axs = axs[:, 0]
+
+    fig.suptitle(f"{method_label}: Phase-II latent z, multi-seed teacher/student overlay", fontsize=14, weight="bold")
+
+    # Use matplotlib default color cycle, but bind color to seed.
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+
+    for c in range(z_dim):
+        ax = axs[c]
+        for r, seed in enumerate(seed_labels):
+            teacher = teachers[r]
+            student = students[r]
+            t, zT, zH = _get_z_teacher_student_for_plot(teacher, student, c)
+            if time_window_s is not None:
+                m = t <= float(time_window_s)
+                t_plot, zT_plot, zH_plot = t[m], zT[m], zH[m]
+            else:
+                t_plot, zT_plot, zH_plot = t, zT, zH
+
+            color = color_cycle[r % len(color_cycle)] if color_cycle else None
+
+            # teacher: dashed; student: solid. Same color = same seed.
+            ax.plot(
+                t_plot,
+                zT_plot,
+                linestyle="--",
+                linewidth=1.3,
+                color=color,
+                label=f"{seed} teacher zT" if c == 0 else None,
+            )
+            ax.plot(
+                t_plot,
+                zH_plot,
+                linestyle="-",
+                linewidth=1.7,
+                color=color,
+                label=f"{seed} student zH" if c == 0 else None,
+            )
+
+        # Semantic y-axis for decoupled mass/length only.
+        if semantic_z01 and c == 0:
+            ax.set_title("Mass latent z0 (normalized)", fontsize=11)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_ylabel("z0 norm")
+        elif semantic_z01 and c == 1:
+            ax.set_title("Length latent z1 (normalized)", fontsize=11)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_ylabel("z1 norm")
+        else:
+            ax.set_title(f"Latent z{c} (raw)", fontsize=11)
+            ax.set_ylabel(f"z{c}")
+
+        ax.grid(True, linestyle=":", linewidth=0.6)
+
+    axs[-1].set_xlabel("Time (s)")
+
+    # Put legend only once, outside the first subplot to reduce clutter.
+    handles, labels_ = axs[0].get_legend_handles_labels()
+    if handles:
+        axs[0].legend(handles, labels_, fontsize="small", ncol=min(3, max(1, n)), loc="best")
+
+    _save_fig(fig, out_path)
+
+def plot_phase2_multiseed_z_outputs(
+    dec_teachers: list[Series],
+    dec_students: list[Series],
+    coup_teachers: list[Series],
+    coup_students: list[Series],
+    seed_labels: list[str],
+    out_dir: Path,
+    time_window_s: float | None,
+    labels: tuple[str, str] = ("Decoupled", "Coupled"),
+    z_dim: int = 5,
+) -> None:
+    """
+    Plot z outputs across three seeds.
+
+    Outputs:
+      1) phase2_multiseed_z_decoupled.png: Decoupled 3 seeds, teacher/student zT/zH.
+      2) phase2_multiseed_z_coupled.png: Coupled 3 seeds, teacher/student zT/zH.
+      3) phase2_multiseed_z_all_methods.png: Decoupled and Coupled in one large figure.
+
+    This compares teacher-vs-student within each method. It does NOT claim that
+    Decoupled z0 is semantically comparable to Coupled z0.
+    """
+    _ensure_out_dir(out_dir)
+
+    _plot_one_method_multiseed_z(
+        method_label=labels[0],
+        teachers=dec_teachers,
+        students=dec_students,
+        seed_labels=seed_labels,
+        out_path=out_dir / "phase2_multiseed_z_decoupled.png",
+        time_window_s=time_window_s,
+        z_dim=z_dim,
+        semantic_z01=True,
+    )
+    _plot_one_method_multiseed_z(
+        method_label=labels[1],
+        teachers=coup_teachers,
+        students=coup_students,
+        seed_labels=seed_labels,
+        out_path=out_dir / "phase2_multiseed_z_coupled.png",
+        time_window_s=time_window_s,
+        z_dim=z_dim,
+        semantic_z01=False,
+    )
+
+    # Combined large figure: rows = method × seed, cols = z dims.
+    rows = []
+    for i, seed in enumerate(seed_labels):
+        rows.append((f"{labels[0]} {seed}", dec_teachers[i], dec_students[i], True))
+    for i, seed in enumerate(seed_labels):
+        rows.append((f"{labels[1]} {seed}", coup_teachers[i], coup_students[i], False))
+
+    actual = max([_available_z_dim(stu, max_dim=z_dim) for _, _, stu, _ in rows] + [0])
+    if actual <= 0:
+        print("[WARN] no z columns found, skip combined z plot")
+        return
+    z_dim = min(z_dim, actual)
+
+    fig, axs = plt.subplots(len(rows), z_dim, figsize=(3.0 * z_dim, max(1.9 * len(rows), 5.0)), sharex=False)
+    if len(rows) == 1 and z_dim == 1:
+        axs = np.asarray([[axs]])
+    elif len(rows) == 1:
+        axs = np.asarray([axs])
+    elif z_dim == 1:
+        axs = np.asarray([[a] for a in axs])
+
+    fig.suptitle("Phase-II latent z across methods and seeds", fontsize=14, weight="bold")
+    for r, (row_label, teacher, student, semantic_z01) in enumerate(rows):
+        for c in range(z_dim):
+            ax = axs[r, c]
+            t, zT, zH = _get_z_teacher_student_for_plot(teacher, student, c)
+            if time_window_s is not None:
+                m = t <= float(time_window_s)
+                t_plot, zT_plot, zH_plot = t[m], zT[m], zH[m]
+            else:
+                t_plot, zT_plot, zH_plot = t, zT, zH
+            ax.plot(t_plot, zT_plot, linestyle="--", linewidth=1.2, label="teacher zT")
+            ax.plot(t_plot, zH_plot, linestyle="-", linewidth=1.5, label="student zH")
+            ax.set_title(f"z{c}", fontsize=9)
+            ax.grid(True, linestyle=":", linewidth=0.6)
+            if c == 0:
+                ax.set_ylabel(row_label)
+            if r == len(rows) - 1:
+                ax.set_xlabel("Time (s)")
+            if r == 0 and c == 0:
+                ax.legend(fontsize="small")
+            if semantic_z01 and c in (0, 1):
+                ax.set_ylim(0.0, 1.0)
+
+    _save_fig(fig, out_dir / "phase2_multiseed_z_all_methods.png")
+    print("[MultiSeed-Z] saved:")
+    print("  - phase2_multiseed_z_decoupled.png")
+    print("  - phase2_multiseed_z_coupled.png")
+    print("  - phase2_multiseed_z_all_methods.png")
+
+
 # ----------------------------
 # Main
 # ----------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--teacher", type=str, required=True, help="Path to phase2_teacher.csv")
-    ap.add_argument("--student", type=str, required=True, help="Path to phase2_student.csv")
+    ap.add_argument("--teacher", type=str, default=None, help="Path to phase2_teacher.csv")
+    ap.add_argument("--student", type=str, default=None, help="Path to phase2_student.csv")
     ap.add_argument("--out_dir", type=str, default=None, help="Output directory for figures (default: dir of student csv)")
     ap.add_argument("--start", type=float, nargs=3, default=[-2.0, 0.0, 2.0], help="TASK start offset (x y z)")
     ap.add_argument("--goal", type=float, nargs=3, default=[2.0, 0.0, 2.0], help="TASK goal offset (x y z)")
     ap.add_argument("--time_window", type=float, default=5.0, help="Energy plot time window in seconds (like IsaaclabPlot12.5). Use <=0 to disable clipping.")
     ap.add_argument("--smooth_window", type=float, default=0.15, help="Smoothing window seconds for energy curves.")
-    ap.add_argument("--semantic_z01", action="store_true",
-                help="Treat z0/z1 as semantic normalized mass/length (decoupled only).")
+    # Cross-method Phase-II compare mode. If these four paths are provided, the script ignores --teacher/--student.
+    ap.add_argument("--dec_teacher", type=str, default=None, help="Decoupled phase2_teacher.csv")
+    ap.add_argument("--dec_student", type=str, default=None, help="Decoupled phase2_student.csv")
+    ap.add_argument("--coup_teacher", type=str, default=None, help="Coupled phase2_teacher.csv")
+    ap.add_argument("--coup_student", type=str, default=None, help="Coupled phase2_student.csv")
+    ap.add_argument("--compare_labels", type=str, nargs=2, default=["Decoupled", "Coupled"], help="Labels for compare mode")
+    # Multi-seed compare mode: put three seeds of Decoupled/Coupled Phase-II into ONE figure.
+    ap.add_argument("--dec_teachers", type=str, nargs="+", default=None, help="Decoupled phase2_teacher.csv list, one per seed")
+    ap.add_argument("--dec_students", type=str, nargs="+", default=None, help="Decoupled phase2_student.csv list, one per seed")
+    ap.add_argument("--coup_teachers", type=str, nargs="+", default=None, help="Coupled phase2_teacher.csv list, one per seed")
+    ap.add_argument("--coup_students", type=str, nargs="+", default=None, help="Coupled phase2_student.csv list, one per seed")
+    ap.add_argument("--seed_labels", type=str, nargs="+", default=None, help="Labels for seeds, e.g. seed38 seed40 seed42")
+    ap.add_argument("--z_dim", type=int, default=5, help="Number of latent dimensions to plot in multi-seed z figures")
     args = ap.parse_args()
-
-    teacher_path = Path(args.teacher).expanduser().resolve()
-    student_path = Path(args.student).expanduser().resolve()
 
     start_ref = np.array(args.start, dtype=float)
     goal_ref = np.array(args.goal, dtype=float)
+
+    # ----------------------------
+    # Multi-seed compare mode: Decoupled/Coupled Phase-II over multiple seeds in one figure
+    # ----------------------------
+    multi_lists = [args.dec_teachers, args.dec_students, args.coup_teachers, args.coup_students]
+    if any(x is not None for x in multi_lists):
+        if not all(x is not None for x in multi_lists):
+            raise SystemExit(
+                "[ERROR] Multi-seed mode requires all four lists: "
+                "--dec_teachers --dec_students --coup_teachers --coup_students"
+            )
+        n = len(args.dec_teachers)
+        if not (len(args.dec_students) == len(args.coup_teachers) == len(args.coup_students) == n):
+            raise SystemExit("[ERROR] Multi-seed path lists must have the same length")
+        seed_labels = args.seed_labels if args.seed_labels is not None else [f"seed{i}" for i in range(n)]
+        if len(seed_labels) != n:
+            raise SystemExit("[ERROR] --seed_labels length must match the number of CSV paths")
+
+        out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else Path("./phase2_multiseed_compare").resolve()
+        _ensure_out_dir(out_dir)
+
+        dec_teachers = [load_series(Path(p).expanduser().resolve(), f"dec_teacher_{seed_labels[i]}", start_ref, goal_ref) for i, p in enumerate(args.dec_teachers)]
+        dec_students = [load_series(Path(p).expanduser().resolve(), f"dec_student_{seed_labels[i]}", start_ref, goal_ref) for i, p in enumerate(args.dec_students)]
+        coup_teachers = [load_series(Path(p).expanduser().resolve(), f"coup_teacher_{seed_labels[i]}", start_ref, goal_ref) for i, p in enumerate(args.coup_teachers)]
+        coup_students = [load_series(Path(p).expanduser().resolve(), f"coup_student_{seed_labels[i]}", start_ref, goal_ref) for i, p in enumerate(args.coup_students)]
+
+        tw = float(args.time_window)
+        tmax = None if tw <= 0 else tw
+        plot_phase2_multiseed_compare(
+            dec_teachers=dec_teachers,
+            dec_students=dec_students,
+            coup_teachers=coup_teachers,
+            coup_students=coup_students,
+            seed_labels=seed_labels,
+            out_dir=out_dir,
+            time_window_s=tmax,
+            labels=(args.compare_labels[0], args.compare_labels[1]),
+        )
+        plot_phase2_multiseed_z_outputs(
+            dec_teachers=dec_teachers,
+            dec_students=dec_students,
+            coup_teachers=coup_teachers,
+            coup_students=coup_students,
+            seed_labels=seed_labels,
+            out_dir=out_dir,
+            time_window_s=tmax,
+            labels=(args.compare_labels[0], args.compare_labels[1]),
+            z_dim=int(args.z_dim),
+        )
+        print(f"[DONE] Multi-seed Phase-II figures saved to: {out_dir}")
+        return
+
+    # ----------------------------
+    # Compare mode: Decoupled Phase-II vs Coupled Phase-II in one seed
+    # ----------------------------
+    compare_paths = [args.dec_teacher, args.dec_student, args.coup_teacher, args.coup_student]
+    if any(p is not None for p in compare_paths):
+        if not all(p is not None for p in compare_paths):
+            raise SystemExit(
+                "[ERROR] Compare mode requires all four paths: "
+                "--dec_teacher --dec_student --coup_teacher --coup_student"
+            )
+        out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else Path(args.dec_student).expanduser().resolve().parent / "phase2_compare"
+        _ensure_out_dir(out_dir)
+
+        dec_teacher = load_series(Path(args.dec_teacher).expanduser().resolve(), "dec_teacher", start_ref, goal_ref)
+        dec_student = load_series(Path(args.dec_student).expanduser().resolve(), "dec_student", start_ref, goal_ref)
+        coup_teacher = load_series(Path(args.coup_teacher).expanduser().resolve(), "coup_teacher", start_ref, goal_ref)
+        coup_student = load_series(Path(args.coup_student).expanduser().resolve(), "coup_student", start_ref, goal_ref)
+
+        print(f"[INFO] dec_teacher origin_w: {dec_teacher.origin_w}")
+        print(f"[INFO] dec_student origin_w: {dec_student.origin_w}")
+        print(f"[INFO] coup_teacher origin_w: {coup_teacher.origin_w}")
+        print(f"[INFO] coup_student origin_w: {coup_student.origin_w}")
+
+        tw = float(args.time_window)
+        tmax = None if tw <= 0 else tw
+        plot_phase2_cross_method_compare(
+            dec_teacher=dec_teacher,
+            dec_student=dec_student,
+            coup_teacher=coup_teacher,
+            coup_student=coup_student,
+            out_dir=out_dir,
+            time_window_s=tmax,
+            smooth_window_s=float(args.smooth_window),
+            labels=(args.compare_labels[0], args.compare_labels[1]),
+        )
+        print(f"[DONE] Cross-method Phase-II figures saved to: {out_dir}")
+        return
+
+    if args.teacher is None or args.student is None:
+        raise SystemExit("[ERROR] Single-method mode requires --teacher and --student")
+
+    teacher_path = Path(args.teacher).expanduser().resolve()
+    student_path = Path(args.student).expanduser().resolve()
 
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else student_path.parent
     _ensure_out_dir(out_dir)
@@ -591,28 +1243,10 @@ def main():
     # Plots
     plot_fig1_payload_pos_and_swing(teacher, student, out_dir)
     plot_fig2_swing_angles(teacher, student, out_dir)
-    plot_fig3_z_compare(teacher, student, out_dir, semantic_z01=args.semantic_z01)
-
+    plot_fig3_z_compare(teacher, student, out_dir)
 
     tw = float(args.time_window)
     tmax = None if tw <= 0 else tw
-    summary = _compute_phase2_summary(teacher, student, semantic_z01=args.semantic_z01)
-    summary_path = out_dir / "phase2_summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[Summary] saved {summary_path}")
-
-    if args.semantic_z01:
-        print("[Summary] mass teacher/student MAE:",
-            summary["teacher_mass"]["mae"], summary["student_mass"]["mae"])
-        print("[Summary] length teacher/student MAE:",
-            summary["teacher_length"]["mae"], summary["student_length"]["mae"])
-    else:
-        print("[Summary] coupled mode: z0/z1 treated as raw latent, skip mass/length error metrics.")
-    print("[Summary] teacher hit_t_0p1 / student hit_t_0p1:",
-        summary["teacher_task"]["hit_t_0p1"], summary["student_task"]["hit_t_0p1"])
-    print("[Summary] teacher final_error / student final_error:",
-        summary["teacher_task"]["final_error"], summary["student_task"]["final_error"])
     plot_fig4_energy_combined(teacher, student, out_dir, tmax, float(args.smooth_window))
 
     print(f"[DONE] Figures saved to: {out_dir}")

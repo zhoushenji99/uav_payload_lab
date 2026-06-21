@@ -1,0 +1,47 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from isaaclab.utils import configclass
+
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+PPO_PHYS_ANCHOR = '__import__("uav_payload_lab.tasks.direct.uav_payload_sim2real.ppo_phys_anchor", fromlist=["PPO"]).PPO'
+
+# 让 IsaacLab 的 eval(class_name) 直接拿到类，不依赖额外 import
+RMA_ACTOR_CRITIC = '__import__("uav_payload_lab.tasks.direct.uav_payload_sim2real.rma_actor_critic", fromlist=["RMAActorCritic"]).RMAActorCritic'
+@configclass
+class MetaPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    num_steps_per_env = 256  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
+    max_iterations = 50000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
+    save_interval = 500  #多少个 iteration 存一次 model_*.pt
+    experiment_name = "uav_payload_sim2real_rl" #日志目录名
+    policy = RslRlPpoActorCriticCfg(
+        class_name=RMA_ACTOR_CRITIC,
+
+        init_noise_std=1.0,     #动作高斯探索噪声初始 std
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[128, 128],     #MLP 的层数和宽度
+        critic_hidden_dims=[128, 128],
+        activation="elu",
+
+        # --------- critical: avoid negative std crash ----------
+        noise_std_type="log",          # <--- MUST (scalar can go negative)  :contentReference[oaicite:3]{index=3}
+
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        class_name=PPO_PHYS_ANCHOR,
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,      #小了就不探索
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=3.0e-4,   #小了就局部最优，步子跨不出去，大了std容易炸
+        schedule="adaptive",
+        gamma=0.995,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )

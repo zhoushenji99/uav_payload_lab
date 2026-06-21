@@ -13,13 +13,14 @@ import math
 # 单 CSV：
 #   按你原来的 Figure 1-6 详细分析逻辑跑
 #
-# 双 CSV：
-#   自动进入 Phase-1 teacher 对比模式
-#   用于 decoupled teacher vs coupled teacher 画在同一张图里
+# 多 CSV：
+#   2 个 CSV：Decoupled vs Coupled
+#   3 个 CSV：PPO vs Coupled vs Decoupled
+#   自动进入对比模式，把多条轨迹画在同一张图里
 # ============================================================
 
 # 默认路径：不传 --csv 时保持你原来的行为
-DEFAULT_SIM_CSV = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-04-21_21-25-05/payload_data.csv"
+DEFAULT_SIM_CSV = "/home/shenji/uav_payload_lab/uav_payload_lab/logs/rsl_rl/Encoder_DataCollectionMLW/2026-04-19_23-47-50/payload_data.csv"
 
 # === Analysis window (seconds) ===
 # CLI 里 --time_window -1 表示不裁剪
@@ -39,19 +40,19 @@ REF_THETA_Y = 0.0
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Plot IsaacLab UAV-payload CSV. One CSV = original mode; two CSVs = comparison mode."
+        description="Plot IsaacLab UAV-payload CSV. One CSV = original mode; two/three CSVs = comparison mode."
     )
     parser.add_argument(
         "--csv",
         nargs="+",
         default=[DEFAULT_SIM_CSV],
-        help="One CSV for original mode, or two CSVs for comparison mode: Decoupled Coupled.",
+        help="One CSV for original mode, or 2/3 CSVs for comparison mode, e.g. PPO Coupled Decoupled.",
     )
     parser.add_argument(
         "--labels",
         nargs="*",
         default=None,
-        help="Labels for comparison mode, e.g. --labels Decoupled Coupled",
+        help="Labels for comparison mode, e.g. --labels PPO Coupled Decoupled",
     )
     parser.add_argument(
         "--out_dir",
@@ -230,8 +231,9 @@ def compute_summary(df: pd.DataFrame) -> dict:
 
 def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
     """
-    双 CSV 对比模式：
-    用于 Phase-1 teacher 的 decoupled vs coupled 对比。
+    多 CSV 对比模式：
+    支持 2 个或 3 个方法画在同一张图里。
+    典型用法：PPO vs Coupled vs Decoupled。
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -247,7 +249,7 @@ def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
     # ============================================================
     fig, axs = plt.subplots(2, 3, figsize=(18, 9), constrained_layout=True)
     fig.suptitle(
-        "Phase-1 Teacher Comparison: Decoupled vs Coupled",
+        "Ablation Comparison: " + " vs ".join(labels),
         fontsize=16,
         weight="bold",
     )
@@ -277,7 +279,7 @@ def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
         if time_window is not None:
             ax.set_xlim(0.0, float(time_window))
 
-    fig_path = os.path.join(out_dir, "phase1_teacher_compare_payload_swing.png")
+    fig_path = os.path.join(out_dir, "ablation_compare_payload_swing.png")
     fig.savefig(fig_path, dpi=300)
     print(f"[Saved] {fig_path}")
 
@@ -286,7 +288,7 @@ def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
     # ============================================================
     fig2, axs2 = plt.subplots(3, 1, figsize=(14, 10), constrained_layout=True, sharex=True)
     fig2.suptitle(
-        "Phase-1 Teacher Comparison: Error, Speed, and Swing",
+        "Ablation Comparison: Error, Speed, and Swing",
         fontsize=16,
         weight="bold",
     )
@@ -309,7 +311,7 @@ def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
         if time_window is not None:
             ax.set_xlim(0.0, float(time_window))
 
-    fig2_path = os.path.join(out_dir, "phase1_teacher_compare_error_speed_swing.png")
+    fig2_path = os.path.join(out_dir, "ablation_compare_error_speed_swing.png")
     fig2.savefig(fig2_path, dpi=300)
     print(f"[Saved] {fig2_path}")
 
@@ -323,7 +325,7 @@ def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
         rows.append(row)
 
     metrics = pd.DataFrame(rows)
-    metrics_path = os.path.join(out_dir, "phase1_teacher_compare_metrics.csv")
+    metrics_path = os.path.join(out_dir, "ablation_compare_metrics.csv")
     metrics.to_csv(metrics_path, index=False)
 
     print("\n[Metrics]")
@@ -337,14 +339,18 @@ def plot_phase1_teacher_compare(csv_paths, labels, out_dir, time_window):
 
 
 # ============================================================
-# 双 CSV：进入 Phase-1 teacher 对比模式，然后提前退出
+# 多 CSV：进入对比模式，然后提前退出
+#   1 个 CSV：走原始单文件详细图 Figure 1-6
+#   2 个 CSV：两方法对比
+#   3 个 CSV：三方法对比，例如 PPO / Coupled / Decoupled
 # ============================================================
-if len(ARGS.csv) == 2:
-    labels = (
-        ARGS.labels
-        if ARGS.labels is not None and len(ARGS.labels) == 2
-        else ["Decoupled", "Coupled"]
-    )
+if len(ARGS.csv) in (2, 3):
+    if ARGS.labels is not None and len(ARGS.labels) == len(ARGS.csv):
+        labels = ARGS.labels
+    elif len(ARGS.csv) == 2:
+        labels = ["Decoupled", "Coupled"]
+    else:
+        labels = ["PPO", "Coupled", "Decoupled"]
 
     plot_phase1_teacher_compare(
         csv_paths=ARGS.csv,
@@ -356,8 +362,8 @@ if len(ARGS.csv) == 2:
 
 elif len(ARGS.csv) != 1:
     raise SystemExit(
-        "[ERROR] --csv 只能给 1 个或 2 个路径。"
-        "1 个=原图模式；2 个=对比模式。"
+        "[ERROR] --csv 只能给 1 个、2 个或 3 个路径。"
+        "1 个=原图模式；2/3 个=对比模式。"
     )
 # --- 2. 加载仿真数据 ---
 try:
@@ -374,12 +380,12 @@ if "Payload_X" in df_sim.columns:
         "Swing_Deg_X": "theta_x_deg",
         "Swing_Deg_Y": "theta_y_deg"
     }, inplace=True)
-    
+
     # 坐标转换 (用于 Payload 对比图)
     df_sim["payload_x"] = df_sim["Payload_X"] - OFFSET_X
     df_sim["payload_y"] = df_sim["Payload_Y"] - OFFSET_Y
     df_sim["payload_z"] = df_sim["Payload_Z"]
-    
+
     # [新增] 计算无人机姿态 (四元数 -> 欧拉角)
     quats = df_sim[['UAV_quat_1', 'UAV_quat_2', 'UAV_quat_3', 'UAV_quat_0']].to_numpy()
     r = R.from_quat(quats)
@@ -391,19 +397,19 @@ if "Payload_X" in df_sim.columns:
     print(f"[Sim] 数据预处理完成: 坐标已校正, 欧拉角已计算。")
 
 # # --- 3. 加载并清洗论文数据 (保持原有逻辑) ---
-# paper_data = {} 
+# paper_data = {}
 # paper_available = False
 
 # try:
 #     df_paper = pd.read_csv(paper_data_path, header=None)
 #     print(f"[Paper] 成功加载 '{paper_data_path}'")
 #     paper_available = True
-    
+
 #     groups = {
 #         "px": (0, 1), "py": (2, 3), "pz": (4, 5),
 #         "thetax": (6, 7), "thetay": (8, 9)
 #     }
-    
+
 #     for key, (t_col, v_col) in groups.items():
 #         if v_col < df_paper.shape[1]:
 #             sub_df = df_paper[[t_col, v_col]].dropna()
@@ -509,9 +515,9 @@ def plot_action(ax, idx):
         ax.plot(df_sim["time"], df_sim[f"Env_raw_a{idx}"], label="Env Raw", alpha=0.6, linestyle="--", linewidth=1)
     if f"Env_clamp_a{idx}" in df_sim.columns:
         ax.plot(df_sim["time"], df_sim[f"Env_clamp_a{idx}"], label="Env Clamp", color='k', linewidth=1.5)
-    
+
     ax.set_title(f"Action {idx}")
-    ax.set_ylim([-1.5, 1.5]) 
+    ax.set_ylim([-1.5, 1.5])
     ax.grid(True, linestyle=":")
     if idx == 0: ax.legend(loc='upper right', fontsize='small')
 
@@ -565,7 +571,7 @@ if "UAV_a_wz" in df_sim.columns:
     axs4[1, 0].plot(df_sim["time"], df_sim["UAV_a_wx"], color='tab:red')
     axs4[1, 1].plot(df_sim["time"], df_sim["UAV_a_wy"], color='tab:red')
     axs4[1, 2].plot(df_sim["time"], df_sim["UAV_a_wz"], color='tab:red')
-    
+
     axs4[1, 0].set_title("World Accel X")
     axs4[1, 0].set_ylabel("m/s^2")
     axs4[1, 1].set_title("World Accel Y")
@@ -856,7 +862,7 @@ if all([c in df_sim.columns for c in _need_cols]):
     g0 = 9.81
 
     # --- 2. 计算部分 ---
-    
+
     # (A) 投影与平滑 (Mechanism)
     if "UAV_X" in df_sim.columns and "UAV_Y" in df_sim.columns:
         dx = float(df_sim["UAV_X"].iloc[-1] - df_sim["UAV_X"].iloc[0])
@@ -928,7 +934,7 @@ if all([c in df_sim.columns for c in _need_cols]):
     ax1_r.set_ylabel("UAV Accel (m/s$^2$)", color=color_acc, weight='bold')
     l2, = ax1_r.plot(t, a_plot, color=color_acc, linestyle='--', linewidth=2.0, label="UAV Acceleration ($a_{uav}$)")
     ax1_r.tick_params(axis='y', labelcolor=color_acc)
-    
+
     lines = [l1, l2]
     labels = [l.get_label() for l in lines]
     ax1.legend(lines, labels, loc='upper right')
@@ -962,7 +968,7 @@ if all([c in df_sim.columns for c in _need_cols]):
 
     # 阴影标注
     axs6[3].fill_between(t, 0.0, P_model_w, where=(P_model_w < 0.0), alpha=0.10, color='green', interpolate=True)
-    
+
     # 保存
     plt.figure(fig6.number)
     plt.savefig("plot_6_combined.png", dpi=300)
@@ -970,7 +976,7 @@ if all([c in df_sim.columns for c in _need_cols]):
 
 else:
     print(f"[Warn] 缺少必要列 {_need_cols}，跳过 Figure 6 Combined。")
-# 保存其他图片  
+# 保存其他图片
 plt.figure(fig1.number)
 plt.savefig("plot_1_payload.png", dpi=300)
 

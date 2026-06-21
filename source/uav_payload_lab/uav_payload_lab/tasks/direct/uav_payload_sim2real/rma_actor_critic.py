@@ -57,9 +57,9 @@ class RMAActorCritic(nn.Module):
         self.obs_groups = obs_groups
         self.num_actions = num_actions
         self.state_dependent_std = state_dependent_std
-        
+
         self.use_physics_anchor = bool(use_physics_anchor)
-        
+
         self.proprio_dim = int(proprio_obs_dim)
         self.priv_dim = int(privileged_obs_dim)
         self.z_dim = int(z_dim)
@@ -283,12 +283,10 @@ class RMAActorCritic(nn.Module):
         pred_phys = z[:, :2]
         loss = (pred_phys - gt_phys).pow(2).mean()
         return loss
-    
+
     def load_state_dict(self, state_dict, strict: bool = True):
         # Allow older checkpoints without probe.*
         allowed_missing = {"probe.weight", "probe.bias"}
-        if (self.z_dim == 0) or (self.priv_dim == 0) or (not self.use_mu):
-            allowed_missing.update(k for k in self.state_dict().keys() if k.startswith("mu."))
 
         res = super().load_state_dict(state_dict, strict=False)
 

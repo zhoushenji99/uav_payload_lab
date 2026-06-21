@@ -158,12 +158,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
+    runner_cfg = agent_cfg.to_dict()
+    runner_cfg["policy"].update(
+        {
+            "proprio_obs_dim": int(getattr(env_cfg, "proprio_obs_dim", 21)),
+            "privileged_obs_dim": int(getattr(env_cfg, "privileged_obs_dim", 5)),
+            "z_dim": int(getattr(env_cfg, "rma_z_dim", 5)),
+            "z_exp_dim": int(getattr(env_cfg, "rma_z_exp_dim", 2)),
+            "use_mu": bool(getattr(env_cfg, "rma_use_mu", True)),
+            "use_physics_anchor": bool(getattr(env_cfg, "rma_use_physics_anchor", False)),
+        }
+    )
+
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, runner_cfg, log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner = DistillationRunner(env, runner_cfg, log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # --- robust load: model weights only (ignore optimizer mismatch) ---
@@ -319,15 +331,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             current_time = timestep * dt
             # --- add near where you already have policy_nn and obs_tensor ---
 
-            # privileged e is the tail of raw obs in Phase-1: dims [17:22]
+            # privileged e is the tail of raw obs in Phase-1: [proprio_dim : proprio_dim + priv_dim]
             e_priv = np.zeros(5, dtype=np.float32)
-            if isinstance(obs_tensor, torch.Tensor) and obs_tensor.shape[1] >= 22:
-                e_priv = obs_tensor[0, 17:22].cpu().numpy()
+            priv_start = int(getattr(base_env.cfg, "proprio_obs_dim", 21))
+            priv_dim = int(getattr(base_env.cfg, "privileged_obs_dim", 5))
+            if isinstance(obs_tensor, torch.Tensor) and priv_dim > 0 and obs_tensor.shape[1] >= priv_start + priv_dim:
+                e_raw = obs_tensor[0, priv_start : priv_start + min(priv_dim, 5)].cpu().numpy()
+                e_priv[: e_raw.shape[0]] = e_raw
 
-            # z from teacher encoder μ(e)
-            z = np.zeros(getattr(base_env.cfg, "rma_z_dim", 5), dtype=np.float32)
+            # z from teacher encoder μ(e). PPO baselines may have rma_z_dim=0,
+            # but the CSV schema keeps five z columns for plotting compatibility.
+            z_raw = np.zeros(getattr(base_env.cfg, "rma_z_dim", 5), dtype=np.float32)
             if hasattr(policy_nn, "last_z") and (policy_nn.last_z is not None):
-                z = policy_nn.last_z[0].detach().cpu().numpy()
+                z_raw = policy_nn.last_z[0].detach().cpu().numpy()
+
+            z = np.zeros(5, dtype=np.float32)
+            z_len = min(5, z_raw.shape[0])
+            if z_len > 0:
+                z[:z_len] = z_raw[:z_len]
 
             zexp_dim = getattr(base_env.cfg, "rma_z_exp_dim", 2)
             z_exp = z[:zexp_dim]

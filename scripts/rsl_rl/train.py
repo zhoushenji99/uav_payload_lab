@@ -34,6 +34,9 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+parser.add_argument("--black_box_rma", action="store_true", default=False)
+parser.add_argument("--rma_z_exp_dim", type=int, default=None)
+parser.add_argument("--rma_phys_anchor_coef", type=float, default=None)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -113,6 +116,17 @@ torch.backends.cudnn.benchmark = False
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
+    if args_cli.black_box_rma:
+        env_cfg.rma_use_mu = True
+        env_cfg.rma_use_physics_anchor = False
+        env_cfg.rma_phys_anchor_coef = 0.0
+
+    if args_cli.rma_z_exp_dim is not None:
+        env_cfg.rma_z_exp_dim = int(args_cli.rma_z_exp_dim)
+
+    if args_cli.rma_phys_anchor_coef is not None:
+        env_cfg.rma_phys_anchor_coef = float(args_cli.rma_phys_anchor_coef)
+
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -189,12 +203,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
+    runner_cfg = agent_cfg.to_dict()
+    rma_cfg_fields = (
+        "proprio_obs_dim",
+        "privileged_obs_dim",
+        "rma_z_dim",
+        "rma_z_exp_dim",
+        "rma_use_mu",
+        "rma_use_physics_anchor",
+        "rma_mu_hidden_dims",
+        "rma_activation",
+    )
+    if all(hasattr(env_cfg, field) for field in rma_cfg_fields):
+        runner_cfg["policy"].update({
+            "proprio_obs_dim": int(env_cfg.proprio_obs_dim),
+            "privileged_obs_dim": int(env_cfg.privileged_obs_dim),
+            "z_dim": int(env_cfg.rma_z_dim),
+            "z_exp_dim": int(env_cfg.rma_z_exp_dim),
+            "use_mu": bool(env_cfg.rma_use_mu),
+            "use_physics_anchor": bool(env_cfg.rma_use_physics_anchor),
+            "mu_hidden_dims": list(env_cfg.rma_mu_hidden_dims),
+            "mu_activation": env_cfg.rma_activation,
+        })
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, runner_cfg, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = DistillationRunner(env, runner_cfg, log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
