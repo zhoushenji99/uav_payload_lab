@@ -326,6 +326,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 moment_cmd = base_env._moment[0, 0, :].cpu().numpy()
             else:
                 moment_cmd = np.array([0, 0, 0])
+            if hasattr(base_env, "_ctbr_thrust_body_z"):
+                px4_thrust_body_z = float(base_env._ctbr_thrust_body_z[0].cpu())
+            else:
+                px4_thrust_body_z = 0.0
+            if hasattr(base_env, "_ctbr_rate_cmd"):
+                ctbr_rate_sp = base_env._ctbr_rate_cmd[0].cpu().numpy()
+            else:
+                ctbr_rate_sp = np.zeros(3)
+            if hasattr(base_env, "_ctbr_rate_meas"):
+                ctbr_rate_meas = base_env._ctbr_rate_meas[0].cpu().numpy()
+            else:
+                ctbr_rate_meas = np.zeros(3)
+            if hasattr(base_env, "_ctbr_rate_error"):
+                ctbr_rate_err = base_env._ctbr_rate_error[0].cpu().numpy()
+            else:
+                ctbr_rate_err = np.zeros(3)
 
             # 6. 记录时间
             current_time = timestep * dt
@@ -371,6 +387,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 a_env_raw[0], a_env_raw[1], a_env_raw[2], a_env_raw[3],
                 a_env_clamp[0], a_env_clamp[1], a_env_clamp[2], a_env_clamp[3],
                 thrust_cmd, moment_cmd[0], moment_cmd[1], moment_cmd[2],
+                px4_thrust_body_z,
+                ctbr_rate_sp[0], ctbr_rate_sp[1], ctbr_rate_sp[2],
+                ctbr_rate_meas[0], ctbr_rate_meas[1], ctbr_rate_meas[2],
+                ctbr_rate_err[0], ctbr_rate_err[1], ctbr_rate_err[2],
                 e_priv[0], e_priv[1], e_priv[2], e_priv[3], e_priv[4],
                 z[0], z[1], z[2], z[3], z[4],
             ])
@@ -417,6 +437,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "Env_raw_a0","Env_raw_a1","Env_raw_a2","Env_raw_a3", 
                 "Env_clamp_a0","Env_clamp_a1","Env_clamp_a2","Env_clamp_a3", 
                 "Thrust_Cmd","Moment_Cmd_X","Moment_Cmd_Y","Moment_Cmd_Z",
+                "PX4_ThrustBodyZ",
+                "RateSp_X","RateSp_Y","RateSp_Z",
+                "RateMeas_X","RateMeas_Y","RateMeas_Z",
+                "RateErr_X","RateErr_Y","RateErr_Z",
                 "e_m", "e_l", "e_wx", "e_wy", "e_wz",
                 "z0","z1","z2","z3","z4"
 

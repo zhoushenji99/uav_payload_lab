@@ -133,6 +133,21 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     thrust_to_weight = 2.61#无量纲参数，意思是“最大推力大概是机重的多少倍”
     moment_scale_xy = 1.0
     moment_scale_z = 0.25
+
+    # PX4-native CTBR: action = [thrust_body[2], roll_rate, pitch_rate, yaw_rate].
+    # Multicopter upward thrust is negative thrust_body[2] in PX4.
+    action_interface = "px4_ctbr"
+    ctbr_single_motor_max_thrust_n = 19.73
+    ctbr_total_max_thrust_n = 78.92
+    ctbr_thrust_curve_coeffs = (14.584, 5.438, 0.0)
+    ctbr_pwm_range_us = (1150.0, 1900.0)
+    measured_voltage_range_v = (23.5, 25.2)
+    measured_current_range_a = (0.22, 13.6)
+    ctbr_body_rate_limit = (2.5, 2.5, 1.5)
+    ctbr_rate_kp = (0.35, 0.35, 0.08)
+    ctbr_moment_limit = (1.0, 1.0, 0.25)
+    ctbr_px4_to_isaac_rate_sign = (1.0, -1.0, -1.0)
+
     # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
     rope_length_range = (0.25,0.8) # 绳长随机范围 (米)
 

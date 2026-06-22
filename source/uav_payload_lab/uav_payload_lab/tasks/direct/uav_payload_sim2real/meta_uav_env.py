@@ -94,7 +94,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         masses0 = self._robot.root_physx_view.get_masses()[0]  # (num_bodies,)
         uav_mass = float(masses0[self._body_id[0]].item())     # 只取 body 的质量
         self._uav_mass = uav_mass  # <<< [新增] 缓存 UAV 质量，给风扰用
-        self._F_max = self.cfg.thrust_to_weight * (uav_mass * g)
+        self._F_max = float(
+            getattr(self.cfg, "ctbr_total_max_thrust_n", self.cfg.thrust_to_weight * (uav_mass * g))
+        )
 
         # 3) 每个 env 的绳长 / 悬停推力 buffer
         # self._rope_len = torch.full((self.num_envs,), self.cfg.rope_length, device=self.device)
@@ -130,7 +132,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # Wind disturbance module (optional)
         self._init_wind_module()
 
-        #[新增] 记录网络原始输出，用于惩罚计算
+        # _policy_actions 是网络真 raw 输出，用于 reward 惩罚；_raw_actions 保留为执行边界内的动作缓存。
         self._raw_actions = torch.zeros_like(self._actions)
         self._prev_raw_actions = torch.zeros_like(self._actions)
         self._policy_actions = torch.zeros_like(self._actions)
@@ -147,6 +149,18 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # [新增] 低通滤波内部状态
         self._filtered_actions = torch.zeros_like(self._actions)
+        self._ctbr_body_rate_limit = torch.tensor(self.cfg.ctbr_body_rate_limit, dtype=torch.float, device=self.device)
+        self._ctbr_rate_kp = torch.tensor(self.cfg.ctbr_rate_kp, dtype=torch.float, device=self.device)
+        self._ctbr_moment_limit = torch.tensor(self.cfg.ctbr_moment_limit, dtype=torch.float, device=self.device)
+        self._ctbr_rate_sign = torch.tensor(self.cfg.ctbr_px4_to_isaac_rate_sign, dtype=torch.float, device=self.device)
+        self._ctbr_action_scale = torch.cat(
+            (torch.ones(1, device=self.device), self._ctbr_body_rate_limit)
+        )
+        self._ctbr_thrust_body_z = torch.zeros(self.num_envs, device=self.device)
+        self._ctbr_rate_cmd = torch.zeros(self.num_envs, 3, device=self.device)
+        self._ctbr_rate_meas = torch.zeros(self.num_envs, 3, device=self.device)
+        self._ctbr_rate_error = torch.zeros(self.num_envs, 3, device=self.device)
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
@@ -163,14 +177,27 @@ class UavPayloadMetaEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+    def _decode_px4_ctbr_action(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """PX4-native CTBR: thrust_body[2] plus body-rate setpoints."""
+        decoded = torch.empty_like(actions)
+        decoded[:, 0] = actions[:, 0].clamp(-1.0, 0.0)
+        decoded[:, 1:4] = torch.clamp(
+            actions[:, 1:4],
+            min=-self._ctbr_body_rate_limit,
+            max=self._ctbr_body_rate_limit,
+        )
+        thrust_body_z = decoded[:, 0]
+        rate_sp_isaac = decoded[:, 1:4] * self._ctbr_rate_sign
+        return decoded, thrust_body_z, rate_sp_isaac
+
     def _pre_physics_step(self, actions: torch.Tensor):
-        # 1. 记录上一帧的原始动作
+        # 1. 记录上一帧动作缓存
         self._prev_raw_actions = self._raw_actions.clone()
         self._prev_policy_actions = self._policy_actions.clone()
 
-        # 2. 截断当前网络输出
+        # 2. 记录当前网络输出，并按 PX4 CTBR 执行边界截断
         self._policy_actions = actions.clone()
-        self._raw_actions = self._policy_actions.clamp(-1.0, 1.0)
+        self._raw_actions, _, _ = self._decode_px4_ctbr_action(self._policy_actions)
 
         # 3. 经过延迟队列 (Lagging)
         if self._action_delay_steps > 0:
@@ -184,16 +211,25 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # 4. 经过一阶低通滤波 (LPF)
         alpha = self.cfg.action_lpf_alpha
-        self._filtered_actions = (1.0 - alpha) * self._filtered_actions + alpha * delayed_actions
+        if alpha >= 1.0:
+            self._filtered_actions = delayed_actions.clone()
+        else:
+            self._filtered_actions = (1.0 - alpha) * self._filtered_actions + alpha * delayed_actions
 
-        # 5. 覆写 self._actions 供实际物理引擎计算推力使用
-        self._actions = self._filtered_actions.clone()
-        self._thrust[:, 0, 2] = self._F_max * (self._actions[:, 0] + 1.0) / 2.0
-        # tau_x, tau_y
-        self._moment[:, 0, 0:2] = self.cfg.moment_scale_xy * self._actions[:, 1:3]
+        # 5. PX4 CTBR -> Isaac thrust and moment.
+        self._actions, thrust_body_z, rate_sp_isaac = self._decode_px4_ctbr_action(self._filtered_actions)
+        self._ctbr_thrust_body_z = thrust_body_z
+        self._thrust[:, 0, 2] = (-thrust_body_z).clamp(0.0, 1.0) * self._F_max
 
-        # tau_z (a3) 单独更小
-        self._moment[:, 0, 2] = self.cfg.moment_scale_z * self._actions[:, 3]        # [新增] wind state update (OU + gust), store wind accel in world frame
+        rate_meas_b = self._robot.data.root_ang_vel_b
+        rate_error = rate_sp_isaac - rate_meas_b
+        moment_cmd = self._ctbr_rate_kp * rate_error
+        self._moment[:, 0, :] = torch.clamp(moment_cmd, -self._ctbr_moment_limit, self._ctbr_moment_limit)
+        self._ctbr_rate_cmd = rate_sp_isaac
+        self._ctbr_rate_meas = rate_meas_b
+        self._ctbr_rate_error = rate_error
+
+        # [新增] wind state update (OU + gust), store wind accel in world frame
         self._wind_step(self.step_dt)
 
     def _apply_action(self):
@@ -496,14 +532,21 @@ class UavPayloadMetaEnv(DirectRLEnv):
         ) ** 2
 
         # === 5) 动作惩罚 ===
-        # [修改] 惩罚原始动作跳变
-        delta_raw_action = self._policy_actions - self._prev_policy_actions
+        policy_action_norm = self._policy_actions / self._ctbr_action_scale
+        prev_policy_action_norm = self._prev_policy_actions / self._ctbr_action_scale
+
+        # [修改] 惩罚原始动作跳变；CTBR 下先按动作物理量纲归一化
+        delta_raw_action = policy_action_norm - prev_policy_action_norm
         r_action_smooth = -float(self.cfg.action_smooth_penalty_scale) * torch.sum(delta_raw_action ** 2, dim=1)
 
-        # [新增] 惩罚绝对输出过大
-        r_action_l2 = -float(self.cfg.action_l2_penalty_scale) * torch.sum(self._policy_actions ** 2, dim=1)
+        # [新增] 惩罚绝对输出过大；CTBR 下先按动作物理量纲归一化
+        r_action_l2 = -float(self.cfg.action_l2_penalty_scale) * torch.sum(policy_action_norm ** 2, dim=1)
 
-        raw_excess = torch.relu(torch.abs(self._policy_actions) - 1.0)
+        a0_low_excess = torch.relu(-1.0 - self._policy_actions[:, 0])
+        a0_high_excess = torch.relu(self._policy_actions[:, 0])
+        rate_excess = torch.relu(torch.abs(self._policy_actions[:, 1:4]) - self._ctbr_body_rate_limit)
+        rate_excess = rate_excess / self._ctbr_body_rate_limit
+        raw_excess = torch.cat((a0_low_excess.unsqueeze(1), a0_high_excess.unsqueeze(1), rate_excess), dim=1)
         r_action_raw_val = -float(self.cfg.action_raw_excess_penalty_scale) * torch.sum(torch.square(raw_excess), dim=1)
 
         r_action_total = r_action_l2 + r_action_smooth + r_action_raw_val
@@ -684,7 +727,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # [新增]warm
         hover_actions = torch.zeros((len(env_ids), self._actions.shape[-1]), device=self.device)
         F_hover = self._robot_weight[env_ids]
-        hover_actions[:, 0] = (2.0 * F_hover / float(self._F_max) - 1.0).clamp(-1.0, 1.0)
+        hover_actions[:, 0] = (-F_hover / float(self._F_max)).clamp(-1.0, 0.0)
+        hover_actions[:, 1:4] = 0.0
 
         self._raw_actions[env_ids] = hover_actions
         self._prev_raw_actions[env_ids] = hover_actions
@@ -697,6 +741,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._filtered_actions[env_ids] = hover_actions
         self._actions[env_ids] = hover_actions
         self._prev_actions[env_ids] = hover_actions
+        self._ctbr_thrust_body_z[env_ids] = hover_actions[:, 0]
+        self._ctbr_rate_cmd[env_ids] = 0.0
+        self._ctbr_rate_meas[env_ids] = 0.0
+        self._ctbr_rate_error[env_ids] = 0.0
 
     # --- 新增辅助函数 1：记录结束状态 (放 Reset 前) ---
     def _log_termination_stats(self, env_ids):

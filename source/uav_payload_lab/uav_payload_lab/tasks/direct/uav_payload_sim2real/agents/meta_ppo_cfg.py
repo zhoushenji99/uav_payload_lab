@@ -15,6 +15,7 @@ class MetaPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256  #每个 env 收集多少步再做一次更新（类似 SB3 的 n_steps）
     max_iterations = 50000  #总迭代次数（不是总步数；总步数 ≈ num_envs * num_steps_per_env * max_iterations）
     save_interval = 500  #多少个 iteration 存一次 model_*.pt
+    clip_actions = 3.0
     experiment_name = "uav_payload_sim2real_rl" #日志目录名
     policy = RslRlPpoActorCriticCfg(
         class_name=RMA_ACTOR_CRITIC,
