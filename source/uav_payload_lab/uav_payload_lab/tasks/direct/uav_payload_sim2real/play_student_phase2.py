@@ -1,7 +1,7 @@
 # play_student_phase2.py
 # Phase-2 closed-loop rollout for Teacher vs Student (RMA):
 # - Teacher: z = mu(priv)  (oracle context)
-# - Student: z_hat = encoder(history(proprio + last_action))
+# - Student: z_exp_hat is cached at low rate; z_imp_hat is refreshed at policy rate.
 # Logs env{trace_env} to CSV for paper-grade plots (UAV pos, payload pos, swing, z, energy proxies).
 #
 # Key fixes vs your "Ultimate" script:
@@ -42,6 +42,8 @@ parser = argparse.ArgumentParser(description="Phase-2 Play: Teacher(mu(priv)) vs
 parser.add_argument("--mode", type=str, default="student", choices=["student", "teacher"])
 parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
 parser.add_argument("--history_len", type=int, default=50)
+parser.add_argument("--slow_warmup_sec", type=float, default=1.0, help="Run the slow encoder at policy rate during startup.")
+parser.add_argument("--slow_update_hz", type=float, default=1.0, help="Slow encoder rate after startup.")
 parser.add_argument("--trace_env", type=int, default=0, help="Which env index to log to CSV.")
 parser.add_argument("--stop_on_done", action="store_true", default=True, help="Stop when trace_env episode ends (default: True).")
 parser.add_argument("--no_stop_on_done", dest="stop_on_done", action="store_false", help="Do not stop on done; keep running until max_steps.")
@@ -118,14 +120,14 @@ def _safe_load_model_only(runner: OnPolicyRunner, ckpt_path: str):
 
     # common keys in rsl_rl / isaaclab
     if "model_state_dict" in ckpt:
-        runner.alg.policy.load_state_dict(ckpt["model_state_dict"], strict=False)
+        runner.alg.policy.load_state_dict(ckpt["model_state_dict"], strict=True)
     elif "model" in ckpt and isinstance(ckpt["model"], dict):
-        runner.alg.policy.load_state_dict(ckpt["model"], strict=False)
+        runner.alg.policy.load_state_dict(ckpt["model"], strict=True)
     elif "state_dict" in ckpt:
-        runner.alg.policy.load_state_dict(ckpt["state_dict"], strict=False)
+        runner.alg.policy.load_state_dict(ckpt["state_dict"], strict=True)
     else:
         # fall back: assume whole ckpt is state_dict
-        runner.alg.policy.load_state_dict(ckpt, strict=False)
+        runner.alg.policy.load_state_dict(ckpt, strict=True)
 
     # optional normalizers
     if "actor_obs_normalizer_state_dict" in ckpt and hasattr(runner.alg.policy, "actor_obs_normalizer"):
@@ -140,11 +142,27 @@ def _default_csv_path(resume_path: str, mode: str) -> str:
     return os.path.join(run_dir, name)
 
 
+def _compute_slow_schedule(history_len, policy_dt, slow_warmup_sec, slow_update_hz):
+    if history_len <= 0 or policy_dt <= 0.0 or slow_update_hz <= 0.0 or slow_warmup_sec < 0.0:
+        raise ValueError("Invalid fast/slow schedule parameters.")
+    warmup_steps = max(history_len, int(math.ceil(slow_warmup_sec / policy_dt)))
+    period_steps = max(1, int(round(1.0 / (slow_update_hz * policy_dt))))
+    return warmup_steps, period_steps
+
+
+def _slow_update_mask(episode_steps, warmup_steps, period_steps):
+    warmup_mask = episode_steps < warmup_steps
+    periodic_mask = (episode_steps >= warmup_steps) & (
+        (episode_steps - warmup_steps) % period_steps == 0
+    )
+    return warmup_mask | periodic_mask
+
+
 # ----------------------------
 # student encoder (must match train_student_z.py)
 # ----------------------------
-class CNNStudentEncoder(nn.Module):
-    def __init__(self, input_dim=21, history_len=50, output_dim=5):
+class CNNContextEncoder(nn.Module):
+    def __init__(self, input_dim=21, history_len=50, output_dim=2):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(input_dim, 64, 5, 1, 2), nn.ReLU(), nn.BatchNorm1d(64),
@@ -162,6 +180,22 @@ class CNNStudentEncoder(nn.Module):
     def forward(self, x):
         x = x.permute(0, 2, 1)  # (B,H,21)->(B,21,H)
         return self.mlp(self.cnn(x))
+
+
+class FastSlowStudentEncoder(nn.Module):
+    def __init__(self, input_dim=21, history_len=50, z_slow_dim=2, z_fast_dim=3):
+        super().__init__()
+        self.slow_encoder = CNNContextEncoder(input_dim, history_len, z_slow_dim)
+        self.fast_encoder = CNNContextEncoder(input_dim, history_len, z_fast_dim)
+
+    def encode_slow(self, x):
+        return self.slow_encoder(x)
+
+    def encode_fast(self, x):
+        return self.fast_encoder(x)
+
+    def forward(self, x):
+        return self.encode_slow(x), self.encode_fast(x)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -215,6 +249,8 @@ def main(env_cfg, agent_cfg):
     student_input_dim = 21
     student_history_len = int(args_cli.history_len)
     student_z_dim = 5
+    student_z_slow_dim = 2
+    student_z_fast_dim = 3
 
     if args_cli.mode == "student":
         if not args_cli.encoder:
@@ -222,28 +258,45 @@ def main(env_cfg, agent_cfg):
 
         enc_ckpt = torch.load(args_cli.encoder, map_location=env.device)
 
-        # 兼容两种格式：
-        # 1) 新格式：{"state_dict": ..., "history_len":..., "input_dim":..., "z_dim":...}
-        # 2) 老格式：纯 state_dict
-        if isinstance(enc_ckpt, dict) and "state_dict" in enc_ckpt:
-            enc_state_dict = enc_ckpt["state_dict"]
-            student_history_len = int(enc_ckpt.get("history_len", student_history_len))
-            student_input_dim = int(enc_ckpt.get("input_dim", student_input_dim))
-            student_z_dim = int(enc_ckpt.get("z_dim", student_z_dim))
-        else:
-            enc_state_dict = enc_ckpt
+        if not isinstance(enc_ckpt, dict) or enc_ckpt.get("model_type") != "fast_slow_context":
+            raise RuntimeError("Student checkpoint is not a fast/slow context checkpoint.")
+        if "state_dict" not in enc_ckpt:
+            raise RuntimeError("Fast/slow student checkpoint is missing state_dict.")
+        enc_state_dict = enc_ckpt["state_dict"]
+        student_history_len = int(enc_ckpt.get("history_len", student_history_len))
+        student_input_dim = int(enc_ckpt.get("input_dim", student_input_dim))
+        student_z_dim = int(enc_ckpt.get("z_dim", student_z_dim))
+        student_z_slow_dim = int(enc_ckpt.get("z_slow_dim", student_z_slow_dim))
+        student_z_fast_dim = int(enc_ckpt.get("z_fast_dim", student_z_fast_dim))
+        if student_z_slow_dim + student_z_fast_dim != student_z_dim:
+            raise RuntimeError(
+                f"Bad student context dims: slow={student_z_slow_dim}, "
+                f"fast={student_z_fast_dim}, total={student_z_dim}."
+            )
+        if (
+            student_z_dim != int(policy_nn.z_dim)
+            or student_z_slow_dim != int(policy_nn.z_exp_dim)
+            or student_z_fast_dim != int(policy_nn.z_imp_dim)
+        ):
+            raise RuntimeError(
+                "Student/Teacher context mismatch: "
+                f"student=({student_z_slow_dim},{student_z_fast_dim}), "
+                f"teacher=({policy_nn.z_exp_dim},{policy_nn.z_imp_dim})."
+            )
 
-        encoder = CNNStudentEncoder(
+        encoder = FastSlowStudentEncoder(
             input_dim=student_input_dim,
             history_len=student_history_len,
-            output_dim=student_z_dim,
+            z_slow_dim=student_z_slow_dim,
+            z_fast_dim=student_z_fast_dim,
         ).to(env.device)
 
         encoder.load_state_dict(enc_state_dict, strict=True)
         encoder.eval()
         print(
             f"[INFO] Loaded student encoder: {args_cli.encoder} | "
-            f"input_dim={student_input_dim} history_len={student_history_len} z_dim={student_z_dim}"
+            f"input_dim={student_input_dim} history_len={student_history_len} "
+            f"z_slow_dim={student_z_slow_dim} z_fast_dim={student_z_fast_dim}"
         )
 
     # ---- buffers ----
@@ -258,6 +311,14 @@ def main(env_cfg, agent_cfg):
     dt = float(base_env.step_dt)
     obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
     last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 只用于日志/重置，不参与feat
+    episode_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    z_slow_cache = torch.zeros((env.num_envs, student_z_slow_dim), device=env.device)
+    slow_warmup_steps, slow_period_steps = _compute_slow_schedule(
+        history_len,
+        dt,
+        float(args_cli.slow_warmup_sec),
+        float(args_cli.slow_update_hz),
+    )
 
     trace_env = int(args_cli.trace_env)
     if trace_env < 0 or trace_env >= env.num_envs:
@@ -287,6 +348,7 @@ def main(env_cfg, agent_cfg):
         "zT0","zT1","zT2","zT3","zT4",
         "zH0","zH1","zH2","zH3","zH4",
         "z_rmse",
+        "slow_updated","episode_step",
         # actions
         "a0_raw","a1_raw","a2_raw","a3_raw",
         "a0_clamp","a1_clamp","a2_clamp","a3_clamp",
@@ -297,6 +359,10 @@ def main(env_cfg, agent_cfg):
     w.writerow(header)
 
     print(f"[INFO] mode={args_cli.mode} num_envs={env.num_envs} max_steps={args_cli.max_steps} stop_on_done={args_cli.stop_on_done}")
+    print(
+        f"[INFO] policy_hz={1.0 / dt:.1f} fast_hz={1.0 / dt:.1f} "
+        f"slow_warmup_steps={slow_warmup_steps} slow_period_steps={slow_period_steps}"
+    )
     print(f"[INFO] CSV -> {csv_path}")
 
     step_count = 0
@@ -331,12 +397,24 @@ def main(env_cfg, agent_cfg):
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = True
                 z_hat = z_teacher  # for logging only
+                slow_update_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
                 policy_in = obs_tensor  # tail stays as priv=e
             else:
-                # student: policy sees z_hat directly
+                # Student: fast context is refreshed every policy step. Slow context
+                # is refreshed at policy rate during startup, then sample-and-held.
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
-                z_hat = encoder(obs_history).detach()  # (N, z_dim)
+                z_fast = encoder.encode_fast(obs_history).detach()
+                slow_update_mask = _slow_update_mask(
+                    episode_steps,
+                    slow_warmup_steps,
+                    slow_period_steps,
+                )
+                if torch.any(slow_update_mask):
+                    z_slow_cache[slow_update_mask] = encoder.encode_slow(
+                        obs_history[slow_update_mask]
+                    ).detach()
+                z_hat = torch.cat([z_slow_cache, z_fast], dim=-1)
                 policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 21+z_dim)
 
             # ---- 3) build obs dict for policy ----
@@ -393,6 +471,7 @@ def main(env_cfg, agent_cfg):
                 *zT,
                 *zH,
                 z_rmse,
+                int(slow_update_mask[e].item()), int(episode_steps[e].item()),
                 *a_raw,
                 *a_clp,
             ])
@@ -401,6 +480,7 @@ def main(env_cfg, agent_cfg):
             obs, _, dones, _ = env.step(actions)
 
             last_actions = actions.detach()
+            episode_steps += 1
 
             done_mask = dones.to(dtype=torch.bool).reshape(-1)
             if done_mask.numel() != env.num_envs:
@@ -412,6 +492,8 @@ def main(env_cfg, agent_cfg):
             if torch.any(done_mask):
                 obs_history[done_mask] = 0.0
                 last_actions[done_mask] = 0.0
+                episode_steps[done_mask] = 0
+                z_slow_cache[done_mask] = 0.0
                 if hasattr(policy_nn, "reset"):
                     policy_nn.reset(done_mask)
 
@@ -449,6 +531,12 @@ def main(env_cfg, agent_cfg):
         "seed": int(args_cli.seed) if args_cli.seed is not None else None,
         "max_steps": int(args_cli.max_steps),
         "stop_on_done": bool(args_cli.stop_on_done),
+        "policy_hz": float(1.0 / dt),
+        "fast_update_hz": float(1.0 / dt),
+        "slow_warmup_sec": float(args_cli.slow_warmup_sec),
+        "slow_update_hz": float(args_cli.slow_update_hz),
+        "slow_warmup_steps": int(slow_warmup_steps),
+        "slow_period_steps": int(slow_period_steps),
     }
 
     summary_name = "phase2_teacher_play_summary.json" if args_cli.mode == "teacher" else "phase2_student_play_summary.json"

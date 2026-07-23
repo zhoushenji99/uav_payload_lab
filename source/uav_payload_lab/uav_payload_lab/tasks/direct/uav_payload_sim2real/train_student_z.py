@@ -1,5 +1,5 @@
 # train_student_z.py
-# Train student encoder phi(history) -> z_teacher (5-dim)
+# Train independent slow/fast student encoders from the same 50-step history.
 # Paper-grade: weighted MSE, per-dim RMSE, report.json, loss_curve.png
 
 import os
@@ -21,7 +21,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--save_name", type=str, default="best_student_encoder_z.pth")
+    p.add_argument("--save_name", type=str, default="best_fast_slow_student_encoder_z.pth")
     p.add_argument("--use_weighted_mse", action="store_true", default=True)
     p.add_argument("--no_weighted_mse", dest="use_weighted_mse", action="store_false")
     p.add_argument(
@@ -34,8 +34,8 @@ def parse_args():
     p.add_argument("--resume_path", type=str, default="", help="Path to checkpoint for resume.")
     return p.parse_args()
 
-class CNNStudentEncoder(nn.Module):
-    def __init__(self, input_dim=21, history_len=50, output_dim=5):
+class CNNContextEncoder(nn.Module):
+    def __init__(self, input_dim=21, history_len=50, output_dim=2):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(input_dim, 64, 5, 1, 2), nn.ReLU(), nn.BatchNorm1d(64),
@@ -53,6 +53,22 @@ class CNNStudentEncoder(nn.Module):
     def forward(self, x):
         x = x.permute(0, 2, 1)  # (B,H,21)->(B,21,H)
         return self.mlp(self.cnn(x))
+
+
+class FastSlowStudentEncoder(nn.Module):
+    def __init__(self, input_dim=21, history_len=50, z_slow_dim=2, z_fast_dim=3):
+        super().__init__()
+        self.slow_encoder = CNNContextEncoder(input_dim, history_len, z_slow_dim)
+        self.fast_encoder = CNNContextEncoder(input_dim, history_len, z_fast_dim)
+
+    def encode_slow(self, x):
+        return self.slow_encoder(x)
+
+    def encode_fast(self, x):
+        return self.fast_encoder(x)
+
+    def forward(self, x):
+        return self.encode_slow(x), self.encode_fast(x)
 
 def load_shard(path):
     d = torch.load(path, map_location="cpu")
@@ -98,6 +114,8 @@ def main():
         raise RuntimeError(f"Expected input dim = 21, but got {in_dim}. collect pipeline is inconsistent.")
     if z_dim != 5:
         raise RuntimeError(f"Expected z dim = 5, but got {z_dim}.")
+    z_slow_dim = 2
+    z_fast_dim = z_dim - z_slow_dim
 
     has_ml = y0_ml is not None
     if args.aux_ml_coef > 0.0 and not has_ml:
@@ -120,15 +138,23 @@ def main():
     # weighted mse weights: 1/std^2
     w = (1.0 / (z_std * z_std)).to(device)
 
-    model = CNNStudentEncoder(input_dim=in_dim, history_len=H, output_dim=z_dim).to(device)
+    model = FastSlowStudentEncoder(
+        input_dim=in_dim,
+        history_len=H,
+        z_slow_dim=z_slow_dim,
+        z_fast_dim=z_fast_dim,
+    ).to(device)
     opt = optim.Adam(model.parameters(), lr=args.lr)
     num_params = sum(p.numel() for p in model.parameters())
+    num_params_slow = sum(p.numel() for p in model.slow_encoder.parameters())
+    num_params_fast = sum(p.numel() for p in model.fast_encoder.parameters())
     def mse_loss(pred, target):
         return torch.mean((pred - target) ** 2)
 
-    def weighted_mse_loss(pred, target):
-        # pred/target: (B,z_dim)
-        return torch.mean(((pred - target) ** 2) * w)
+    def branch_mse_loss(pred, target, branch_weight):
+        if args.use_weighted_mse:
+            return torch.mean(((pred - target) ** 2) * branch_weight)
+        return mse_loss(pred, target)
 
     best_val = float("inf")
     train_hist = []
@@ -144,6 +170,8 @@ def main():
 
         if "state_dict" not in ckpt:
             raise RuntimeError(f"Resume checkpoint missing 'state_dict': {args.resume_path}")
+        if ckpt.get("model_type") != "fast_slow_context":
+            raise RuntimeError("Resume checkpoint is not a fast/slow student checkpoint.")
 
         model.load_state_dict(ckpt["state_dict"], strict=True)
 
@@ -199,13 +227,16 @@ def main():
                 by = by.to(device, non_blocking=True)
 
                 opt.zero_grad(set_to_none=True)
-                pred = model(bx)
-
-                loss_main = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+                pred_slow, pred_fast = model(bx)
+                target_slow = by[:, :z_slow_dim]
+                target_fast = by[:, z_slow_dim:]
+                loss_slow = branch_mse_loss(pred_slow, target_slow, w[:z_slow_dim])
+                loss_fast = branch_mse_loss(pred_fast, target_fast, w[z_slow_dim:])
+                loss_main = (z_slow_dim / z_dim) * loss_slow + (z_fast_dim / z_dim) * loss_fast
                 loss = loss_main
 
                 if by_ml is not None and args.aux_ml_coef > 0.0:
-                    loss_ml = mse_loss(pred[:, :2], by_ml)
+                    loss_ml = mse_loss(pred_slow, by_ml)
                     loss = loss + args.aux_ml_coef * loss_ml
 
                 loss.backward()
@@ -215,6 +246,8 @@ def main():
         # ---- val ----
         model.eval()
         val_losses = []
+        val_slow_losses = []
+        val_fast_losses = []
         sum_sq = torch.zeros(z_dim, device=device)
         count = 0
 
@@ -247,15 +280,21 @@ def main():
                     bx = bx.to(device, non_blocking=True)
                     by = by.to(device, non_blocking=True)
 
-                    pred = model(bx)
-
-                    loss_main = weighted_mse_loss(pred, by) if args.use_weighted_mse else mse_loss(pred, by)
+                    pred_slow, pred_fast = model(bx)
+                    pred = torch.cat([pred_slow, pred_fast], dim=-1)
+                    target_slow = by[:, :z_slow_dim]
+                    target_fast = by[:, z_slow_dim:]
+                    loss_slow = branch_mse_loss(pred_slow, target_slow, w[:z_slow_dim])
+                    loss_fast = branch_mse_loss(pred_fast, target_fast, w[z_slow_dim:])
+                    loss_main = (z_slow_dim / z_dim) * loss_slow + (z_fast_dim / z_dim) * loss_fast
                     loss = loss_main
                     if by_ml is not None and args.aux_ml_coef > 0.0:
-                        loss_ml = mse_loss(pred[:, :2], by_ml)
+                        loss_ml = mse_loss(pred_slow, by_ml)
                         loss = loss + args.aux_ml_coef * loss_ml
 
                     val_losses.append(loss.item())
+                    val_slow_losses.append(loss_slow.item())
+                    val_fast_losses.append(loss_fast.item())
 
                     err = pred - by
                     sum_sq += (err * err).sum(dim=0)
@@ -263,11 +302,17 @@ def main():
 
         tr = float(np.mean(train_losses)) if len(train_losses) else 0.0
         va = float(np.mean(val_losses)) if len(val_losses) else 0.0
+        va_slow = float(np.mean(val_slow_losses)) if len(val_slow_losses) else 0.0
+        va_fast = float(np.mean(val_fast_losses)) if len(val_fast_losses) else 0.0
         train_hist.append(tr)
         val_hist.append(va)
 
         rmse_dim = torch.sqrt(sum_sq / max(1, count)).detach().cpu().numpy()
-        print(f"Epoch {epoch+1:03d}/{args.epochs} | train={tr:.6e} | val={va:.6e} | rmse_dim={np.round(rmse_dim,3)}")
+        print(
+            f"Epoch {epoch+1:03d}/{args.epochs} | train={tr:.6e} | val={va:.6e} "
+            f"| val_slow={va_slow:.6e} | val_fast={va_fast:.6e} "
+            f"| rmse_dim={np.round(rmse_dim,3)}"
+        )
 
         if va < best_val:
             best_val = va
@@ -277,6 +322,7 @@ def main():
             save_path = os.path.join(args.out_dir, args.save_name)
             torch.save(
                 {
+                    "model_type": "fast_slow_context",
                     "state_dict": model.state_dict(),
                     "optimizer_state_dict": opt.state_dict(),
                     "epoch": epoch,
@@ -286,6 +332,8 @@ def main():
                     "history_len": H,
                     "input_dim": in_dim,
                     "z_dim": z_dim,
+                    "z_slow_dim": z_slow_dim,
+                    "z_fast_dim": z_fast_dim,
                     "z_mean": z_mean.cpu(),
                     "z_std": z_std.cpu(),
                 },
@@ -295,6 +343,7 @@ def main():
         last_path = os.path.join(args.out_dir, "last_checkpoint.pth")
         torch.save(
             {
+                "model_type": "fast_slow_context",
                 "state_dict": model.state_dict(),
                 "optimizer_state_dict": opt.state_dict(),
                 "epoch": epoch,
@@ -304,6 +353,8 @@ def main():
                 "history_len": H,
                 "input_dim": in_dim,
                 "z_dim": z_dim,
+                "z_slow_dim": z_slow_dim,
+                "z_fast_dim": z_fast_dim,
                 "z_mean": z_mean.cpu(),
                 "z_std": z_std.cpu(),
             },
@@ -320,6 +371,10 @@ def main():
         "wall_time_sec": wall_time_sec,
         "epochs_ran": len(train_hist),
         "num_params": int(num_params),
+        "num_params_slow": int(num_params_slow),
+        "num_params_fast": int(num_params_fast),
+        "z_slow_dim": int(z_slow_dim),
+        "z_fast_dim": int(z_fast_dim),
         "use_weighted_mse": bool(args.use_weighted_mse),
         "z_std": z_std.cpu().tolist(),
         "z_mean": z_mean.cpu().tolist() if z_mean is not None else None,

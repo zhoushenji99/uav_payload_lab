@@ -864,10 +864,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._wind_mean[env_ids] = torch.cat([mean_xy, torch.zeros(m, 1, device=dev)], dim=-1)
 
         # clear gust/ou and timers
-        self._wind_gust[env_ids].zero_()
-        self._wind_ou[env_ids].zero_()
-        self._wind_acc_w[env_ids].zero_()
-        self._wind_t[env_ids].zero_()
+        self._wind_gust[env_ids] = 0.0
+        self._wind_ou[env_ids] = 0.0
+        self._wind_acc_w[env_ids] = 0.0
+        self._wind_t[env_ids] = 0.0
 
         dt_next = self._wind_gust_dt_min + (self._wind_gust_dt_max - self._wind_gust_dt_min) * torch.rand(m, device=dev)
         self._wind_t_next[env_ids] = dt_next

@@ -42,7 +42,7 @@ class RMAActorCritic(nn.Module):
         proprio_obs_dim: int = 21,
         privileged_obs_dim: int = 5,
         z_dim: int = 5,
-        z_exp_dim: int = 2,                   # optional split for logging
+        z_exp_dim: int = 2,
         use_mu: bool = True,                  # Phase-1 True, Phase-2 False
         mu_hidden_dims: tuple[int] | list[int] = [64, 64],
         mu_activation: str | None = None,     # default use `activation`
@@ -64,7 +64,18 @@ class RMAActorCritic(nn.Module):
         self.priv_dim = int(privileged_obs_dim)
         self.z_dim = int(z_dim)
         self.z_exp_dim = int(z_exp_dim)
+        self.z_imp_dim = self.z_dim - self.z_exp_dim
         self.use_mu = bool(use_mu)
+        if self.z_exp_dim <= 0 or self.z_imp_dim <= 0:
+            raise ValueError(
+                f"Expected positive explicit and implicit context dimensions, got "
+                f"z_dim={self.z_dim}, z_exp_dim={self.z_exp_dim}."
+            )
+        if self.priv_dim <= self.z_exp_dim:
+            raise ValueError(
+                f"privileged_obs_dim must contain explicit and implicit inputs, got "
+                f"privileged_obs_dim={self.priv_dim}, z_exp_dim={self.z_exp_dim}."
+            )
         self.probe = nn.Linear(self.z_dim, self.priv_dim, bias=True)
 
         # -------- infer raw obs dim from obs_groups (same as original ActorCritic) --------
@@ -85,9 +96,11 @@ class RMAActorCritic(nn.Module):
                 f"Check env obs concat order & cfg observation_space."
             )
 
-        # -------- μ: e -> z --------
+        # Independent Teacher pathways:
+        #   mu_exp([m,l]) -> z_exp(2), mu_imp([wind_xyz]) -> z_imp(3).
         mu_act = mu_activation if mu_activation is not None else activation
-        self.mu = MLP(self.priv_dim, self.z_dim, mu_hidden_dims, mu_act)
+        self.mu_exp = MLP(self.z_exp_dim, self.z_exp_dim, mu_hidden_dims, mu_act)
+        self.mu_imp = MLP(self.priv_dim - self.z_exp_dim, self.z_imp_dim, mu_hidden_dims, mu_act)
 
         # -------- actor/critic take [proprio, z] --------
         num_actor_obs = self.proprio_dim + self.z_dim
@@ -163,6 +176,17 @@ class RMAActorCritic(nn.Module):
         proprio = raw[..., : self.proprio_dim]
         tail = raw[..., self.proprio_dim : self.proprio_dim + self.priv_dim]  # e (Phase1) or z (Phase2)
         return proprio, tail
+
+    def mu(self, privileged: torch.Tensor) -> torch.Tensor:
+        """Keep the original mu(priv) API while enforcing clean input separation."""
+
+        if privileged.shape[-1] != self.priv_dim:
+            raise ValueError(f"Expected privileged dim={self.priv_dim}, got {privileged.shape[-1]}")
+        e_exp = privileged[..., : self.z_exp_dim]
+        e_imp = privileged[..., self.z_exp_dim :]
+        z_exp = self.mu_exp(e_exp)
+        z_imp = self.mu_imp(e_imp)
+        return torch.cat([z_exp, z_imp], dim=-1)
 
     def _compute_z(self, tail: torch.Tensor) -> torch.Tensor:
         if self.use_mu:
@@ -278,17 +302,27 @@ class RMAActorCritic(nn.Module):
             raw_obs = obs
 
         priv = raw_obs[:, self.proprio_dim : self.proprio_dim + self.priv_dim]
-        gt_phys = priv[:, :2]
-        z = self.mu(priv)
-        pred_phys = z[:, :2]
+        gt_phys = priv[:, : self.z_exp_dim]
+        pred_phys = self.mu_exp(gt_phys)
         loss = (pred_phys - gt_phys).pow(2).mean()
         return loss
 
     def load_state_dict(self, state_dict, strict: bool = True):
         # Allow older checkpoints without probe.*
         allowed_missing = {"probe.weight", "probe.bias"}
+        legacy_mu_keys = [key for key in state_dict if key.startswith("mu.")]
+        if legacy_mu_keys:
+            raise RuntimeError(
+                "Legacy coupled Teacher checkpoint is incompatible with the split "
+                "mu_exp/mu_imp architecture; retrain Phase I."
+            )
 
         res = super().load_state_dict(state_dict, strict=False)
+        context_missing = [
+            key for key in res.missing_keys if key.startswith(("mu_exp.", "mu_imp."))
+        ]
+        if context_missing:
+            raise RuntimeError(f"Split Teacher checkpoint is missing context encoder keys: {context_missing}")
 
         # If missing keys beyond probe.*, treat as real error
         bad_missing = [k for k in res.missing_keys if k not in allowed_missing]
