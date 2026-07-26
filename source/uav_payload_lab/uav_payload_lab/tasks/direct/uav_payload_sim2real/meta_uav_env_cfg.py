@@ -223,17 +223,22 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     rma_z_dim = 5                 # z_t dim (这里先设为5，匹配你的“mlw5->z”)
     rma_z_exp_dim = 2             # z前2维当 z_exp（对应慢变量）
     rma_use_mu = True             # Phase1: True; Phase2部署/评估: False
-    rma_use_physics_anchor = True
-    rma_phys_anchor_coef = 1.0
-    #split + physics anchor 版
+    # Proposed Teacher: exact normalized [mass, rope length] identity path plus
+    # an independent learned wind/residual branch.
+    rma_context_mode = "split_hard"
+    rma_use_physics_anchor = False
+    rma_phys_anchor_coef = 0.0
+    # split_soft + physics anchor ablation
     # rma_use_mu = True
+    # rma_context_mode = "split_soft"
     # rma_z_exp_dim = 2
     # rma_use_physics_anchor = True
     # rma_phys_anchor_coef = 1.0
 
-    # #black-box RMA 版 coupled版
+    # black-box / monolithic RMA ablation
     # rma_use_mu = True
-    # rma_z_exp_dim = 2   # 或 0，都行；见下文
+    # rma_context_mode = "monolithic"
+    # rma_z_exp_dim = 2   # retained only for logging the first/last dimensions
     # rma_use_physics_anchor = False
     # rma_phys_anchor_coef = 0.0
 

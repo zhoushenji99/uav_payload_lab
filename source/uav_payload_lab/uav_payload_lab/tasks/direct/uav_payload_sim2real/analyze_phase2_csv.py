@@ -29,6 +29,68 @@ import matplotlib.pyplot as plt
 # Helpers
 # ----------------------------
 
+PAYLOAD_MASS_RANGE_KG = (0.3, 0.8)
+ROPE_LENGTH_RANGE_M = (0.25, 0.8)
+
+
+def _normalized_context_to_physical(values, value_range) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    lo, hi = map(float, value_range)
+    return lo + values * (hi - lo)
+
+
+def _semantic_context_physical(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Convert semantic z0/z1 to physical mass/rope-length units for plotting."""
+
+    physical = {
+        "student_mass_kg": _normalized_context_to_physical(
+            df["zH0"].to_numpy(dtype=float), PAYLOAD_MASS_RANGE_KG
+        ),
+        "student_rope_length_m": _normalized_context_to_physical(
+            df["zH1"].to_numpy(dtype=float), ROPE_LENGTH_RANGE_M
+        ),
+    }
+
+    if "zT0" in df.columns:
+        physical["teacher_mass_kg"] = _normalized_context_to_physical(
+            df["zT0"].to_numpy(dtype=float), PAYLOAD_MASS_RANGE_KG
+        )
+    if "zT1" in df.columns:
+        physical["teacher_rope_length_m"] = _normalized_context_to_physical(
+            df["zT1"].to_numpy(dtype=float), ROPE_LENGTH_RANGE_M
+        )
+
+    if "payload_mass_kg" in df.columns:
+        physical["true_mass_kg"] = df["payload_mass_kg"].to_numpy(dtype=float)
+    else:
+        physical["true_mass_kg"] = _normalized_context_to_physical(
+            df["priv0"].to_numpy(dtype=float), PAYLOAD_MASS_RANGE_KG
+        )
+
+    if "rope_length_m" in df.columns:
+        physical["true_rope_length_m"] = df["rope_length_m"].to_numpy(dtype=float)
+    else:
+        physical["true_rope_length_m"] = _normalized_context_to_physical(
+            df["priv1"].to_numpy(dtype=float), ROPE_LENGTH_RANGE_M
+        )
+
+    return physical
+
+
+def _teacher_structure_label(df: pd.DataFrame, atol: float = 1e-7) -> str:
+    """Infer whether the CSV contains the hard-explicit structural identity."""
+
+    required = ["zT0", "zT1", "priv0", "priv1"]
+    if not all(column in df.columns for column in required):
+        return "Teacher structural context"
+    teacher = df[["zT0", "zT1"]].to_numpy(dtype=float)
+    privileged = df[["priv0", "priv1"]].to_numpy(dtype=float)
+    finite = np.isfinite(teacher).all() and np.isfinite(privileged).all()
+    if finite and np.max(np.abs(teacher - privileged)) <= float(atol):
+        return "hard-explicit Teacher"
+    return "learned/soft Teacher"
+
+
 def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
     if win <= 1:
         return x
@@ -292,25 +354,189 @@ def plot_fig3_z_compare(teacher: Series, student: Series, out_dir: Path) -> None
 
     # teacher zT optional
     have_teacher_zT = all(f"zT{i}" in teacher.df.columns for i in range(5))
+    physical = _semantic_context_physical(student.df)
 
     fig, axs = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
     for i in range(5):
         ax = axs[i]
-        ax.plot(tS, student.df[f"zT{i}"], label="student:zT (teacher mu(priv))")
-        ax.plot(tS, student.df[f"zH{i}"], label="student:zH (encoder)")
-        if have_teacher_zT:
-            # align by time index (same dt) – good enough for visual reference
-            tT = teacher.t()
-            m = tT <= tmax
-            ax.plot(tT[m], teacher.df.loc[m, f"zT{i}"], linestyle="--", linewidth=1.0, label="teacher:zT")
-        ax.set_ylabel(f"z[{i}]")
-        ax.grid(True, linestyle=":", linewidth=0.6)
         if i == 0:
-            ax.legend()
+            ax.plot(tS, physical["teacher_mass_kg"], label="Teacher structural mass")
+            ax.plot(tS, physical["student_mass_kg"], label="Student estimated mass")
+            if have_teacher_zT:
+                tT = teacher.t()
+                m = tT <= tmax
+                teacher_mass = _normalized_context_to_physical(
+                    teacher.df.loc[m, "zT0"].to_numpy(dtype=float),
+                    PAYLOAD_MASS_RANGE_KG,
+                )
+                ax.plot(tT[m], teacher_mass, linestyle="--", linewidth=1.0, label="Teacher rollout structural mass")
+            ax.plot(tS, physical["true_mass_kg"], linestyle=":", linewidth=1.5, label="Ground-truth mass")
+            ax.set_ylim(*PAYLOAD_MASS_RANGE_KG)
+            ax.set_ylabel("Payload mass (kg)")
+            teacher_median = float(np.nanmedian(physical["teacher_mass_kg"]))
+            true_median = float(np.nanmedian(physical["true_mass_kg"]))
+            ax.set_title(
+                f"Slow physical context: mass | Teacher bias = {teacher_median - true_median:+.4f} kg",
+                fontsize=10,
+            )
+        elif i == 1:
+            ax.plot(tS, physical["teacher_rope_length_m"], label="Teacher structural rope length")
+            ax.plot(tS, physical["student_rope_length_m"], label="Student estimated rope length")
+            if have_teacher_zT:
+                tT = teacher.t()
+                m = tT <= tmax
+                teacher_length = _normalized_context_to_physical(
+                    teacher.df.loc[m, "zT1"].to_numpy(dtype=float),
+                    ROPE_LENGTH_RANGE_M,
+                )
+                ax.plot(tT[m], teacher_length, linestyle="--", linewidth=1.0, label="Teacher rollout structural length")
+            ax.plot(
+                tS,
+                physical["true_rope_length_m"],
+                linestyle=":",
+                linewidth=1.5,
+                label="Ground-truth rope length",
+            )
+            ax.set_ylim(*ROPE_LENGTH_RANGE_M)
+            ax.set_ylabel("Rope length (m)")
+            teacher_median = float(np.nanmedian(physical["teacher_rope_length_m"]))
+            true_median = float(np.nanmedian(physical["true_rope_length_m"]))
+            ax.set_title(
+                f"Slow physical context: rope length | Teacher bias = {teacher_median - true_median:+.4f} m",
+                fontsize=10,
+            )
+        else:
+            ax.plot(tS, student.df[f"zT{i}"], label="student:zT (teacher mu(priv))")
+            ax.plot(tS, student.df[f"zH{i}"], label="student:zH (encoder)")
+            if have_teacher_zT:
+                # align by time index (same dt) – good enough for visual reference
+                tT = teacher.t()
+                m = tT <= tmax
+                ax.plot(
+                    tT[m],
+                    teacher.df.loc[m, f"zT{i}"],
+                    linestyle="--",
+                    linewidth=1.0,
+                    label="teacher:zT",
+                )
+            ax.set_ylabel(f"z[{i}]")
+        ax.grid(True, linestyle=":", linewidth=0.6)
+        if i in (0, 1):
+            ax.legend(fontsize="small", ncol=2)
 
     axs[-1].set_xlabel("Time (s)")
-    fig.suptitle("Latent z comparison (student encoder vs teacher priv->mu)", y=0.995)
+    fig.suptitle("Context comparison: physical slow branch and latent fast branch", y=0.995)
     _save_fig(fig, out_dir / "fig3_z_compare.png")
+
+
+def plot_fig5_fastslow_runtime_audit(student: Series, out_dir: Path) -> None:
+    """Plot raw/target/cache transitions and the associated runtime diagnostics."""
+
+    required = [
+        "z_slow_raw0",
+        "z_slow_raw1",
+        "z_slow_target0",
+        "z_slow_target1",
+        "z_slow_cache0",
+        "z_slow_cache1",
+        "slow_updated",
+        "actor_inference_ms",
+        "end_to_end_inference_ms",
+    ]
+    missing = [name for name in required if name not in student.df.columns]
+    if missing:
+        print(f"[WARN] Skip fast/slow runtime audit plot; missing columns: {missing}")
+        return
+
+    t = student.t()
+    df = student.df
+    fig, axs = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    fig.suptitle("Fast/slow context runtime audit", fontsize=14, weight="bold")
+
+    mass_range = PAYLOAD_MASS_RANGE_KG
+    length_range = ROPE_LENGTH_RANGE_M
+    axs[0].plot(
+        t,
+        _normalized_context_to_physical(df["z_slow_raw0"], mass_range),
+        linewidth=1.0,
+        alpha=0.7,
+        label="slow raw",
+    )
+    axs[0].plot(
+        t,
+        _normalized_context_to_physical(df["z_slow_target0"], mass_range),
+        linestyle="--",
+        label="filter target",
+    )
+    axs[0].plot(
+        t,
+        _normalized_context_to_physical(df["z_slow_cache0"], mass_range),
+        linewidth=2.0,
+        label="Actor-visible cache",
+    )
+    if "payload_mass_kg" in df:
+        axs[0].plot(t, df["payload_mass_kg"], linestyle=":", label="ground truth")
+    axs[0].set_ylabel("Mass (kg)")
+    axs[0].set_title("Slow structural context: payload mass")
+
+    axs[1].plot(
+        t,
+        _normalized_context_to_physical(df["z_slow_raw1"], length_range),
+        linewidth=1.0,
+        alpha=0.7,
+        label="slow raw",
+    )
+    axs[1].plot(
+        t,
+        _normalized_context_to_physical(df["z_slow_target1"], length_range),
+        linestyle="--",
+        label="filter target",
+    )
+    axs[1].plot(
+        t,
+        _normalized_context_to_physical(df["z_slow_cache1"], length_range),
+        linewidth=2.0,
+        label="Actor-visible cache",
+    )
+    if "rope_length_m" in df:
+        axs[1].plot(t, df["rope_length_m"], linestyle=":", label="ground truth")
+    axs[1].set_ylabel("Length (m)")
+    axs[1].set_title("Slow structural context: rope length")
+
+    if "executed_action_delta_l1" in df:
+        axs[2].plot(
+            t,
+            df["executed_action_delta_l1"],
+            label="executed adjacent-step CTBR Δ L1",
+        )
+    if "context_refresh_action_l1" in df:
+        refresh = df["slow_updated"].to_numpy(dtype=bool)
+        axs[2].scatter(
+            t[refresh],
+            df.loc[refresh, "context_refresh_action_l1"],
+            s=16,
+            label="old-cache vs raw-target counterfactual Δ L1",
+        )
+    axs[2].set_ylabel("CTBR difference")
+    axs[2].set_title("Action continuity at slow-context refresh")
+
+    for column, label in [
+        ("slow_inference_ms", "slow encoder"),
+        ("fast_inference_ms", "fast encoder"),
+        ("actor_inference_ms", "Actor"),
+        ("end_to_end_inference_ms", "end-to-end"),
+    ]:
+        if column in df:
+            axs[3].plot(t, df[column], linewidth=1.0, label=label)
+    axs[3].set_ylabel("Latency (ms)")
+    axs[3].set_xlabel("Time (s)")
+    axs[3].set_title("Synchronized evaluation inference latency")
+
+    for ax in axs:
+        ax.grid(True, linestyle=":", linewidth=0.6)
+        ax.legend(fontsize="small", ncol=2)
+    _save_fig(fig, out_dir / "fig5_fastslow_runtime_audit.png")
+
 
 def _compute_energy(df: pd.DataFrame, goal_ref: np.ndarray, smooth_window_s: float = 0.15):
     """
@@ -642,23 +868,55 @@ def plot_phase2_cross_method_compare(
     # This is for the proposed method only. Coupled latent dimensions are not semantically aligned.
     if all(c in dec_student.df.columns for c in ["zH0", "zH1", "priv0", "priv1"]):
         fig, axs = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-        fig.suptitle("Decoupled semantic context recovery", fontsize=14, weight="bold")
+        fig.suptitle(
+            f"Physical context recovery ({_teacher_structure_label(dec_student.df)})",
+            fontsize=14,
+            weight="bold",
+        )
         t = dec_student.t()
-        axs[0].plot(t, dec_student.df["zH0"].to_numpy(dtype=float), label="student zH0")
-        if "zT0" in dec_student.df.columns:
-            axs[0].plot(t, dec_student.df["zT0"].to_numpy(dtype=float), linestyle="--", label="teacher zT0")
-        axs[0].axhline(float(np.nanmedian(dec_student.df["priv0"].to_numpy(dtype=float))), linestyle=":", label="true mass")
-        axs[0].set_ylim(0.0, 1.0)
-        axs[0].set_ylabel("mass context")
+        physical = _semantic_context_physical(dec_student.df)
+        axs[0].plot(t, physical["student_mass_kg"], label="student estimated mass")
+        if "teacher_mass_kg" in physical:
+            axs[0].plot(
+                t,
+                physical["teacher_mass_kg"],
+                linestyle="--",
+                label="teacher equivalent mass",
+            )
+        axs[0].plot(t, physical["true_mass_kg"], linestyle=":", label="ground-truth mass")
+        axs[0].set_ylim(*PAYLOAD_MASS_RANGE_KG)
+        axs[0].set_ylabel("Payload mass (kg)")
+        teacher_mass = float(np.nanmedian(physical["teacher_mass_kg"]))
+        true_mass = float(np.nanmedian(physical["true_mass_kg"]))
+        axs[0].set_title(
+            f"Teacher equivalent − truth = {teacher_mass - true_mass:+.4f} kg",
+            fontsize=10,
+        )
         axs[0].grid(True, linestyle=":", linewidth=0.6)
         axs[0].legend()
 
-        axs[1].plot(t, dec_student.df["zH1"].to_numpy(dtype=float), label="student zH1")
-        if "zT1" in dec_student.df.columns:
-            axs[1].plot(t, dec_student.df["zT1"].to_numpy(dtype=float), linestyle="--", label="teacher zT1")
-        axs[1].axhline(float(np.nanmedian(dec_student.df["priv1"].to_numpy(dtype=float))), linestyle=":", label="true length")
-        axs[1].set_ylim(0.0, 1.0)
-        axs[1].set_ylabel("length context")
+        axs[1].plot(t, physical["student_rope_length_m"], label="student estimated rope length")
+        if "teacher_rope_length_m" in physical:
+            axs[1].plot(
+                t,
+                physical["teacher_rope_length_m"],
+                linestyle="--",
+                label="teacher equivalent rope length",
+            )
+        axs[1].plot(
+            t,
+            physical["true_rope_length_m"],
+            linestyle=":",
+            label="ground-truth rope length",
+        )
+        axs[1].set_ylim(*ROPE_LENGTH_RANGE_M)
+        axs[1].set_ylabel("Rope length (m)")
+        teacher_length = float(np.nanmedian(physical["teacher_rope_length_m"]))
+        true_length = float(np.nanmedian(physical["true_rope_length_m"]))
+        axs[1].set_title(
+            f"Teacher equivalent − truth = {teacher_length - true_length:+.4f} m",
+            fontsize=10,
+        )
         axs[1].set_xlabel("Time (s)")
         axs[1].grid(True, linestyle=":", linewidth=0.6)
         axs[1].legend()
@@ -682,7 +940,7 @@ def plot_phase2_cross_method_compare(
     print("[Compare] saved:")
     print("  - phase2_compare_task_curves.png")
     print("  - phase2_compare_realization_gap.png")
-    print("  - phase2_decoupled_semantic_z01.png (if columns exist)")
+    print("  - phase2_decoupled_semantic_z01.png (physical kg/m axes, if columns exist)")
     print("  - phase2_compare_metrics.csv")
     print("  - phase2_compare_realization_gap_metrics.csv")
 
@@ -1244,6 +1502,7 @@ def main():
     plot_fig1_payload_pos_and_swing(teacher, student, out_dir)
     plot_fig2_swing_angles(teacher, student, out_dir)
     plot_fig3_z_compare(teacher, student, out_dir)
+    plot_fig5_fastslow_runtime_audit(student, out_dir)
 
     tw = float(args.time_window)
     tmax = None if tw <= 0 else tw

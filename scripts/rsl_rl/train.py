@@ -35,6 +35,16 @@ parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 parser.add_argument("--black_box_rma", action="store_true", default=False)
+parser.add_argument(
+    "--rma_context_mode",
+    type=str,
+    default=None,
+    choices=["split_hard", "split_soft", "monolithic"],
+    help=(
+        "Teacher context architecture. Proposed method is split_hard. "
+        "--black_box_rma is a deprecated alias for monolithic."
+    ),
+)
 parser.add_argument("--rma_z_exp_dim", type=int, default=None)
 parser.add_argument("--rma_phys_anchor_coef", type=float, default=None)
 # append RSL-RL cli arguments
@@ -79,6 +89,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 """Rest everything follows."""
 
 import gymnasium as gym
+import json
 import logging
 import os
 import torch
@@ -117,15 +128,44 @@ torch.backends.cudnn.benchmark = False
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
     if args_cli.black_box_rma:
+        if args_cli.rma_context_mode not in (None, "monolithic"):
+            raise ValueError(
+                "--black_box_rma is a deprecated alias for "
+                "--rma_context_mode monolithic and cannot be combined with "
+                f"--rma_context_mode {args_cli.rma_context_mode}."
+            )
+        print("[WARN] --black_box_rma is deprecated; using --rma_context_mode monolithic.")
         env_cfg.rma_use_mu = True
+        env_cfg.rma_context_mode = "monolithic"
         env_cfg.rma_use_physics_anchor = False
         env_cfg.rma_phys_anchor_coef = 0.0
+
+    if args_cli.rma_context_mode is not None:
+        env_cfg.rma_context_mode = str(args_cli.rma_context_mode)
 
     if args_cli.rma_z_exp_dim is not None:
         env_cfg.rma_z_exp_dim = int(args_cli.rma_z_exp_dim)
 
     if args_cli.rma_phys_anchor_coef is not None:
         env_cfg.rma_phys_anchor_coef = float(args_cli.rma_phys_anchor_coef)
+
+    context_mode = str(getattr(env_cfg, "rma_context_mode", "split_hard"))
+    if context_mode == "split_soft":
+        if args_cli.rma_phys_anchor_coef is None and float(
+            getattr(env_cfg, "rma_phys_anchor_coef", 0.0)
+        ) == 0.0:
+            env_cfg.rma_phys_anchor_coef = 1.0
+        env_cfg.rma_use_physics_anchor = (
+            float(getattr(env_cfg, "rma_phys_anchor_coef", 0.0)) > 0.0
+        )
+    else:
+        if float(getattr(env_cfg, "rma_phys_anchor_coef", 0.0)) != 0.0:
+            print(
+                f"[WARN] context_mode={context_mode} has no learned explicit branch; "
+                "forcing rma_phys_anchor_coef=0."
+            )
+        env_cfg.rma_use_physics_anchor = False
+        env_cfg.rma_phys_anchor_coef = 0.0
 
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -210,6 +250,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "rma_z_dim",
         "rma_z_exp_dim",
         "rma_use_mu",
+        "rma_context_mode",
         "rma_use_physics_anchor",
         "rma_mu_hidden_dims",
         "rma_activation",
@@ -221,6 +262,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "z_dim": int(env_cfg.rma_z_dim),
             "z_exp_dim": int(env_cfg.rma_z_exp_dim),
             "use_mu": bool(env_cfg.rma_use_mu),
+            "context_mode": str(env_cfg.rma_context_mode),
             "use_physics_anchor": bool(env_cfg.rma_use_physics_anchor),
             "mu_hidden_dims": list(env_cfg.rma_mu_hidden_dims),
             "mu_activation": env_cfg.rma_activation,
@@ -251,6 +293,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("[DEBUG] alg.use_phys_anchor =", runner.alg.use_phys_anchor)
     print("[DEBUG] alg.phys_anchor_coef =", runner.alg.phys_anchor_coef)
     print("[DEBUG] policy.use_physics_anchor =", getattr(runner.alg.policy, "use_physics_anchor", None))
+    print("[DEBUG] policy.context_mode =", getattr(runner.alg.policy, "context_mode", None))
+
+    context_manifest = (
+        runner.alg.policy.context_manifest()
+        if hasattr(runner.alg.policy, "context_manifest")
+        else {"context_mode": context_mode}
+    )
+    context_manifest.update(
+        {
+            "rma_phys_anchor_coef": float(env_cfg.rma_phys_anchor_coef),
+            "run_name": str(agent_cfg.run_name),
+            "seed": int(agent_cfg.seed),
+        }
+    )
+    with open(os.path.join(log_dir, "context_architecture.json"), "w") as manifest_file:
+        json.dump(context_manifest, manifest_file, indent=2)
+    print(
+        "[INFO] Context architecture manifest -> "
+        f"{os.path.join(log_dir, 'context_architecture.json')}"
+    )
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
