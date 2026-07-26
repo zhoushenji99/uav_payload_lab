@@ -44,6 +44,7 @@ class RMAActorCritic(nn.Module):
         z_dim: int = 5,
         z_exp_dim: int = 2,
         use_mu: bool = True,                  # Phase-1 True, Phase-2 False
+        context_mode: str = "split_hard",
         mu_hidden_dims: tuple[int] | list[int] = [64, 64],
         mu_activation: str | None = None,     # default use `activation`
         use_physics_anchor: bool = True,
@@ -58,14 +59,19 @@ class RMAActorCritic(nn.Module):
         self.num_actions = num_actions
         self.state_dependent_std = state_dependent_std
 
-        self.use_physics_anchor = bool(use_physics_anchor)
-
         self.proprio_dim = int(proprio_obs_dim)
         self.priv_dim = int(privileged_obs_dim)
         self.z_dim = int(z_dim)
         self.z_exp_dim = int(z_exp_dim)
         self.z_imp_dim = self.z_dim - self.z_exp_dim
         self.use_mu = bool(use_mu)
+        self.context_mode = str(context_mode).strip().lower()
+        valid_context_modes = {"split_hard", "split_soft", "monolithic"}
+        if self.context_mode not in valid_context_modes:
+            raise ValueError(
+                f"Unknown context_mode={context_mode!r}; expected one of "
+                f"{sorted(valid_context_modes)}."
+            )
         if self.z_exp_dim <= 0 or self.z_imp_dim <= 0:
             raise ValueError(
                 f"Expected positive explicit and implicit context dimensions, got "
@@ -76,6 +82,13 @@ class RMAActorCritic(nn.Module):
                 f"privileged_obs_dim must contain explicit and implicit inputs, got "
                 f"privileged_obs_dim={self.priv_dim}, z_exp_dim={self.z_exp_dim}."
             )
+        if self.context_mode == "split_hard" and self.priv_dim != self.z_dim:
+            raise ValueError(
+                "split_hard requires privileged_obs_dim == z_dim so the explicit "
+                "identity path and residual branch preserve all context dimensions."
+            )
+        # The hard explicit path is an identity, so it needs no auxiliary loss.
+        self.use_physics_anchor = bool(use_physics_anchor) and self.context_mode == "split_soft"
         self.probe = nn.Linear(self.z_dim, self.priv_dim, bias=True)
 
         # -------- infer raw obs dim from obs_groups (same as original ActorCritic) --------
@@ -96,11 +109,37 @@ class RMAActorCritic(nn.Module):
                 f"Check env obs concat order & cfg observation_space."
             )
 
-        # Independent Teacher pathways:
-        #   mu_exp([m,l]) -> z_exp(2), mu_imp([wind_xyz]) -> z_imp(3).
+        # Teacher context structures:
+        # - split_hard: [m_norm,l_norm] identity + learned residual branch.
+        # - split_soft: independent learned explicit and residual branches.
+        # - monolithic: one joint five-to-five learned context encoder.
         mu_act = mu_activation if mu_activation is not None else activation
-        self.mu_exp = MLP(self.z_exp_dim, self.z_exp_dim, mu_hidden_dims, mu_act)
-        self.mu_imp = MLP(self.priv_dim - self.z_exp_dim, self.z_imp_dim, mu_hidden_dims, mu_act)
+        if self.context_mode == "split_hard":
+            self.mu_imp = MLP(
+                self.priv_dim - self.z_exp_dim,
+                self.z_imp_dim,
+                mu_hidden_dims,
+                mu_act,
+            )
+        elif self.context_mode == "split_soft":
+            self.mu_exp = MLP(self.z_exp_dim, self.z_exp_dim, mu_hidden_dims, mu_act)
+            self.mu_imp = MLP(
+                self.priv_dim - self.z_exp_dim,
+                self.z_imp_dim,
+                mu_hidden_dims,
+                mu_act,
+            )
+        else:
+            self.context_encoder = MLP(
+                self.priv_dim,
+                self.z_dim,
+                mu_hidden_dims,
+                mu_act,
+            )
+        print(
+            f"[RMA] context_mode={self.context_mode} "
+            f"use_physics_anchor={self.use_physics_anchor}"
+        )
 
         # -------- actor/critic take [proprio, z] --------
         num_actor_obs = self.proprio_dim + self.z_dim
@@ -178,13 +217,21 @@ class RMAActorCritic(nn.Module):
         return proprio, tail
 
     def mu(self, privileged: torch.Tensor) -> torch.Tensor:
-        """Keep the original mu(priv) API while enforcing clean input separation."""
+        """Compute the selected privileged Teacher context."""
 
         if privileged.shape[-1] != self.priv_dim:
             raise ValueError(f"Expected privileged dim={self.priv_dim}, got {privileged.shape[-1]}")
+        if self.context_mode == "monolithic":
+            return self.context_encoder(privileged)
+
         e_exp = privileged[..., : self.z_exp_dim]
         e_imp = privileged[..., self.z_exp_dim :]
-        z_exp = self.mu_exp(e_exp)
+        if self.context_mode == "split_hard":
+            # Do not clone or transform this slice.  z_s is exactly the normalized
+            # true structural parameter vector seen in the privileged observation.
+            z_exp = e_exp
+        else:
+            z_exp = self.mu_exp(e_exp)
         z_imp = self.mu_imp(e_imp)
         return torch.cat([z_exp, z_imp], dim=-1)
 
@@ -292,7 +339,7 @@ class RMAActorCritic(nn.Module):
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
     def compute_physics_loss(self, obs) -> torch.Tensor:
-        if not self.use_physics_anchor:
+        if not self.use_physics_anchor or self.context_mode != "split_soft":
             device = obs["policy"].device if hasattr(obs, "get") and obs.get("policy") is not None else obs.device
             return torch.zeros((), device=device)
 
@@ -307,22 +354,69 @@ class RMAActorCritic(nn.Module):
         loss = (pred_phys - gt_phys).pow(2).mean()
         return loss
 
+    def context_manifest(self) -> dict[str, Any]:
+        """Return serializable architecture metadata for run/checkpoint audits."""
+
+        return {
+            "context_mode": self.context_mode,
+            "proprio_obs_dim": self.proprio_dim,
+            "privileged_obs_dim": self.priv_dim,
+            "z_dim": self.z_dim,
+            "z_exp_dim": self.z_exp_dim,
+            "z_imp_dim": self.z_imp_dim,
+            "hard_explicit_identity": self.context_mode == "split_hard",
+            "use_physics_anchor": self.use_physics_anchor,
+        }
+
     def load_state_dict(self, state_dict, strict: bool = True):
-        # Allow older checkpoints without probe.*
+        # Allow older checkpoints without probe.*, but never allow a context
+        # architecture to be silently partially loaded.
         allowed_missing = {"probe.weight", "probe.bias"}
+        state_dict = state_dict.copy()
         legacy_mu_keys = [key for key in state_dict if key.startswith("mu.")]
         if legacy_mu_keys:
+            if self.context_mode != "monolithic":
+                raise RuntimeError(
+                    "Checkpoint context mode/architecture mismatch: legacy monolithic "
+                    f"mu.* weights cannot load into {self.context_mode!r}."
+                )
+            for old_key in legacy_mu_keys:
+                new_key = f"context_encoder.{old_key[len('mu.'):]}"
+                state_dict[new_key] = state_dict.pop(old_key)
+
+        has_exp = any(key.startswith("mu_exp.") for key in state_dict)
+        has_imp = any(key.startswith("mu_imp.") for key in state_dict)
+        has_monolithic = any(key.startswith("context_encoder.") for key in state_dict)
+        if self.context_mode == "split_hard" and (has_exp or has_monolithic or not has_imp):
             raise RuntimeError(
-                "Legacy coupled Teacher checkpoint is incompatible with the split "
-                "mu_exp/mu_imp architecture; retrain Phase I."
+                "Checkpoint context mode/architecture mismatch: split_hard expects "
+                "mu_imp.* weights only."
+            )
+        if self.context_mode == "split_soft" and (
+            not has_exp or not has_imp or has_monolithic
+        ):
+            raise RuntimeError(
+                "Checkpoint context mode/architecture mismatch: split_soft expects "
+                "both mu_exp.* and mu_imp.* weights."
+            )
+        if self.context_mode == "monolithic" and (
+            not has_monolithic or has_exp or has_imp
+        ):
+            raise RuntimeError(
+                "Checkpoint context mode/architecture mismatch: monolithic expects "
+                "context_encoder.* weights only."
             )
 
         res = super().load_state_dict(state_dict, strict=False)
         context_missing = [
-            key for key in res.missing_keys if key.startswith(("mu_exp.", "mu_imp."))
+            key
+            for key in res.missing_keys
+            if key.startswith(("mu_exp.", "mu_imp.", "context_encoder."))
         ]
         if context_missing:
-            raise RuntimeError(f"Split Teacher checkpoint is missing context encoder keys: {context_missing}")
+            raise RuntimeError(
+                f"Teacher checkpoint is missing context encoder keys: {context_missing}"
+            )
 
         # If missing keys beyond probe.*, treat as real error
         bad_missing = [k for k in res.missing_keys if k not in allowed_missing]
