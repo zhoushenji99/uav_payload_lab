@@ -653,7 +653,21 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 3. 绳长随机化 & 设置关节目标 (核心修复!)
         if hasattr(self.cfg, "rope_length_range"):
             lo_len, hi_len = self.cfg.rope_length_range
-            L = torch.rand(len(env_ids), device=self.device) * (hi_len - lo_len) + lo_len
+            fixed_rope_length = getattr(
+                self.cfg, "eval_fixed_rope_length_m", None
+            )
+            if fixed_rope_length is None:
+                L = (
+                    torch.rand(len(env_ids), device=self.device)
+                    * (hi_len - lo_len)
+                    + lo_len
+                )
+            else:
+                L = torch.full(
+                    (len(env_ids),),
+                    float(fixed_rope_length),
+                    device=self.device,
+                )
             self._rope_lengths[env_ids] = L
 
             # (A) 设置状态：告诉物理引擎现在绳子有多长
@@ -677,7 +691,19 @@ class UavPayloadMetaEnv(DirectRLEnv):
             env_ids_cpu = env_ids.to("cpu")
             # 假设你已经缓存了 _default_masses_cpu
             masses = self._default_masses_cpu.clone()
-            new_mass = torch.empty((len(env_ids_cpu),), device="cpu").uniform_(float(lo), float(hi))
+            fixed_payload_mass = getattr(
+                self.cfg, "eval_fixed_payload_mass_kg", None
+            )
+            if fixed_payload_mass is None:
+                new_mass = torch.empty(
+                    (len(env_ids_cpu),), device="cpu"
+                ).uniform_(float(lo), float(hi))
+            else:
+                new_mass = torch.full(
+                    (len(env_ids_cpu),),
+                    float(fixed_payload_mass),
+                    device="cpu",
+                )
             masses[env_ids_cpu, self._payload_id] = new_mass
             self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
             # 记录到 buffer
@@ -804,7 +830,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
     # ---------------------------------------------------------------------
 
     def _init_wind_module(self):
-        self._wind_enabled = bool(getattr(self.cfg, "enable_wind", False))
+        self._wind_enabled = bool(
+            getattr(self.cfg, "enable_wind", False)
+            and not getattr(self.cfg, "eval_disable_wind", False)
+        )
 
         # always create buffer to avoid attribute errors
         self._wind_acc_w = torch.zeros(self.num_envs, 3, device=self.device)

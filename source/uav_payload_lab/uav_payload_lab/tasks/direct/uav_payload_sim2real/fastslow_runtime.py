@@ -28,6 +28,48 @@ class MultirateSchedule:
         return asdict(self)
 
 
+def validate_evaluation_overrides(
+    payload_mass_kg: float | None,
+    rope_length_m: float | None,
+    disable_wind: bool,
+    payload_mass_range: tuple[float, float],
+    rope_length_range: tuple[float, float],
+) -> dict[str, float | bool | None]:
+    """Validate fixed evaluation physics without changing training ranges."""
+
+    def _validate_optional(
+        value: float | None,
+        bounds: tuple[float, float],
+        label: str,
+    ) -> float | None:
+        if value is None:
+            return None
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"Fixed {label} must be finite, got {value!r}.")
+        low, high = (float(bounds[0]), float(bounds[1]))
+        if numeric < low or numeric > high:
+            raise ValueError(
+                f"Fixed {label} {numeric} is outside the training range "
+                f"[{low}, {high}]."
+            )
+        return numeric
+
+    return {
+        "payload_mass_kg": _validate_optional(
+            payload_mass_kg,
+            payload_mass_range,
+            "payload mass",
+        ),
+        "rope_length_m": _validate_optional(
+            rope_length_m,
+            rope_length_range,
+            "rope length",
+        ),
+        "disable_wind": bool(disable_wind),
+    }
+
+
 def compute_multirate_schedule(
     history_len: int,
     policy_dt: float,
