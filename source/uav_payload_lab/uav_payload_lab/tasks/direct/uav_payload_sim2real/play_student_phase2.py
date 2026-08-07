@@ -75,6 +75,24 @@ parser.add_argument("--stop_on_done", action="store_true", default=True, help="S
 parser.add_argument("--no_stop_on_done", dest="stop_on_done", action="store_false", help="Do not stop on done; keep running until max_steps.")
 parser.add_argument("--max_steps", type=int, default=2000, help="Max env steps to run (avoid crossing episode boundary).")
 parser.add_argument("--csv", type=str, default="", help="CSV output path. If empty, write into checkpoint folder.")
+parser.add_argument(
+    "--eval_payload_mass_kg",
+    type=float,
+    default=None,
+    help="Evaluation-only fixed payload mass; keeps the training normalization range unchanged.",
+)
+parser.add_argument(
+    "--eval_rope_length_m",
+    type=float,
+    default=None,
+    help="Evaluation-only fixed rope length; keeps the training normalization range unchanged.",
+)
+parser.add_argument(
+    "--eval_disable_wind",
+    action="store_true",
+    default=False,
+    help="Disable mean, gust, and OU wind for this evaluation rollout.",
+)
 
 # standard play args
 parser.add_argument("--task", type=str, default=None)
@@ -113,6 +131,7 @@ from uav_payload_lab.tasks.direct.uav_payload_sim2real.fastslow_runtime import (
     compute_gust_response_latency,
     compute_multirate_schedule,
     summarize_latency_ms,
+    validate_evaluation_overrides,
 )
 
 
@@ -300,6 +319,18 @@ def main(env_cfg, agent_cfg):
     env_cfg.seed = int(agent_cfg.seed)
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
+
+    evaluation_overrides = validate_evaluation_overrides(
+        payload_mass_kg=args_cli.eval_payload_mass_kg,
+        rope_length_m=args_cli.eval_rope_length_m,
+        disable_wind=args_cli.eval_disable_wind,
+        payload_mass_range=tuple(env_cfg.payload_mass_range),
+        rope_length_range=tuple(env_cfg.rope_length_range),
+    )
+    env_cfg.eval_fixed_payload_mass_kg = evaluation_overrides["payload_mass_kg"]
+    env_cfg.eval_fixed_rope_length_m = evaluation_overrides["rope_length_m"]
+    env_cfg.eval_disable_wind = evaluation_overrides["disable_wind"]
+    print(f"[INFO] evaluation_overrides={evaluation_overrides}")
 
     # where to load checkpoint
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
@@ -493,6 +524,7 @@ def main(env_cfg, agent_cfg):
         "slow_inference_ms","fast_inference_ms","full_inference_ms",
         "actor_inference_ms","end_to_end_inference_ms",
         "gust_x_mps2","gust_y_mps2","gust_z_mps2","gust_event",
+        "wind_acc_x_mps2","wind_acc_y_mps2","wind_acc_z_mps2",
         "context_refresh_action_l1","context_refresh_action_l2","context_refresh_action_max",
         "executed_action_delta_l1",
         # actions
@@ -762,6 +794,12 @@ def main(env_cfg, agent_cfg):
                 )
             else:
                 gust_e = np.zeros(3, dtype=float)
+            if hasattr(base_env, "_wind_acc_w"):
+                wind_acc_e = (
+                    base_env._wind_acc_w[e].detach().cpu().numpy().astype(float)
+                )
+            else:
+                wind_acc_e = np.zeros(3, dtype=float)
             gust_event = (
                 previous_trace_gust is not None
                 and float(np.linalg.norm(gust_e - previous_trace_gust))
@@ -813,6 +851,7 @@ def main(env_cfg, agent_cfg):
                 end_to_end_inference_ms,
                 *gust_e.tolist(),
                 int(gust_event),
+                *wind_acc_e.tolist(),
                 context_delta_l1,
                 context_delta_l2,
                 context_delta_max,
@@ -929,6 +968,20 @@ def main(env_cfg, agent_cfg):
         "slow_filter_tau_sec": float(args_cli.slow_filter_tau_sec),
         "slow_filter_alpha": float(slow_filter_alpha),
         "profile_inference": bool(args_cli.profile_inference),
+        "evaluation_overrides": {
+            **evaluation_overrides,
+            "payload_mass_training_range_kg": [
+                float(env_cfg.payload_mass_range[0]),
+                float(env_cfg.payload_mass_range[1]),
+            ],
+            "rope_length_training_range_m": [
+                float(env_cfg.rope_length_range[0]),
+                float(env_cfg.rope_length_range[1]),
+            ],
+            "wind_enabled_effective": bool(
+                getattr(base_env, "_wind_enabled", False)
+            ),
+        },
         "context_call_counts": call_counts,
         "post_startup_slow_call_reduction_fraction": float(
             1.0 - 1.0 / slow_period_steps

@@ -153,6 +153,11 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     use_oracle_mass_obs = True
     payload_mass_range = (0.3, 0.8)   # kg，每个episode随机
+    # Evaluation-only fixed values.  Keep the ranges above unchanged because
+    # they define the hard-explicit mass/rope normalization seen in training.
+    eval_fixed_rope_length_m: float | None = None
+    eval_fixed_payload_mass_kg: float | None = None
+    eval_disable_wind: bool = False
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------

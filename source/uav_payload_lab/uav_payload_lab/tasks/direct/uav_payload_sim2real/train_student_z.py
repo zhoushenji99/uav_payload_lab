@@ -7,16 +7,104 @@ import glob
 import json
 import time
 import argparse
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 
+
+def configure_reproducibility(seed: int):
+    """Configure deterministic random behavior before model construction."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_dataloader_worker(worker_id: int):
+    """Seed Python and NumPy inside every DataLoader worker."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def capture_rng_state():
+    """Capture all global RNG states needed for an exact training resume."""
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy_state[0],
+            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_training_rng(checkpoint, requested_seed: int, train_generator: torch.Generator):
+    """Validate and restore global and DataLoader RNG states from a checkpoint."""
+    required_keys = ("seed", "rng_state", "train_generator_state")
+    missing = [key for key in required_keys if key not in checkpoint]
+    if missing:
+        raise RuntimeError(
+            "Cannot resume a legacy or incomplete checkpoint without reproducibility metadata: "
+            f"missing={missing}. Start a fresh seeded run."
+        )
+    checkpoint_seed = int(checkpoint["seed"])
+    if checkpoint_seed != int(requested_seed):
+        raise RuntimeError(
+            "Resume seed mismatch: "
+            f"requested={requested_seed}, checkpoint={checkpoint_seed}."
+        )
+
+    rng_state = checkpoint["rng_state"]
+    rng_required = ("python", "numpy", "torch_cpu", "torch_cuda")
+    rng_missing = [key for key in rng_required if key not in rng_state]
+    if rng_missing:
+        raise RuntimeError(
+            "Cannot resume a legacy or incomplete checkpoint without complete RNG state: "
+            f"missing={rng_missing}. Start a fresh seeded run."
+        )
+
+    random.setstate(rng_state["python"])
+    numpy_state = rng_state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["bit_generator"],
+            numpy_state["keys"].cpu().numpy(),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
+    torch.set_rng_state(rng_state["torch_cpu"].cpu())
+    cuda_states = rng_state["torch_cuda"]
+    if cuda_states is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
+    train_generator.set_state(checkpoint["train_generator_state"].cpu())
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=str, required=True, help="Folder containing shard_*.pt and meta.pt")
     p.add_argument("--out_dir", type=str, default=".", help="Output directory to save model/report/plots")
+    p.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="Required experiment seed controlling initialization, shuffling, and resume.",
+    )
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--epochs", type=int, default=30)
@@ -107,9 +195,16 @@ def compute_z_stats_from_meta(meta_path: str, z_dim: int):
 
 def main():
     args = parse_args()
+    configure_reproducibility(args.seed)
+    train_generator = torch.Generator(device="cpu")
+    train_generator.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     train_t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(
+        f"[Seed] seed={args.seed} deterministic_algorithms="
+        f"{torch.are_deterministic_algorithms_enabled()}"
+    )
 
     shard_files = sorted(glob.glob(os.path.join(args.data_dir, "shard_*.pt")))
     assert len(shard_files) > 0, f"No shard_*.pt found in {args.data_dir}"
@@ -259,6 +354,12 @@ def main():
         else:
             print("[WARN] optimizer_state_dict not found in resume checkpoint. This is only pseudo-resume.")
 
+        restore_training_rng(
+            ckpt,
+            requested_seed=args.seed,
+            train_generator=train_generator,
+        )
+
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         best_val = float(ckpt.get("best_val", best_val))
         train_hist = list(ckpt.get("train_hist", train_hist))
@@ -289,6 +390,8 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True,
                 persistent_workers=(args.num_workers > 0),
+                worker_init_fn=seed_dataloader_worker,
+                generator=train_generator,
             )
 
             for batch in dl:
@@ -424,6 +527,12 @@ def main():
                     "z_fast_dim": z_fast_dim,
                     "z_mean": z_mean.cpu(),
                     "z_std": z_std.cpu(),
+                    "seed": int(args.seed),
+                    "deterministic_algorithms": bool(
+                        torch.are_deterministic_algorithms_enabled()
+                    ),
+                    "rng_state": capture_rng_state(),
+                    "train_generator_state": train_generator.get_state(),
                 },
                 save_path,
             )
@@ -447,6 +556,12 @@ def main():
                 "z_fast_dim": z_fast_dim,
                 "z_mean": z_mean.cpu(),
                 "z_std": z_std.cpu(),
+                "seed": int(args.seed),
+                "deterministic_algorithms": bool(
+                    torch.are_deterministic_algorithms_enabled()
+                ),
+                "rng_state": capture_rng_state(),
+                "train_generator_state": train_generator.get_state(),
             },
             last_path,
         )
@@ -489,6 +604,10 @@ def main():
         "has_labels_ml": has_ml,
         "resume": bool(args.resume),
         "resume_path": args.resume_path,
+        "seed": int(args.seed),
+        "deterministic_algorithms": bool(
+            torch.are_deterministic_algorithms_enabled()
+        ),
     }
     report_path = os.path.join(args.out_dir, "report.json")
     with open(report_path, "w") as f:
