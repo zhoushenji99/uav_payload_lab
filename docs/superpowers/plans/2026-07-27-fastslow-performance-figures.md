@@ -222,4 +222,3 @@ python3 -m pytest -q tests/test_fastslow_performance_figures.py tests/test_stude
 ```
 
 Expected: all focused tests PASS with no failures.
-

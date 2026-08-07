@@ -63,4 +63,3 @@ gust inputs are exactly equal.
 - Do not use a duplicated Teacher curve to manufacture four methods.
 - State directly in titles/captions that Teacher is an unpaired reference.
 - Preserve raw findings even if Fast/slow and All-60 Hz overlap almost exactly.
-
