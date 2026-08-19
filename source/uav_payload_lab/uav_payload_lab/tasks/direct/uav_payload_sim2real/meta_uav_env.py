@@ -837,6 +837,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # always create buffer to avoid attribute errors
         self._wind_acc_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._eval_wind_elapsed_s = torch.zeros(self.num_envs, device=self.device)
 
         if not self._wind_enabled:
             return
@@ -856,6 +857,54 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._wind_ou_sigma = float(getattr(self.cfg, "wind_ou_sigma", 1.0))
         self._wind_scale_uav = float(getattr(self.cfg, "wind_scale_uav", 0.4))
         self._wind_scale_payload = float(getattr(self.cfg, "wind_scale_payload", 1.0))
+        self._eval_wind_scale = float(getattr(self.cfg, "eval_wind_scale", 1.0))
+        if not math.isfinite(self._eval_wind_scale) or self._eval_wind_scale < 0.0:
+            raise ValueError(
+                "eval_wind_scale must be finite and non-negative, got "
+                f"{self._eval_wind_scale!r}."
+            )
+        self._eval_wind_mode = str(
+            getattr(self.cfg, "eval_wind_mode", "training")
+        ).strip().lower()
+        if self._eval_wind_mode not in {"training", "sinusoid"}:
+            raise ValueError(
+                "eval_wind_mode must be 'training' or 'sinusoid', got "
+                f"{self._eval_wind_mode!r}."
+            )
+        self._eval_wind_amplitude_mps2 = float(
+            getattr(self.cfg, "eval_wind_amplitude_mps2", 1.0)
+        )
+        self._eval_wind_frequency_hz = float(
+            getattr(self.cfg, "eval_wind_frequency_hz", 1.0)
+        )
+        self._eval_wind_start_sec = float(
+            getattr(self.cfg, "eval_wind_start_sec", 3.0)
+        )
+        self._eval_wind_axis = str(
+            getattr(self.cfg, "eval_wind_axis", "x")
+        ).strip().lower()
+        self._eval_wind_phase_rad = float(
+            getattr(self.cfg, "eval_wind_phase_rad", 0.0)
+        )
+        if (
+            not math.isfinite(self._eval_wind_amplitude_mps2)
+            or self._eval_wind_amplitude_mps2 < 0.0
+        ):
+            raise ValueError("eval_wind_amplitude_mps2 must be finite and non-negative.")
+        if (
+            not math.isfinite(self._eval_wind_frequency_hz)
+            or self._eval_wind_frequency_hz <= 0.0
+        ):
+            raise ValueError("eval_wind_frequency_hz must be finite and positive.")
+        if (
+            not math.isfinite(self._eval_wind_start_sec)
+            or self._eval_wind_start_sec < 0.0
+        ):
+            raise ValueError("eval_wind_start_sec must be finite and non-negative.")
+        if self._eval_wind_axis not in {"x", "y"}:
+            raise ValueError("eval_wind_axis must be 'x' or 'y'.")
+        if not math.isfinite(self._eval_wind_phase_rad):
+            raise ValueError("eval_wind_phase_rad must be finite.")
 
         # body ids for external wrench application
         self._uav_body_idx = int(self._body_id[0])
@@ -897,6 +946,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._wind_ou[env_ids] = 0.0
         self._wind_acc_w[env_ids] = 0.0
         self._wind_t[env_ids] = 0.0
+        self._eval_wind_elapsed_s[env_ids] = 0.0
 
         dt_next = self._wind_gust_dt_min + (self._wind_gust_dt_max - self._wind_gust_dt_min) * torch.rand(m, device=dev)
         self._wind_t_next[env_ids] = dt_next
@@ -908,6 +958,24 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         dev = self.device
         n = self.num_envs
+        self._eval_wind_elapsed_s += dt
+
+        if getattr(self, "_eval_wind_mode", "training") == "sinusoid":
+            elapsed = self._eval_wind_elapsed_s
+            active = elapsed >= self._eval_wind_start_sec
+            phase = (
+                2.0
+                * math.pi
+                * self._eval_wind_frequency_hz
+                * (elapsed - self._eval_wind_start_sec)
+                + self._eval_wind_phase_rad
+            )
+            value = self._eval_wind_amplitude_mps2 * torch.sin(phase)
+            value = torch.where(active, value, torch.zeros_like(value))
+            self._wind_acc_w.zero_()
+            axis_index = 0 if self._eval_wind_axis == "x" else 1
+            self._wind_acc_w[:, axis_index] = value * self._eval_wind_scale
+            return
 
         # gust: piecewise constant
         self._wind_t += dt
@@ -950,7 +1018,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         if self._wind_axis == "xy":
             a_w[:, 2] = 0.0
 
-        self._wind_acc_w = a_w
+        # Evaluation-only physical scaling is deliberately applied after the
+        # training-range clamp.  The observation normalization still divides
+        # by cfg.wind_total_accel_max, making scale > 1 a genuine OOD input.
+        self._wind_acc_w = a_w * self._eval_wind_scale
 
     # ---------------- Quaternion helpers (wxyz) ----------------
     @staticmethod

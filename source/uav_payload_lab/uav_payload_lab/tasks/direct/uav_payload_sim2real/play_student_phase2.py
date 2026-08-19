@@ -93,6 +93,28 @@ parser.add_argument(
     default=False,
     help="Disable mean, gust, and OU wind for this evaluation rollout.",
 )
+parser.add_argument(
+    "--eval_wind_scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Evaluation-only multiplier applied to the physical wind after the "
+        "training-range clamp. Values above 1 are physical OOD while the "
+        "Teacher normalization denominator remains unchanged."
+    ),
+)
+parser.add_argument(
+    "--eval_wind_mode",
+    type=str,
+    default="training",
+    choices=["training", "sinusoid"],
+    help="Use the original stochastic training wind or a deterministic evaluation sinusoid.",
+)
+parser.add_argument("--eval_wind_amplitude_mps2", type=float, default=1.0)
+parser.add_argument("--eval_wind_frequency_hz", type=float, default=1.0)
+parser.add_argument("--eval_wind_start_sec", type=float, default=3.0)
+parser.add_argument("--eval_wind_axis", type=str, default="x", choices=["x", "y"])
+parser.add_argument("--eval_wind_phase_rad", type=float, default=0.0)
 
 # standard play args
 parser.add_argument("--task", type=str, default=None)
@@ -324,12 +346,26 @@ def main(env_cfg, agent_cfg):
         payload_mass_kg=args_cli.eval_payload_mass_kg,
         rope_length_m=args_cli.eval_rope_length_m,
         disable_wind=args_cli.eval_disable_wind,
+        wind_scale=args_cli.eval_wind_scale,
+        wind_mode=args_cli.eval_wind_mode,
+        wind_amplitude_mps2=args_cli.eval_wind_amplitude_mps2,
+        wind_frequency_hz=args_cli.eval_wind_frequency_hz,
+        wind_start_sec=args_cli.eval_wind_start_sec,
+        wind_axis=args_cli.eval_wind_axis,
+        wind_phase_rad=args_cli.eval_wind_phase_rad,
         payload_mass_range=tuple(env_cfg.payload_mass_range),
         rope_length_range=tuple(env_cfg.rope_length_range),
     )
     env_cfg.eval_fixed_payload_mass_kg = evaluation_overrides["payload_mass_kg"]
     env_cfg.eval_fixed_rope_length_m = evaluation_overrides["rope_length_m"]
     env_cfg.eval_disable_wind = evaluation_overrides["disable_wind"]
+    env_cfg.eval_wind_scale = evaluation_overrides["wind_scale"]
+    env_cfg.eval_wind_mode = evaluation_overrides["wind_mode"]
+    env_cfg.eval_wind_amplitude_mps2 = evaluation_overrides["wind_amplitude_mps2"]
+    env_cfg.eval_wind_frequency_hz = evaluation_overrides["wind_frequency_hz"]
+    env_cfg.eval_wind_start_sec = evaluation_overrides["wind_start_sec"]
+    env_cfg.eval_wind_axis = evaluation_overrides["wind_axis"]
+    env_cfg.eval_wind_phase_rad = evaluation_overrides["wind_phase_rad"]
     print(f"[INFO] evaluation_overrides={evaluation_overrides}")
 
     # where to load checkpoint

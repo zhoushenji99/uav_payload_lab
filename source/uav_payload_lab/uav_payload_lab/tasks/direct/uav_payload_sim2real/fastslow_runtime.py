@@ -32,9 +32,16 @@ def validate_evaluation_overrides(
     payload_mass_kg: float | None,
     rope_length_m: float | None,
     disable_wind: bool,
+    wind_scale: float,
+    wind_mode: str,
+    wind_amplitude_mps2: float,
+    wind_frequency_hz: float,
+    wind_start_sec: float,
+    wind_axis: str,
+    wind_phase_rad: float,
     payload_mass_range: tuple[float, float],
     rope_length_range: tuple[float, float],
-) -> dict[str, float | bool | None]:
+) -> dict[str, float | bool | str | None]:
     """Validate fixed evaluation physics without changing training ranges."""
 
     def _validate_optional(
@@ -55,6 +62,54 @@ def validate_evaluation_overrides(
             )
         return numeric
 
+    numeric_wind_scale = float(wind_scale)
+    if not math.isfinite(numeric_wind_scale) or numeric_wind_scale < 0.0:
+        raise ValueError(
+            f"Evaluation wind scale must be finite and non-negative, got {wind_scale!r}."
+        )
+
+    normalized_wind_mode = str(wind_mode).strip().lower()
+    if normalized_wind_mode not in {"training", "sinusoid"}:
+        raise ValueError(
+            "Evaluation wind mode must be 'training' or 'sinusoid', got "
+            f"{wind_mode!r}."
+        )
+
+    numeric_amplitude = float(wind_amplitude_mps2)
+    if not math.isfinite(numeric_amplitude) or numeric_amplitude < 0.0:
+        raise ValueError(
+            "Evaluation wind amplitude must be finite and non-negative, got "
+            f"{wind_amplitude_mps2!r}."
+        )
+
+    numeric_frequency = float(wind_frequency_hz)
+    minimum_frequency = 0.0 if normalized_wind_mode == "training" else 1e-12
+    if not math.isfinite(numeric_frequency) or numeric_frequency < minimum_frequency:
+        relation = "non-negative" if normalized_wind_mode == "training" else "positive"
+        raise ValueError(
+            f"Evaluation wind frequency must be finite and {relation}, got "
+            f"{wind_frequency_hz!r}."
+        )
+
+    numeric_start_sec = float(wind_start_sec)
+    if not math.isfinite(numeric_start_sec) or numeric_start_sec < 0.0:
+        raise ValueError(
+            "Evaluation wind start time must be finite and non-negative, got "
+            f"{wind_start_sec!r}."
+        )
+
+    normalized_wind_axis = str(wind_axis).strip().lower()
+    if normalized_wind_axis not in {"x", "y"}:
+        raise ValueError(
+            f"Evaluation wind axis must be 'x' or 'y', got {wind_axis!r}."
+        )
+
+    numeric_phase_rad = float(wind_phase_rad)
+    if not math.isfinite(numeric_phase_rad):
+        raise ValueError(
+            f"Evaluation wind phase must be finite, got {wind_phase_rad!r}."
+        )
+
     return {
         "payload_mass_kg": _validate_optional(
             payload_mass_kg,
@@ -67,6 +122,13 @@ def validate_evaluation_overrides(
             "rope length",
         ),
         "disable_wind": bool(disable_wind),
+        "wind_scale": numeric_wind_scale,
+        "wind_mode": normalized_wind_mode,
+        "wind_amplitude_mps2": numeric_amplitude,
+        "wind_frequency_hz": numeric_frequency,
+        "wind_start_sec": numeric_start_sec,
+        "wind_axis": normalized_wind_axis,
+        "wind_phase_rad": numeric_phase_rad,
     }
 
 

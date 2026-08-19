@@ -158,6 +158,18 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     eval_fixed_rope_length_m: float | None = None
     eval_fixed_payload_mass_kg: float | None = None
     eval_disable_wind: bool = False
+    # Applied to the physical wind after the training-range clamp.  Keeping
+    # wind_total_accel_max unchanged preserves the Teacher normalization used
+    # during training, so values above 1.0 are genuine physical OOD tests.
+    eval_wind_scale: float = 1.0
+    # Deterministic evaluation waveform. "training" preserves the original
+    # mean + piecewise gust + OU process exactly.
+    eval_wind_mode: str = "training"
+    eval_wind_amplitude_mps2: float = 1.0
+    eval_wind_frequency_hz: float = 1.0
+    eval_wind_start_sec: float = 3.0
+    eval_wind_axis: str = "x"
+    eval_wind_phase_rad: float = 0.0
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
