@@ -153,6 +153,23 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     use_oracle_mass_obs = True
     payload_mass_range = (0.3, 0.8)   # kg，每个episode随机
+    # Evaluation-only fixed values.  Keep the ranges above unchanged because
+    # they define the hard-explicit mass/rope normalization seen in training.
+    eval_fixed_rope_length_m: float | None = None
+    eval_fixed_payload_mass_kg: float | None = None
+    eval_disable_wind: bool = False
+    # Applied to the physical wind after the training-range clamp.  Keeping
+    # wind_total_accel_max unchanged preserves the Teacher normalization used
+    # during training, so values above 1.0 are genuine physical OOD tests.
+    eval_wind_scale: float = 1.0
+    # Deterministic evaluation waveform. "training" preserves the original
+    # mean + piecewise gust + OU process exactly.
+    eval_wind_mode: str = "training"
+    eval_wind_amplitude_mps2: float = 1.0
+    eval_wind_frequency_hz: float = 1.0
+    eval_wind_start_sec: float = 3.0
+    eval_wind_axis: str = "x"
+    eval_wind_phase_rad: float = 0.0
     recompute_inertia = True         # 质量大改动时建议同步缩放惯量
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
@@ -223,17 +240,22 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     rma_z_dim = 5                 # z_t dim (这里先设为5，匹配你的“mlw5->z”)
     rma_z_exp_dim = 2             # z前2维当 z_exp（对应慢变量）
     rma_use_mu = True             # Phase1: True; Phase2部署/评估: False
-    rma_use_physics_anchor = True
-    rma_phys_anchor_coef = 1.0
-    #split + physics anchor 版
+    # Proposed Teacher: exact normalized [mass, rope length] identity path plus
+    # an independent learned wind/residual branch.
+    rma_context_mode = "split_hard"
+    rma_use_physics_anchor = False
+    rma_phys_anchor_coef = 0.0
+    # split_soft + physics anchor ablation
     # rma_use_mu = True
+    # rma_context_mode = "split_soft"
     # rma_z_exp_dim = 2
     # rma_use_physics_anchor = True
     # rma_phys_anchor_coef = 1.0
 
-    # #black-box RMA 版 coupled版
+    # black-box / monolithic RMA ablation
     # rma_use_mu = True
-    # rma_z_exp_dim = 2   # 或 0，都行；见下文
+    # rma_context_mode = "monolithic"
+    # rma_z_exp_dim = 2   # retained only for logging the first/last dimensions
     # rma_use_physics_anchor = False
     # rma_phys_anchor_coef = 0.0
 

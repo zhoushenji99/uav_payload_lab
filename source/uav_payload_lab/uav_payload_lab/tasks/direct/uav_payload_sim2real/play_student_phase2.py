@@ -18,9 +18,9 @@ import csv
 import time
 import math
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from isaaclab.app import AppLauncher
@@ -42,13 +42,79 @@ parser = argparse.ArgumentParser(description="Phase-2 Play: Teacher(mu(priv)) vs
 parser.add_argument("--mode", type=str, default="student", choices=["student", "teacher"])
 parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
 parser.add_argument("--history_len", type=int, default=50)
-parser.add_argument("--slow_warmup_sec", type=float, default=1.0, help="Run the slow encoder at policy rate during startup.")
+parser.add_argument("--slow_warmup_sec", type=float, default=3.0, help="Run the slow encoder at policy rate during startup.")
 parser.add_argument("--slow_update_hz", type=float, default=1.0, help="Slow encoder rate after startup.")
+parser.add_argument("--fast_update_hz", type=float, default=60.0, help="Fast encoder update rate.")
+parser.add_argument(
+    "--slow_filter_tau_sec",
+    type=float,
+    default=0.25,
+    help="Post-startup causal slow-context filter time constant; 0 disables filtering.",
+)
+parser.add_argument(
+    "--context_runtime_mode",
+    type=str,
+    default="fast_slow",
+    choices=["fast_slow", "all_60hz"],
+    help="Proposed fast/slow schedule or a future all-branches-at-policy-rate ablation.",
+)
+parser.add_argument(
+    "--rma_context_mode",
+    type=str,
+    default=None,
+    choices=["split_hard", "split_soft", "monolithic"],
+    help="Teacher checkpoint architecture. Defaults to the task configuration.",
+)
+parser.add_argument("--profile_inference", action="store_true", default=True)
+parser.add_argument("--no_profile_inference", dest="profile_inference", action="store_false")
+parser.add_argument("--gust_event_threshold", type=float, default=0.05)
+parser.add_argument("--fast_response_threshold", type=float, default=0.05)
+parser.add_argument("--gust_response_window_sec", type=float, default=0.5)
 parser.add_argument("--trace_env", type=int, default=0, help="Which env index to log to CSV.")
 parser.add_argument("--stop_on_done", action="store_true", default=True, help="Stop when trace_env episode ends (default: True).")
 parser.add_argument("--no_stop_on_done", dest="stop_on_done", action="store_false", help="Do not stop on done; keep running until max_steps.")
 parser.add_argument("--max_steps", type=int, default=2000, help="Max env steps to run (avoid crossing episode boundary).")
 parser.add_argument("--csv", type=str, default="", help="CSV output path. If empty, write into checkpoint folder.")
+parser.add_argument(
+    "--eval_payload_mass_kg",
+    type=float,
+    default=None,
+    help="Evaluation-only fixed payload mass; keeps the training normalization range unchanged.",
+)
+parser.add_argument(
+    "--eval_rope_length_m",
+    type=float,
+    default=None,
+    help="Evaluation-only fixed rope length; keeps the training normalization range unchanged.",
+)
+parser.add_argument(
+    "--eval_disable_wind",
+    action="store_true",
+    default=False,
+    help="Disable mean, gust, and OU wind for this evaluation rollout.",
+)
+parser.add_argument(
+    "--eval_wind_scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Evaluation-only multiplier applied to the physical wind after the "
+        "training-range clamp. Values above 1 are physical OOD while the "
+        "Teacher normalization denominator remains unchanged."
+    ),
+)
+parser.add_argument(
+    "--eval_wind_mode",
+    type=str,
+    default="training",
+    choices=["training", "sinusoid"],
+    help="Use the original stochastic training wind or a deterministic evaluation sinusoid.",
+)
+parser.add_argument("--eval_wind_amplitude_mps2", type=float, default=1.0)
+parser.add_argument("--eval_wind_frequency_hz", type=float, default=1.0)
+parser.add_argument("--eval_wind_start_sec", type=float, default=3.0)
+parser.add_argument("--eval_wind_axis", type=str, default="x", choices=["x", "y"])
+parser.add_argument("--eval_wind_phase_rad", type=float, default=0.0)
 
 # standard play args
 parser.add_argument("--task", type=str, default=None)
@@ -80,6 +146,15 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 import isaaclab_tasks  # noqa: F401
 import uav_payload_lab.tasks  # noqa: F401
+from uav_payload_lab.tasks.direct.uav_payload_sim2real.fastslow_runtime import (
+    causal_ema_alpha,
+    compute_action_band_energy,
+    compute_action_total_variation,
+    compute_gust_response_latency,
+    compute_multirate_schedule,
+    summarize_latency_ms,
+    validate_evaluation_overrides,
+)
 
 
 # ----------------------------
@@ -136,18 +211,40 @@ def _safe_load_model_only(runner: OnPolicyRunner, ckpt_path: str):
         runner.alg.policy.critic_obs_normalizer.load_state_dict(ckpt["critic_obs_normalizer_state_dict"])
 
 
+def _build_rma_runner_cfg(agent_cfg, env_cfg):
+    runner_cfg = agent_cfg.to_dict()
+    fields = (
+        "proprio_obs_dim",
+        "privileged_obs_dim",
+        "rma_z_dim",
+        "rma_z_exp_dim",
+        "rma_use_mu",
+        "rma_context_mode",
+        "rma_use_physics_anchor",
+        "rma_mu_hidden_dims",
+        "rma_activation",
+    )
+    if all(hasattr(env_cfg, field) for field in fields):
+        runner_cfg["policy"].update(
+            {
+                "proprio_obs_dim": int(env_cfg.proprio_obs_dim),
+                "privileged_obs_dim": int(env_cfg.privileged_obs_dim),
+                "z_dim": int(env_cfg.rma_z_dim),
+                "z_exp_dim": int(env_cfg.rma_z_exp_dim),
+                "use_mu": bool(env_cfg.rma_use_mu),
+                "context_mode": str(env_cfg.rma_context_mode),
+                "use_physics_anchor": bool(env_cfg.rma_use_physics_anchor),
+                "mu_hidden_dims": list(env_cfg.rma_mu_hidden_dims),
+                "mu_activation": env_cfg.rma_activation,
+            }
+        )
+    return runner_cfg
+
+
 def _default_csv_path(resume_path: str, mode: str) -> str:
     run_dir = os.path.dirname(resume_path)
     name = "phase2_teacher.csv" if mode == "teacher" else "phase2_student.csv"
     return os.path.join(run_dir, name)
-
-
-def _compute_slow_schedule(history_len, policy_dt, slow_warmup_sec, slow_update_hz):
-    if history_len <= 0 or policy_dt <= 0.0 or slow_update_hz <= 0.0 or slow_warmup_sec < 0.0:
-        raise ValueError("Invalid fast/slow schedule parameters.")
-    warmup_steps = max(history_len, int(math.ceil(slow_warmup_sec / policy_dt)))
-    period_steps = max(1, int(round(1.0 / (slow_update_hz * policy_dt))))
-    return warmup_steps, period_steps
 
 
 def _slow_update_mask(episode_steps, warmup_steps, period_steps):
@@ -156,6 +253,25 @@ def _slow_update_mask(episode_steps, warmup_steps, period_steps):
         (episode_steps - warmup_steps) % period_steps == 0
     )
     return warmup_mask | periodic_mask
+
+
+def _periodic_update_mask(episode_steps, period_steps):
+    return (episode_steps % int(period_steps)) == 0
+
+
+def _synchronize(device):
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _timed_call(function, device, enabled):
+    if not enabled:
+        return function(), 0.0
+    _synchronize(device)
+    start = time.perf_counter()
+    result = function()
+    _synchronize(device)
+    return result, (time.perf_counter() - start) * 1000.0
 
 
 # ----------------------------
@@ -198,10 +314,24 @@ class FastSlowStudentEncoder(nn.Module):
         return self.encode_slow(x), self.encode_fast(x)
 
 
+class MonolithicStudentEncoder(nn.Module):
+    def __init__(self, input_dim=21, history_len=50, z_dim=5):
+        super().__init__()
+        self.encoder = CNNContextEncoder(input_dim, history_len, z_dim)
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg, agent_cfg):
     # ---- cfg wiring (mirror official play.py + collect_z_dataset.py) ----
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    if args_cli.rma_context_mode is not None:
+        env_cfg.rma_context_mode = str(args_cli.rma_context_mode)
+    if str(getattr(env_cfg, "rma_context_mode", "split_hard")) != "split_soft":
+        env_cfg.rma_use_physics_anchor = False
+        env_cfg.rma_phys_anchor_coef = 0.0
 
     if args_cli.seed is not None:
         agent_cfg.seed = int(args_cli.seed)
@@ -211,6 +341,32 @@ def main(env_cfg, agent_cfg):
     env_cfg.seed = int(agent_cfg.seed)
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
+
+    evaluation_overrides = validate_evaluation_overrides(
+        payload_mass_kg=args_cli.eval_payload_mass_kg,
+        rope_length_m=args_cli.eval_rope_length_m,
+        disable_wind=args_cli.eval_disable_wind,
+        wind_scale=args_cli.eval_wind_scale,
+        wind_mode=args_cli.eval_wind_mode,
+        wind_amplitude_mps2=args_cli.eval_wind_amplitude_mps2,
+        wind_frequency_hz=args_cli.eval_wind_frequency_hz,
+        wind_start_sec=args_cli.eval_wind_start_sec,
+        wind_axis=args_cli.eval_wind_axis,
+        wind_phase_rad=args_cli.eval_wind_phase_rad,
+        payload_mass_range=tuple(env_cfg.payload_mass_range),
+        rope_length_range=tuple(env_cfg.rope_length_range),
+    )
+    env_cfg.eval_fixed_payload_mass_kg = evaluation_overrides["payload_mass_kg"]
+    env_cfg.eval_fixed_rope_length_m = evaluation_overrides["rope_length_m"]
+    env_cfg.eval_disable_wind = evaluation_overrides["disable_wind"]
+    env_cfg.eval_wind_scale = evaluation_overrides["wind_scale"]
+    env_cfg.eval_wind_mode = evaluation_overrides["wind_mode"]
+    env_cfg.eval_wind_amplitude_mps2 = evaluation_overrides["wind_amplitude_mps2"]
+    env_cfg.eval_wind_frequency_hz = evaluation_overrides["wind_frequency_hz"]
+    env_cfg.eval_wind_start_sec = evaluation_overrides["wind_start_sec"]
+    env_cfg.eval_wind_axis = evaluation_overrides["wind_axis"]
+    env_cfg.eval_wind_phase_rad = evaluation_overrides["wind_phase_rad"]
+    print(f"[INFO] evaluation_overrides={evaluation_overrides}")
 
     # where to load checkpoint
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
@@ -233,7 +389,8 @@ def main(env_cfg, agent_cfg):
     # if hasattr(base_env, "episode_length_buf"):
     #     base_env.episode_length_buf[:] = 0
     # ---- runner + policy ----
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    runner_cfg = _build_rma_runner_cfg(agent_cfg, env_cfg)
+    runner = OnPolicyRunner(env, runner_cfg, log_dir=None, device=agent_cfg.device)
     print(f"[INFO] Loading checkpoint (model-only): {resume_path}")
     _safe_load_model_only(runner, resume_path)
 
@@ -251,6 +408,8 @@ def main(env_cfg, agent_cfg):
     student_z_dim = 5
     student_z_slow_dim = 2
     student_z_fast_dim = 3
+    student_context_mode = "split"
+    student_teacher_context_mode = None
 
     if args_cli.mode == "student":
         if not args_cli.encoder:
@@ -258,10 +417,38 @@ def main(env_cfg, agent_cfg):
 
         enc_ckpt = torch.load(args_cli.encoder, map_location=env.device)
 
-        if not isinstance(enc_ckpt, dict) or enc_ckpt.get("model_type") != "fast_slow_context":
-            raise RuntimeError("Student checkpoint is not a fast/slow context checkpoint.")
+        if not isinstance(enc_ckpt, dict) or enc_ckpt.get("model_type") not in {
+            "fast_slow_context",
+            "monolithic_context",
+        }:
+            raise RuntimeError(
+                "Student checkpoint must be fast_slow_context or monolithic_context."
+            )
         if "state_dict" not in enc_ckpt:
-            raise RuntimeError("Fast/slow student checkpoint is missing state_dict.")
+            raise RuntimeError("Student checkpoint is missing state_dict.")
+        student_context_mode = (
+            "split"
+            if enc_ckpt.get("model_type") == "fast_slow_context"
+            else "monolithic"
+        )
+        student_teacher_context_mode = enc_ckpt.get("teacher_context_mode")
+        policy_context_mode = str(getattr(policy_nn, "context_mode", "unknown"))
+        if policy_context_mode == "split_hard" and str(
+            student_teacher_context_mode
+        ) != "split_hard":
+            raise RuntimeError(
+                "Hard-explicit Teacher requires a Student checkpoint with explicit "
+                "teacher_context_mode='split_hard' lineage. Retrain the Student from "
+                "the new audited hard-explicit dataset."
+            )
+        if student_teacher_context_mode not in (None, "unknown") and str(
+            student_teacher_context_mode
+        ) != policy_context_mode:
+            raise RuntimeError(
+                "Student/Teacher architecture lineage mismatch: "
+                f"student was trained from {student_teacher_context_mode!r}, "
+                f"loaded Teacher policy is {policy_context_mode!r}."
+            )
         enc_state_dict = enc_ckpt["state_dict"]
         student_history_len = int(enc_ckpt.get("history_len", student_history_len))
         student_input_dim = int(enc_ckpt.get("input_dim", student_input_dim))
@@ -284,22 +471,29 @@ def main(env_cfg, agent_cfg):
                 f"teacher=({policy_nn.z_exp_dim},{policy_nn.z_imp_dim})."
             )
 
-        encoder = FastSlowStudentEncoder(
-            input_dim=student_input_dim,
-            history_len=student_history_len,
-            z_slow_dim=student_z_slow_dim,
-            z_fast_dim=student_z_fast_dim,
-        ).to(env.device)
+        if student_context_mode == "split":
+            encoder = FastSlowStudentEncoder(
+                input_dim=student_input_dim,
+                history_len=student_history_len,
+                z_slow_dim=student_z_slow_dim,
+                z_fast_dim=student_z_fast_dim,
+            ).to(env.device)
+        else:
+            encoder = MonolithicStudentEncoder(
+                input_dim=student_input_dim,
+                history_len=student_history_len,
+                z_dim=student_z_dim,
+            ).to(env.device)
 
         encoder.load_state_dict(enc_state_dict, strict=True)
         encoder.eval()
         print(
             f"[INFO] Loaded student encoder: {args_cli.encoder} | "
+            f"context_mode={student_context_mode} "
             f"input_dim={student_input_dim} history_len={student_history_len} "
             f"z_slow_dim={student_z_slow_dim} z_fast_dim={student_z_fast_dim}"
         )
 
-    # ---- buffers ----
     # ---- buffers ----
     history_len = student_history_len if args_cli.mode == "student" else int(args_cli.history_len)
     proprio_dim = 21
@@ -312,13 +506,21 @@ def main(env_cfg, agent_cfg):
     obs_history = torch.zeros((env.num_envs, history_len, proprio_dim), device=env.device)
     last_actions = torch.zeros((env.num_envs, action_dim), device=env.device)  # 只用于日志/重置，不参与feat
     episode_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    z_slow_raw = torch.zeros((env.num_envs, student_z_slow_dim), device=env.device)
+    z_slow_target = torch.zeros((env.num_envs, student_z_slow_dim), device=env.device)
     z_slow_cache = torch.zeros((env.num_envs, student_z_slow_dim), device=env.device)
-    slow_warmup_steps, slow_period_steps = _compute_slow_schedule(
-        history_len,
-        dt,
-        float(args_cli.slow_warmup_sec),
-        float(args_cli.slow_update_hz),
+    z_fast_cache = torch.zeros((env.num_envs, student_z_fast_dim), device=env.device)
+    schedule = compute_multirate_schedule(
+        history_len=history_len,
+        policy_dt=dt,
+        slow_warmup_sec=float(args_cli.slow_warmup_sec),
+        slow_update_hz=float(args_cli.slow_update_hz),
+        fast_update_hz=float(args_cli.fast_update_hz),
     )
+    slow_warmup_steps = schedule.slow_warmup_steps
+    slow_period_steps = schedule.slow_period_steps
+    fast_period_steps = schedule.fast_period_steps
+    slow_filter_alpha = causal_ema_alpha(dt, float(args_cli.slow_filter_tau_sec))
 
     trace_env = int(args_cli.trace_env)
     if trace_env < 0 or trace_env >= env.num_envs:
@@ -348,7 +550,19 @@ def main(env_cfg, agent_cfg):
         "zT0","zT1","zT2","zT3","zT4",
         "zH0","zH1","zH2","zH3","zH4",
         "z_rmse",
-        "slow_updated","episode_step",
+        # slow context audit: raw CNN output, held filter target, Actor-visible cache
+        "z_slow_raw0","z_slow_raw1",
+        "z_slow_target0","z_slow_target1",
+        "z_slow_cache0","z_slow_cache1",
+        "slow_updated","fast_updated","full_updated","episode_step",
+        "slow_batch_calls","fast_batch_calls","full_batch_calls",
+        "slow_env_samples","fast_env_samples","full_env_samples",
+        "slow_inference_ms","fast_inference_ms","full_inference_ms",
+        "actor_inference_ms","end_to_end_inference_ms",
+        "gust_x_mps2","gust_y_mps2","gust_z_mps2","gust_event",
+        "wind_acc_x_mps2","wind_acc_y_mps2","wind_acc_z_mps2",
+        "context_refresh_action_l1","context_refresh_action_l2","context_refresh_action_max",
+        "executed_action_delta_l1",
         # actions
         "a0_raw","a1_raw","a2_raw","a3_raw",
         "a0_clamp","a1_clamp","a2_clamp","a3_clamp",
@@ -360,13 +574,32 @@ def main(env_cfg, agent_cfg):
 
     print(f"[INFO] mode={args_cli.mode} num_envs={env.num_envs} max_steps={args_cli.max_steps} stop_on_done={args_cli.stop_on_done}")
     print(
-        f"[INFO] policy_hz={1.0 / dt:.1f} fast_hz={1.0 / dt:.1f} "
-        f"slow_warmup_steps={slow_warmup_steps} slow_period_steps={slow_period_steps}"
+        f"[INFO] policy_hz={schedule.policy_hz:.1f} fast_hz={schedule.fast_update_hz:.1f} "
+        f"slow_warmup_steps={slow_warmup_steps} slow_period_steps={slow_period_steps} "
+        f"slow_filter_tau={args_cli.slow_filter_tau_sec:.3f}s alpha={slow_filter_alpha:.8f} "
+        f"runtime_mode={args_cli.context_runtime_mode}"
     )
     print(f"[INFO] CSV -> {csv_path}")
 
     step_count = 0
     t0 = time.time()
+    call_counts = {
+        "slow_batch_calls": 0,
+        "fast_batch_calls": 0,
+        "full_batch_calls": 0,
+        "slow_env_samples": 0,
+        "fast_env_samples": 0,
+        "full_env_samples": 0,
+    }
+    latency_samples = {"slow": [], "fast": [], "full": [], "actor": [], "end_to_end": []}
+    trace_actions = []
+    trace_gust = []
+    trace_z_fast = []
+    context_refresh_action_l1 = []
+    context_refresh_action_l2 = []
+    context_refresh_action_max = []
+    previous_trace_action = None
+    previous_trace_gust = None
 
     # ----------------------------
     # Main rollout loop (single-step, aligned logging)
@@ -392,29 +625,106 @@ def main(env_cfg, agent_cfg):
             else:
                 z_teacher = priv  # fallback (shouldn't happen if RMAActorCritic is used)
 
+            slow_update_mask = torch.zeros(
+                env.num_envs, dtype=torch.bool, device=env.device
+            )
+            fast_update_mask = torch.zeros_like(slow_update_mask)
+            full_update_mask = torch.zeros_like(slow_update_mask)
+            slow_inference_ms = 0.0
+            fast_inference_ms = 0.0
+            full_inference_ms = 0.0
+            context_delta_l1 = 0.0
+            context_delta_l2 = 0.0
+            context_delta_max = 0.0
+            old_slow_cache = z_slow_cache.clone()
+
+            if args_cli.profile_inference:
+                _synchronize(env.device)
+                end_to_end_start = time.perf_counter()
+
             if args_cli.mode == "teacher":
                 # teacher: policy sees e(t) and internally uses z = mu(e)
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = True
                 z_hat = z_teacher  # for logging only
-                slow_update_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+                z_slow_raw[:] = z_teacher[:, :student_z_slow_dim]
+                z_slow_target[:] = z_teacher[:, :student_z_slow_dim]
+                z_slow_cache[:] = z_teacher[:, :student_z_slow_dim]
+                z_fast_cache[:] = z_teacher[:, student_z_slow_dim:]
                 policy_in = obs_tensor  # tail stays as priv=e
             else:
-                # Student: fast context is refreshed every policy step. Slow context
-                # is refreshed at policy rate during startup, then sample-and-held.
                 if hasattr(policy_nn, "use_mu"):
                     policy_nn.use_mu = False
-                z_fast = encoder.encode_fast(obs_history).detach()
-                slow_update_mask = _slow_update_mask(
-                    episode_steps,
-                    slow_warmup_steps,
-                    slow_period_steps,
-                )
-                if torch.any(slow_update_mask):
-                    z_slow_cache[slow_update_mask] = encoder.encode_slow(
-                        obs_history[slow_update_mask]
-                    ).detach()
-                z_hat = torch.cat([z_slow_cache, z_fast], dim=-1)
+
+                if student_context_mode == "monolithic":
+                    full_update_mask[:] = True
+                    z_all, full_inference_ms = _timed_call(
+                        lambda: encoder(obs_history).detach(),
+                        env.device,
+                        bool(args_cli.profile_inference),
+                    )
+                    z_slow_raw[:] = z_all[:, :student_z_slow_dim]
+                    z_slow_target[:] = z_slow_raw
+                    z_slow_cache[:] = z_slow_raw
+                    z_fast_cache[:] = z_all[:, student_z_slow_dim:]
+                    call_counts["full_batch_calls"] += 1
+                    call_counts["full_env_samples"] += int(env.num_envs)
+                    latency_samples["full"].append(full_inference_ms)
+                else:
+                    fast_update_mask = _periodic_update_mask(
+                        episode_steps, fast_period_steps
+                    )
+                    if torch.any(fast_update_mask):
+                        z_fast_new, fast_inference_ms = _timed_call(
+                            lambda: encoder.encode_fast(
+                                obs_history[fast_update_mask]
+                            ).detach(),
+                            env.device,
+                            bool(args_cli.profile_inference),
+                        )
+                        z_fast_cache[fast_update_mask] = z_fast_new
+                        call_counts["fast_batch_calls"] += 1
+                        call_counts["fast_env_samples"] += int(
+                            fast_update_mask.sum().item()
+                        )
+                        latency_samples["fast"].append(fast_inference_ms)
+
+                    if args_cli.context_runtime_mode == "all_60hz":
+                        slow_update_mask[:] = True
+                    else:
+                        slow_update_mask = _slow_update_mask(
+                            episode_steps,
+                            slow_warmup_steps,
+                            slow_period_steps,
+                        )
+                    if torch.any(slow_update_mask):
+                        z_slow_new, slow_inference_ms = _timed_call(
+                            lambda: encoder.encode_slow(
+                                obs_history[slow_update_mask]
+                            ).detach(),
+                            env.device,
+                            bool(args_cli.profile_inference),
+                        )
+                        z_slow_raw[slow_update_mask] = z_slow_new
+                        z_slow_target[slow_update_mask] = z_slow_new
+                        call_counts["slow_batch_calls"] += 1
+                        call_counts["slow_env_samples"] += int(
+                            slow_update_mask.sum().item()
+                        )
+                        latency_samples["slow"].append(slow_inference_ms)
+
+                    if args_cli.context_runtime_mode == "all_60hz":
+                        z_slow_cache[:] = z_slow_target
+                    else:
+                        startup_mask = episode_steps < slow_warmup_steps
+                        z_slow_cache[startup_mask] = z_slow_target[startup_mask]
+                        post_startup_mask = ~startup_mask
+                        z_slow_cache[post_startup_mask] += slow_filter_alpha * (
+                            z_slow_target[post_startup_mask]
+                            - z_slow_cache[post_startup_mask]
+                        )
+
+                z_hat = torch.cat([z_slow_cache, z_fast_cache], dim=-1)
                 policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 21+z_dim)
 
             # ---- 3) build obs dict for policy ----
@@ -425,12 +735,66 @@ def main(env_cfg, agent_cfg):
             # ---- 4) action inference (t) ----
             if not hasattr(policy_nn, "act_inference"):
                 raise RuntimeError("policy_nn has no act_inference(); unexpected policy type.")
-            actions_raw = policy_nn.act_inference(obs_in)             # (N, act_dim)
+            actions_raw, actor_inference_ms = _timed_call(
+                lambda: policy_nn.act_inference(obs_in),
+                env.device,
+                bool(args_cli.profile_inference),
+            )
             actions = _clip_actions_to_bounds(actions_raw, action_low, action_high)
+            latency_samples["actor"].append(actor_inference_ms)
+
+            if args_cli.profile_inference:
+                _synchronize(env.device)
+                end_to_end_inference_ms = (
+                    time.perf_counter() - end_to_end_start
+                ) * 1000.0
+            else:
+                end_to_end_inference_ms = 0.0
+            latency_samples["end_to_end"].append(end_to_end_inference_ms)
+
+            # Counterfactual refresh diagnostic: under the same observation and
+            # current fast context, compare old cache vs newly refreshed raw target.
+            # These two extra Actor calls are deliberately outside profiled latency.
+            e = trace_env
+            if (
+                args_cli.mode == "student"
+                and student_context_mode == "split"
+                and bool(slow_update_mask[e].item())
+            ):
+                z_old_e = torch.cat(
+                    [old_slow_cache[e : e + 1], z_fast_cache[e : e + 1]], dim=-1
+                )
+                z_raw_e = torch.cat(
+                    [z_slow_target[e : e + 1], z_fast_cache[e : e + 1]], dim=-1
+                )
+                old_policy_in = torch.cat(
+                    [obs_proprio[e : e + 1], z_old_e], dim=-1
+                )
+                raw_policy_in = torch.cat(
+                    [obs_proprio[e : e + 1], z_raw_e], dim=-1
+                )
+                old_action = _clip_actions_to_bounds(
+                    policy_nn.act_inference({"policy": old_policy_in}),
+                    action_low,
+                    action_high,
+                )
+                raw_action = _clip_actions_to_bounds(
+                    policy_nn.act_inference({"policy": raw_policy_in}),
+                    action_low,
+                    action_high,
+                )
+                context_action_delta = torch.abs(raw_action - old_action)[0]
+                context_delta_l1 = float(context_action_delta.sum().cpu())
+                context_delta_l2 = float(
+                    torch.linalg.vector_norm(context_action_delta).cpu()
+                )
+                context_delta_max = float(context_action_delta.max().cpu())
+                if int(episode_steps[e].item()) >= slow_warmup_steps:
+                    context_refresh_action_l1.append(context_delta_l1)
+                    context_refresh_action_l2.append(context_delta_l2)
+                    context_refresh_action_max.append(context_delta_max)
 
             # ---- 5) LOG at time t (BEFORE env.step) ----
-            e = trace_env
-
             # state (t): from base_env (aligned with obs_tensor)
             uav_pos = base_env._robot.data.root_pos_w[e].detach().cpu().numpy().tolist()
             payload_pos = base_env._robot.data.body_pos_w[e, base_env._payload_id, :].detach().cpu().numpy().tolist()
@@ -456,6 +820,38 @@ def main(env_cfg, agent_cfg):
             # actions (t)
             a_raw = actions_raw[e].detach().cpu().numpy().tolist()
             a_clp = actions[e].detach().cpu().numpy().tolist()
+            slow_raw_e = z_slow_raw[e].detach().cpu().numpy().tolist()
+            slow_target_e = z_slow_target[e].detach().cpu().numpy().tolist()
+            slow_cache_e = z_slow_cache[e].detach().cpu().numpy().tolist()
+
+            if hasattr(base_env, "_wind_gust"):
+                gust_e = (
+                    base_env._wind_gust[e].detach().cpu().numpy().astype(float)
+                )
+            else:
+                gust_e = np.zeros(3, dtype=float)
+            if hasattr(base_env, "_wind_acc_w"):
+                wind_acc_e = (
+                    base_env._wind_acc_w[e].detach().cpu().numpy().astype(float)
+                )
+            else:
+                wind_acc_e = np.zeros(3, dtype=float)
+            gust_event = (
+                previous_trace_gust is not None
+                and float(np.linalg.norm(gust_e - previous_trace_gust))
+                >= float(args_cli.gust_event_threshold)
+            )
+            action_e = np.asarray(a_clp, dtype=float)
+            executed_action_delta_l1 = (
+                float(np.sum(np.abs(action_e - previous_trace_action)))
+                if previous_trace_action is not None
+                else 0.0
+            )
+            trace_actions.append(action_e.copy())
+            trace_gust.append(gust_e.copy())
+            trace_z_fast.append(np.asarray(zH[student_z_slow_dim:], dtype=float))
+            previous_trace_action = action_e.copy()
+            previous_trace_gust = gust_e.copy()
 
             w.writerow([
                 step_count * dt,
@@ -471,7 +867,31 @@ def main(env_cfg, agent_cfg):
                 *zT,
                 *zH,
                 z_rmse,
-                int(slow_update_mask[e].item()), int(episode_steps[e].item()),
+                *slow_raw_e,
+                *slow_target_e,
+                *slow_cache_e,
+                int(slow_update_mask[e].item()),
+                int(fast_update_mask[e].item()),
+                int(full_update_mask[e].item()),
+                int(episode_steps[e].item()),
+                int(call_counts["slow_batch_calls"]),
+                int(call_counts["fast_batch_calls"]),
+                int(call_counts["full_batch_calls"]),
+                int(call_counts["slow_env_samples"]),
+                int(call_counts["fast_env_samples"]),
+                int(call_counts["full_env_samples"]),
+                slow_inference_ms,
+                fast_inference_ms,
+                full_inference_ms,
+                actor_inference_ms,
+                end_to_end_inference_ms,
+                *gust_e.tolist(),
+                int(gust_event),
+                *wind_acc_e.tolist(),
+                context_delta_l1,
+                context_delta_l2,
+                context_delta_max,
+                executed_action_delta_l1,
                 *a_raw,
                 *a_clp,
             ])
@@ -493,16 +913,21 @@ def main(env_cfg, agent_cfg):
                 obs_history[done_mask] = 0.0
                 last_actions[done_mask] = 0.0
                 episode_steps[done_mask] = 0
+                z_slow_raw[done_mask] = 0.0
+                z_slow_target[done_mask] = 0.0
                 z_slow_cache[done_mask] = 0.0
+                z_fast_cache[done_mask] = 0.0
                 if hasattr(policy_nn, "reset"):
                     policy_nn.reset(done_mask)
 
+            step_count += 1
             # stop exactly at episode boundary of trace_env
             if bool(args_cli.stop_on_done) and bool(dones[e].item()):
-                print(f"[INFO] trace_env done at step={step_count}. stop_on_done=True -> exit.")
+                print(
+                    f"[INFO] trace_env done after {step_count} logged steps. "
+                    "stop_on_done=True -> exit."
+                )
                 break
-
-        step_count += 1
 
         # realtime option
         if args_cli.real_time:
@@ -514,29 +939,122 @@ def main(env_cfg, agent_cfg):
     # Cleanup
     # ----------------------------
     f.close()
+    num_envs = int(env.num_envs)
     env.close()
 
     wall_time_sec = float(time.time() - t0)
     print(f"[DONE] steps={step_count} wall={wall_time_sec:.2f}s -> {csv_path}")
 
+    actions_array = np.asarray(trace_actions, dtype=float).reshape(-1, action_dim)
+    gust_array = np.asarray(trace_gust, dtype=float).reshape(-1, 3)
+    z_fast_array = np.asarray(trace_z_fast, dtype=float).reshape(
+        -1, student_z_fast_dim
+    )
+    action_tv = compute_action_total_variation(actions_array)
+    action_band_energy = compute_action_band_energy(
+        actions_array,
+        sample_rate_hz=schedule.policy_hz,
+        low_hz=5.0,
+        high_hz=min(30.0, 0.5 * schedule.policy_hz),
+    )
+    gust_response = compute_gust_response_latency(
+        gust_array,
+        z_fast_array,
+        policy_dt=dt,
+        gust_event_threshold=float(args_cli.gust_event_threshold),
+        fast_response_threshold=float(args_cli.fast_response_threshold),
+        response_window_sec=float(args_cli.gust_response_window_sec),
+    )
+
+    def _summarize_refresh(values):
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            return {"count": 0, "mean": None, "p95": None, "p99": None, "max": None}
+        return {
+            "count": int(arr.size),
+            "mean": float(np.mean(arr)),
+            "p95": float(np.percentile(arr, 95)),
+            "p99": float(np.percentile(arr, 99)),
+            "max": float(np.max(arr)),
+        }
+
     summary = {
         "mode": args_cli.mode,
+        "teacher_context_mode": str(getattr(policy_nn, "context_mode", "unknown")),
+        "student_teacher_context_mode": student_teacher_context_mode,
+        "student_context_mode": student_context_mode if args_cli.mode == "student" else None,
+        "context_runtime_mode": str(args_cli.context_runtime_mode),
         "checkpoint": resume_path,
         "encoder": args_cli.encoder if args_cli.mode == "student" else "",
         "csv_path": csv_path,
         "steps": int(step_count),
         "wall_time_sec": wall_time_sec,
         "dt": float(dt),
-        "num_envs": int(env.num_envs),
+        "num_envs": num_envs,
         "seed": int(args_cli.seed) if args_cli.seed is not None else None,
         "max_steps": int(args_cli.max_steps),
         "stop_on_done": bool(args_cli.stop_on_done),
-        "policy_hz": float(1.0 / dt),
-        "fast_update_hz": float(1.0 / dt),
+        "policy_hz": float(schedule.policy_hz),
+        "fast_update_hz": float(schedule.fast_update_hz),
+        "fast_period_steps": int(fast_period_steps),
         "slow_warmup_sec": float(args_cli.slow_warmup_sec),
         "slow_update_hz": float(args_cli.slow_update_hz),
         "slow_warmup_steps": int(slow_warmup_steps),
         "slow_period_steps": int(slow_period_steps),
+        "slow_filter_tau_sec": float(args_cli.slow_filter_tau_sec),
+        "slow_filter_alpha": float(slow_filter_alpha),
+        "profile_inference": bool(args_cli.profile_inference),
+        "evaluation_overrides": {
+            **evaluation_overrides,
+            "payload_mass_training_range_kg": [
+                float(env_cfg.payload_mass_range[0]),
+                float(env_cfg.payload_mass_range[1]),
+            ],
+            "rope_length_training_range_m": [
+                float(env_cfg.rope_length_range[0]),
+                float(env_cfg.rope_length_range[1]),
+            ],
+            "wind_enabled_effective": bool(
+                getattr(base_env, "_wind_enabled", False)
+            ),
+        },
+        "context_call_counts": call_counts,
+        "post_startup_slow_call_reduction_fraction": float(
+            1.0 - 1.0 / slow_period_steps
+        ),
+        "observed_overall_slow_batch_call_reduction_fraction": (
+            float(1.0 - call_counts["slow_batch_calls"] / step_count)
+            if step_count > 0 and args_cli.mode == "student"
+            and student_context_mode == "split"
+            else None
+        ),
+        "observed_overall_slow_env_sample_reduction_fraction": (
+            float(
+                1.0
+                - call_counts["slow_env_samples"]
+                / max(1, step_count * num_envs)
+            )
+            if step_count > 0
+            and args_cli.mode == "student"
+            and student_context_mode == "split"
+            else None
+        ),
+        "inference_latency": {
+            name: summarize_latency_ms(values)
+            for name, values in latency_samples.items()
+        },
+        "ctbr_action_total_variation": action_tv,
+        "ctbr_action_5_30hz_energy": action_band_energy,
+        "gust_to_fast_context_response": gust_response,
+        "context_refresh_counterfactual_action_change": {
+            "definition": (
+                "same-observation Actor output difference between old slow cache "
+                "and newly refreshed unfiltered slow target"
+            ),
+            "l1": _summarize_refresh(context_refresh_action_l1),
+            "l2": _summarize_refresh(context_refresh_action_l2),
+            "max_abs_channel": _summarize_refresh(context_refresh_action_max),
+        },
     }
 
     summary_name = "phase2_teacher_play_summary.json" if args_cli.mode == "teacher" else "phase2_student_play_summary.json"

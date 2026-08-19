@@ -7,21 +7,116 @@ import glob
 import json
 import time
 import argparse
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 
+
+def configure_reproducibility(seed: int):
+    """Configure deterministic random behavior before model construction."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_dataloader_worker(worker_id: int):
+    """Seed Python and NumPy inside every DataLoader worker."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def capture_rng_state():
+    """Capture all global RNG states needed for an exact training resume."""
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy_state[0],
+            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_training_rng(checkpoint, requested_seed: int, train_generator: torch.Generator):
+    """Validate and restore global and DataLoader RNG states from a checkpoint."""
+    required_keys = ("seed", "rng_state", "train_generator_state")
+    missing = [key for key in required_keys if key not in checkpoint]
+    if missing:
+        raise RuntimeError(
+            "Cannot resume a legacy or incomplete checkpoint without reproducibility metadata: "
+            f"missing={missing}. Start a fresh seeded run."
+        )
+    checkpoint_seed = int(checkpoint["seed"])
+    if checkpoint_seed != int(requested_seed):
+        raise RuntimeError(
+            "Resume seed mismatch: "
+            f"requested={requested_seed}, checkpoint={checkpoint_seed}."
+        )
+
+    rng_state = checkpoint["rng_state"]
+    rng_required = ("python", "numpy", "torch_cpu", "torch_cuda")
+    rng_missing = [key for key in rng_required if key not in rng_state]
+    if rng_missing:
+        raise RuntimeError(
+            "Cannot resume a legacy or incomplete checkpoint without complete RNG state: "
+            f"missing={rng_missing}. Start a fresh seeded run."
+        )
+
+    random.setstate(rng_state["python"])
+    numpy_state = rng_state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["bit_generator"],
+            numpy_state["keys"].cpu().numpy(),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
+    torch.set_rng_state(rng_state["torch_cpu"].cpu())
+    cuda_states = rng_state["torch_cuda"]
+    if cuda_states is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
+    train_generator.set_state(checkpoint["train_generator_state"].cpu())
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=str, required=True, help="Folder containing shard_*.pt and meta.pt")
     p.add_argument("--out_dir", type=str, default=".", help="Output directory to save model/report/plots")
+    p.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="Required experiment seed controlling initialization, shuffling, and resume.",
+    )
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_name", type=str, default="best_fast_slow_student_encoder_z.pth")
+    p.add_argument(
+        "--student_context_mode",
+        type=str,
+        default="split",
+        choices=["split", "monolithic"],
+        help="Proposed method uses two independent split encoders; monolithic is an ablation.",
+    )
     p.add_argument("--use_weighted_mse", action="store_true", default=True)
     p.add_argument("--no_weighted_mse", dest="use_weighted_mse", action="store_false")
     p.add_argument(
@@ -70,6 +165,17 @@ class FastSlowStudentEncoder(nn.Module):
     def forward(self, x):
         return self.encode_slow(x), self.encode_fast(x)
 
+
+class MonolithicStudentEncoder(nn.Module):
+    """Single history encoder that predicts all context dimensions jointly."""
+
+    def __init__(self, input_dim=21, history_len=50, z_dim=5):
+        super().__init__()
+        self.encoder = CNNContextEncoder(input_dim, history_len, z_dim)
+
+    def forward(self, x):
+        return self.encoder(x)
+
 def load_shard(path):
     d = torch.load(path, map_location="cpu")
     x = d["inputs"].float()        # (N, H, 21)
@@ -89,9 +195,16 @@ def compute_z_stats_from_meta(meta_path: str, z_dim: int):
 
 def main():
     args = parse_args()
+    configure_reproducibility(args.seed)
+    train_generator = torch.Generator(device="cpu")
+    train_generator.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     train_t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(
+        f"[Seed] seed={args.seed} deterministic_algorithms="
+        f"{torch.are_deterministic_algorithms_enabled()}"
+    )
 
     shard_files = sorted(glob.glob(os.path.join(args.data_dir, "shard_*.pt")))
     assert len(shard_files) > 0, f"No shard_*.pt found in {args.data_dir}"
@@ -116,12 +229,52 @@ def main():
         raise RuntimeError(f"Expected z dim = 5, but got {z_dim}.")
     z_slow_dim = 2
     z_fast_dim = z_dim - z_slow_dim
+    model_type = (
+        "fast_slow_context"
+        if args.student_context_mode == "split"
+        else "monolithic_context"
+    )
+
+    meta_path = os.path.join(args.data_dir, "meta.pt")
+    meta = torch.load(meta_path, map_location="cpu") if os.path.exists(meta_path) else {}
+    teacher_context_mode = str(meta.get("teacher_context_mode", "unknown"))
+    dataset_audit_path = os.path.join(args.data_dir, "dataset_audit.json")
+    dataset_audit = None
+    if os.path.exists(dataset_audit_path):
+        with open(dataset_audit_path, "r") as audit_file:
+            dataset_audit = json.load(audit_file)
+    if teacher_context_mode == "split_hard":
+        if dataset_audit is None:
+            raise RuntimeError(
+                "Hard-explicit Student training requires dataset_audit.json. "
+                "Recollect or run the dataset audit before training."
+            )
+        if not bool(dataset_audit.get("passed", False)):
+            raise RuntimeError(
+                f"Dataset audit did not pass: {dataset_audit_path}"
+            )
+    if teacher_context_mode == "monolithic" and args.aux_ml_coef > 0.0:
+        raise RuntimeError(
+            "A monolithic Teacher has no guaranteed physical meaning in z[:2]. "
+            "Use --aux_ml_coef 0 for that baseline, or use a hard/split Teacher "
+            "for the physical slow-context experiment."
+        )
 
     has_ml = y0_ml is not None
     if args.aux_ml_coef > 0.0 and not has_ml:
         raise RuntimeError("aux_ml_coef > 0 but shard has no labels_ml. Please recollect dataset.")
     if has_ml and y0_ml.shape[1] != 2:
         raise RuntimeError(f"Expected labels_ml dim = 2, but got {y0_ml.shape[1]}.")
+    slow_identity_max_abs = (
+        float(torch.max(torch.abs(y0[:, :z_slow_dim] - y0_ml)).item())
+        if y0_ml is not None
+        else None
+    )
+    if teacher_context_mode == "split_hard" and slow_identity_max_abs != 0.0:
+        raise RuntimeError(
+            "Hard-explicit dataset identity check failed on the first training shard: "
+            f"max_abs={slow_identity_max_abs}"
+        )
     # z stats (for weighted mse)
     z_mean, z_std = compute_z_stats_from_meta(os.path.join(args.data_dir, "meta.pt"), z_dim)
     if z_std is None:
@@ -138,16 +291,31 @@ def main():
     # weighted mse weights: 1/std^2
     w = (1.0 / (z_std * z_std)).to(device)
 
-    model = FastSlowStudentEncoder(
-        input_dim=in_dim,
-        history_len=H,
-        z_slow_dim=z_slow_dim,
-        z_fast_dim=z_fast_dim,
-    ).to(device)
+    if args.student_context_mode == "split":
+        model = FastSlowStudentEncoder(
+            input_dim=in_dim,
+            history_len=H,
+            z_slow_dim=z_slow_dim,
+            z_fast_dim=z_fast_dim,
+        ).to(device)
+    else:
+        model = MonolithicStudentEncoder(
+            input_dim=in_dim,
+            history_len=H,
+            z_dim=z_dim,
+        ).to(device)
     opt = optim.Adam(model.parameters(), lr=args.lr)
     num_params = sum(p.numel() for p in model.parameters())
-    num_params_slow = sum(p.numel() for p in model.slow_encoder.parameters())
-    num_params_fast = sum(p.numel() for p in model.fast_encoder.parameters())
+    num_params_slow = (
+        sum(p.numel() for p in model.slow_encoder.parameters())
+        if args.student_context_mode == "split"
+        else 0
+    )
+    num_params_fast = (
+        sum(p.numel() for p in model.fast_encoder.parameters())
+        if args.student_context_mode == "split"
+        else 0
+    )
     def mse_loss(pred, target):
         return torch.mean((pred - target) ** 2)
 
@@ -170,8 +338,11 @@ def main():
 
         if "state_dict" not in ckpt:
             raise RuntimeError(f"Resume checkpoint missing 'state_dict': {args.resume_path}")
-        if ckpt.get("model_type") != "fast_slow_context":
-            raise RuntimeError("Resume checkpoint is not a fast/slow student checkpoint.")
+        if ckpt.get("model_type") != model_type:
+            raise RuntimeError(
+                "Resume checkpoint architecture mismatch: "
+                f"requested={model_type}, checkpoint={ckpt.get('model_type')}"
+            )
 
         model.load_state_dict(ckpt["state_dict"], strict=True)
 
@@ -182,6 +353,12 @@ def main():
             print(f"[Resume] override optimizer lr -> {args.lr}")
         else:
             print("[WARN] optimizer_state_dict not found in resume checkpoint. This is only pseudo-resume.")
+
+        restore_training_rng(
+            ckpt,
+            requested_seed=args.seed,
+            train_generator=train_generator,
+        )
 
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         best_val = float(ckpt.get("best_val", best_val))
@@ -213,6 +390,8 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True,
                 persistent_workers=(args.num_workers > 0),
+                worker_init_fn=seed_dataloader_worker,
+                generator=train_generator,
             )
 
             for batch in dl:
@@ -227,7 +406,12 @@ def main():
                 by = by.to(device, non_blocking=True)
 
                 opt.zero_grad(set_to_none=True)
-                pred_slow, pred_fast = model(bx)
+                if args.student_context_mode == "split":
+                    pred_slow, pred_fast = model(bx)
+                else:
+                    pred_all = model(bx)
+                    pred_slow = pred_all[:, :z_slow_dim]
+                    pred_fast = pred_all[:, z_slow_dim:]
                 target_slow = by[:, :z_slow_dim]
                 target_fast = by[:, z_slow_dim:]
                 loss_slow = branch_mse_loss(pred_slow, target_slow, w[:z_slow_dim])
@@ -280,7 +464,12 @@ def main():
                     bx = bx.to(device, non_blocking=True)
                     by = by.to(device, non_blocking=True)
 
-                    pred_slow, pred_fast = model(bx)
+                    if args.student_context_mode == "split":
+                        pred_slow, pred_fast = model(bx)
+                    else:
+                        pred_all = model(bx)
+                        pred_slow = pred_all[:, :z_slow_dim]
+                        pred_fast = pred_all[:, z_slow_dim:]
                     pred = torch.cat([pred_slow, pred_fast], dim=-1)
                     target_slow = by[:, :z_slow_dim]
                     target_fast = by[:, z_slow_dim:]
@@ -322,7 +511,9 @@ def main():
             save_path = os.path.join(args.out_dir, args.save_name)
             torch.save(
                 {
-                    "model_type": "fast_slow_context",
+                    "model_type": model_type,
+                    "student_context_mode": args.student_context_mode,
+                    "teacher_context_mode": teacher_context_mode,
                     "state_dict": model.state_dict(),
                     "optimizer_state_dict": opt.state_dict(),
                     "epoch": epoch,
@@ -336,6 +527,12 @@ def main():
                     "z_fast_dim": z_fast_dim,
                     "z_mean": z_mean.cpu(),
                     "z_std": z_std.cpu(),
+                    "seed": int(args.seed),
+                    "deterministic_algorithms": bool(
+                        torch.are_deterministic_algorithms_enabled()
+                    ),
+                    "rng_state": capture_rng_state(),
+                    "train_generator_state": train_generator.get_state(),
                 },
                 save_path,
             )
@@ -343,7 +540,9 @@ def main():
         last_path = os.path.join(args.out_dir, "last_checkpoint.pth")
         torch.save(
             {
-                "model_type": "fast_slow_context",
+                "model_type": model_type,
+                "student_context_mode": args.student_context_mode,
+                "teacher_context_mode": teacher_context_mode,
                 "state_dict": model.state_dict(),
                 "optimizer_state_dict": opt.state_dict(),
                 "epoch": epoch,
@@ -357,6 +556,12 @@ def main():
                 "z_fast_dim": z_fast_dim,
                 "z_mean": z_mean.cpu(),
                 "z_std": z_std.cpu(),
+                "seed": int(args.seed),
+                "deterministic_algorithms": bool(
+                    torch.are_deterministic_algorithms_enabled()
+                ),
+                "rng_state": capture_rng_state(),
+                "train_generator_state": train_generator.get_state(),
             },
             last_path,
         )
@@ -373,6 +578,15 @@ def main():
         "num_params": int(num_params),
         "num_params_slow": int(num_params_slow),
         "num_params_fast": int(num_params_fast),
+        "student_context_mode": args.student_context_mode,
+        "teacher_context_mode": teacher_context_mode,
+        "slow_label_identity_max_abs_first_shard": slow_identity_max_abs,
+        "dataset_audit_path": dataset_audit_path if dataset_audit is not None else None,
+        "dataset_audit_passed": (
+            bool(dataset_audit.get("passed", False))
+            if dataset_audit is not None
+            else None
+        ),
         "z_slow_dim": int(z_slow_dim),
         "z_fast_dim": int(z_fast_dim),
         "use_weighted_mse": bool(args.use_weighted_mse),
@@ -390,6 +604,10 @@ def main():
         "has_labels_ml": has_ml,
         "resume": bool(args.resume),
         "resume_path": args.resume_path,
+        "seed": int(args.seed),
+        "deterministic_algorithms": bool(
+            torch.are_deterministic_algorithms_enabled()
+        ),
     }
     report_path = os.path.join(args.out_dir, "report.json")
     with open(report_path, "w") as f:

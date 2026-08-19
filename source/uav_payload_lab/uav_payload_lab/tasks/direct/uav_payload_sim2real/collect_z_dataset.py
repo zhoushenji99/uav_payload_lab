@@ -49,6 +49,13 @@ parser.add_argument("--probe_freq", type=float, default=1.0,
                     help="Hz of probing sine.")
 parser.add_argument("--sample_stride", type=int, default=5,
                     help="Store one sample every K env steps after warmup.")
+parser.add_argument(
+    "--rma_context_mode",
+    type=str,
+    default=None,
+    choices=["split_hard", "split_soft", "monolithic"],
+    help="Teacher checkpoint architecture. Defaults to the task configuration.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -67,12 +74,21 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 import isaaclab_tasks  # noqa: F401
 import uav_payload_lab.tasks  # noqa: F401
+from uav_payload_lab.tasks.direct.uav_payload_sim2real.audit_z_dataset import audit_shard_tensors
 
 
 def _safe_load_model_only(runner: OnPolicyRunner, ckpt_path: str):
     """Load ONLY model (and normalizers if exist). Avoid optimizer mismatch."""
     ckpt = torch.load(ckpt_path, map_location=runner.device)
-    runner.alg.policy.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if "model_state_dict" in ckpt:
+        model_state = ckpt["model_state_dict"]
+    elif "model" in ckpt and isinstance(ckpt["model"], dict):
+        model_state = ckpt["model"]
+    elif "state_dict" in ckpt:
+        model_state = ckpt["state_dict"]
+    else:
+        model_state = ckpt
+    runner.alg.policy.load_state_dict(model_state, strict=True)
     if "actor_obs_normalizer_state_dict" in ckpt and hasattr(runner.alg.policy, "actor_obs_normalizer"):
         runner.alg.policy.actor_obs_normalizer.load_state_dict(ckpt["actor_obs_normalizer_state_dict"])
     if "critic_obs_normalizer_state_dict" in ckpt and hasattr(runner.alg.policy, "critic_obs_normalizer"):
@@ -109,12 +125,65 @@ def _clip_actions_to_bounds(actions: torch.Tensor, low: torch.Tensor, high: torc
     return torch.minimum(torch.maximum(actions, low), high)
 
 
+def _build_rma_runner_cfg(agent_cfg, env_cfg):
+    runner_cfg = agent_cfg.to_dict()
+    fields = (
+        "proprio_obs_dim",
+        "privileged_obs_dim",
+        "rma_z_dim",
+        "rma_z_exp_dim",
+        "rma_use_mu",
+        "rma_context_mode",
+        "rma_use_physics_anchor",
+        "rma_mu_hidden_dims",
+        "rma_activation",
+    )
+    if all(hasattr(env_cfg, field) for field in fields):
+        runner_cfg["policy"].update(
+            {
+                "proprio_obs_dim": int(env_cfg.proprio_obs_dim),
+                "privileged_obs_dim": int(env_cfg.privileged_obs_dim),
+                "z_dim": int(env_cfg.rma_z_dim),
+                "z_exp_dim": int(env_cfg.rma_z_exp_dim),
+                "use_mu": bool(env_cfg.rma_use_mu),
+                "context_mode": str(env_cfg.rma_context_mode),
+                "use_physics_anchor": bool(env_cfg.rma_use_physics_anchor),
+                "mu_hidden_dims": list(env_cfg.rma_mu_hidden_dims),
+                "mu_activation": env_cfg.rma_activation,
+            }
+        )
+    return runner_cfg
+
+
+def _merge_shard_audit(total: dict[str, float | int], shard_audit: dict[str, object]) -> None:
+    total["shards"] = int(total["shards"]) + 1
+    total["samples"] = int(total["samples"]) + int(shard_audit["sample_count"])
+    total["inputs_nonfinite"] = int(total["inputs_nonfinite"]) + int(
+        shard_audit["inputs_nonfinite"]
+    )
+    total["labels_nonfinite"] = int(total["labels_nonfinite"]) + int(
+        shard_audit["labels_nonfinite"]
+    )
+    total["labels_ml_nonfinite"] = int(total["labels_ml_nonfinite"]) + int(
+        shard_audit["labels_ml_nonfinite"]
+    )
+    total["slow_identity_max_abs"] = max(
+        float(total["slow_identity_max_abs"]),
+        float(shard_audit["slow_identity_max_abs"]),
+    )
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg, agent_cfg):
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
 
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    if args_cli.rma_context_mode is not None:
+        env_cfg.rma_context_mode = str(args_cli.rma_context_mode)
+    if str(getattr(env_cfg, "rma_context_mode", "split_hard")) != "split_soft":
+        env_cfg.rma_use_physics_anchor = False
+        env_cfg.rma_phys_anchor_coef = 0.0
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
@@ -134,7 +203,8 @@ def main(env_cfg, agent_cfg):
     base_env = env.unwrapped
     action_low, action_high = _get_action_bounds(base_env, env.device)
 
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    runner_cfg = _build_rma_runner_cfg(agent_cfg, env_cfg)
+    runner = OnPolicyRunner(env, runner_cfg, log_dir=None, device=agent_cfg.device)
 
     print(f"[INFO] Loading checkpoint (model-only): {resume_path}")
     _safe_load_model_only(runner, resume_path)
@@ -148,7 +218,9 @@ def main(env_cfg, agent_cfg):
     history_len = int(args_cli.history_len)
     input_dim = 21            # 当前 teacher 真正看到的 proprio 维度，已经包含 prev_actions(4)
     z_dim = getattr(policy_nn, "z_dim", 5)
+    z_exp_dim = int(getattr(policy_nn, "z_exp_dim", 2))
     priv_dim = z_dim          # 当前 teacher 的 privileged tail = 5
+    teacher_context_mode = str(getattr(policy_nn, "context_mode", "unknown"))
 
     obs = env.get_observations()
     dt = env.unwrapped.step_dt
@@ -178,13 +250,25 @@ def main(env_cfg, agent_cfg):
     priv_sumsq = torch.zeros(priv_dim)
     priv_min = torch.full((priv_dim,), float("inf"))
     priv_max = torch.full((priv_dim,), -float("inf"))
+    audit_totals = {
+        "shards": 0,
+        "samples": 0,
+        "inputs_nonfinite": 0,
+        "labels_nonfinite": 0,
+        "labels_ml_nonfinite": 0,
+        "slow_identity_max_abs": 0.0,
+    }
 
     # trace csv
     trace_rows = []
     trace_env = int(args_cli.trace_env)
     trace_path = os.path.join(out_dir, "trace_env0.csv")  # name kept stable for paper scripts
 
-    print(f"[Collect] num_envs={env.num_envs}, steps={args_cli.steps}, history_len={history_len}, z_dim={z_dim}")
+    print(
+        f"[Collect] num_envs={env.num_envs}, steps={args_cli.steps}, "
+        f"history_len={history_len}, z_dim={z_dim}, "
+        f"teacher_context_mode={teacher_context_mode}"
+    )
     print(f"[Collect] saving shards to: {out_dir}")
     print(f"[Collect] action_low={action_low.detach().cpu().tolist()} action_high={action_high.detach().cpu().tolist()}")
 
@@ -283,6 +367,27 @@ def main(env_cfg, agent_cfg):
                     inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
                     labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
                     labels_ml = torch.stack(shard_labels_ml, dim=0).reshape(-1, 2)
+                    shard_audit = audit_shard_tensors(
+                        inputs,
+                        labels,
+                        labels_ml,
+                        history_len=history_len,
+                        input_dim=input_dim,
+                        z_dim=z_dim,
+                        slow_dim=z_exp_dim,
+                    )
+                    _merge_shard_audit(audit_totals, shard_audit)
+                    if teacher_context_mode == "split_hard" and float(
+                        shard_audit["slow_identity_max_abs"]
+                    ) != 0.0:
+                        raise RuntimeError(
+                            "Hard-explicit Teacher identity audit failed before shard save: "
+                            f"max_abs={shard_audit['slow_identity_max_abs']}"
+                        )
+                    if not bool(shard_audit["all_finite"]):
+                        raise RuntimeError(
+                            f"Non-finite dataset values detected before shard save: {shard_audit}"
+                        )
 
                     shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
                     torch.save(
@@ -309,6 +414,27 @@ def main(env_cfg, agent_cfg):
                     inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
                     labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
                     labels_ml = torch.stack(shard_labels_ml, dim=0).reshape(-1, 2)
+                    shard_audit = audit_shard_tensors(
+                        inputs,
+                        labels,
+                        labels_ml,
+                        history_len=history_len,
+                        input_dim=input_dim,
+                        z_dim=z_dim,
+                        slow_dim=z_exp_dim,
+                    )
+                    _merge_shard_audit(audit_totals, shard_audit)
+                    if teacher_context_mode == "split_hard" and float(
+                        shard_audit["slow_identity_max_abs"]
+                    ) != 0.0:
+                        raise RuntimeError(
+                            "Hard-explicit Teacher identity audit failed before final shard save: "
+                            f"max_abs={shard_audit['slow_identity_max_abs']}"
+                        )
+                    if not bool(shard_audit["all_finite"]):
+                        raise RuntimeError(
+                            f"Non-finite dataset values detected before final shard save: {shard_audit}"
+                        )
 
                     shard_path = os.path.join(out_dir, f"shard_{shard_idx:04d}.pt")
                     torch.save(
@@ -336,12 +462,15 @@ def main(env_cfg, agent_cfg):
 
                 meta = {
                     "checkpoint": resume_path,
+                    "teacher_context_mode": teacher_context_mode,
                     "num_envs": env.num_envs,
                     "history_len": history_len,
                     "input_dim": input_dim,
                     "sample_stride": args_cli.sample_stride,
                     "priv_dim": priv_dim,
                     "z_dim": z_dim,
+                    "z_exp_dim": z_exp_dim,
+                    "total_samples": total_samples,
                     "steps": args_cli.steps,
                     "save_every": args_cli.save_every,
                     "obs_layout": {
@@ -350,6 +479,17 @@ def main(env_cfg, agent_cfg):
                         "student_input": "history of policy_obs(21)",
                     },
                     "aux_target": "labels_ml = priv[:, :2] = [m_norm, l_norm]",
+                    "hard_explicit_identity": teacher_context_mode == "split_hard",
+                    "physical_ranges": {
+                        "payload_mass_kg": [
+                            float(env_cfg.payload_mass_range[0]),
+                            float(env_cfg.payload_mass_range[1]),
+                        ],
+                        "rope_length_m": [
+                            float(env_cfg.rope_length_range[0]),
+                            float(env_cfg.rope_length_range[1]),
+                        ],
+                    },
                     "z_stats": {
                         "mean": z_mean.tolist(),
                         "std": z_std.tolist(),
@@ -389,6 +529,7 @@ def main(env_cfg, agent_cfg):
                     "probe_amp": float(args_cli.probe_amp),
                     "probe_freq": float(args_cli.probe_freq),
                     "trace_csv": bool(args_cli.trace_csv),
+                    "teacher_context_mode": teacher_context_mode,
                 }
 
                 collect_report_path = os.path.join(out_dir, "collect_report.json")
@@ -396,6 +537,55 @@ def main(env_cfg, agent_cfg):
                     json.dump(collect_report, f, indent=2)
                 print(f"[Collect] saved collect_report.json -> {collect_report_path}")
                 print("[Collect] saved meta.pt")
+
+                dataset_audit = {
+                    "teacher_context_mode": teacher_context_mode,
+                    "hard_explicit_identity_required": teacher_context_mode == "split_hard",
+                    "num_shards": int(audit_totals["shards"]),
+                    "total_samples": int(audit_totals["samples"]),
+                    "expected_total_samples": int(total_samples),
+                    "sample_count_ok": int(audit_totals["samples"]) == int(total_samples),
+                    "nonfinite_counts": {
+                        "inputs": int(audit_totals["inputs_nonfinite"]),
+                        "labels": int(audit_totals["labels_nonfinite"]),
+                        "labels_ml": int(audit_totals["labels_ml_nonfinite"]),
+                    },
+                    "all_finite": (
+                        int(audit_totals["inputs_nonfinite"])
+                        + int(audit_totals["labels_nonfinite"])
+                        + int(audit_totals["labels_ml_nonfinite"])
+                    )
+                    == 0,
+                    "slow_label_identity_max_abs": float(
+                        audit_totals["slow_identity_max_abs"]
+                    ),
+                    "hard_identity_ok": (
+                        teacher_context_mode != "split_hard"
+                        or float(audit_totals["slow_identity_max_abs"]) == 0.0
+                    ),
+                    "z_stats": meta["z_stats"],
+                    "priv_stats": meta["priv_stats"],
+                    "normalized_slow_coverage_span": [
+                        float(priv_max[i] - priv_min[i]) for i in range(z_exp_dim)
+                    ],
+                }
+                dataset_audit["passed"] = bool(
+                    dataset_audit["sample_count_ok"]
+                    and dataset_audit["all_finite"]
+                    and dataset_audit["hard_identity_ok"]
+                )
+                dataset_audit_path = os.path.join(out_dir, "dataset_audit.json")
+                with open(dataset_audit_path, "w") as audit_file:
+                    json.dump(dataset_audit, audit_file, indent=2)
+                print(
+                    f"[Collect] dataset audit passed={dataset_audit['passed']} "
+                    f"-> {dataset_audit_path}"
+                )
+                if not dataset_audit["passed"]:
+                    raise RuntimeError(
+                        f"Dataset audit failed; collection is not eligible for Student training: "
+                        f"{dataset_audit_path}"
+                    )
 
                 if args_cli.trace_csv and len(trace_rows) > 0:
                     with open(trace_path, "w", newline="") as f:
