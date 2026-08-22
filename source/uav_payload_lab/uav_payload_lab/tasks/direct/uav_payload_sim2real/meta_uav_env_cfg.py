@@ -327,11 +327,14 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # ==========================================
     # [新增] Sim2Real: 延迟与动力学建模
     # ==========================================
-    # 模拟纯链路延迟
-    action_delay_steps: int =   0
-
-    # 模拟电机的物理低通滤波 (0.2表示当前指令占20%，80%继承系统惯性)
+    # Episode-level provisional PX4/actuator transport gap. The old scalar
+    # values are retained as compatibility fallbacks when this profile is off.
+    action_delay_steps: int = 0
     action_lpf_alpha: float = 1.0
+    action_delay_steps_range = (0, 2)
+    action_lpf_alpha_range = (0.35, 1.0)
+    collective_efficiency_range = (0.85, 1.05)
+    moment_efficiency_range = (0.90, 1.10)
 
     # ==========================================
     # [修改] 动作惩罚项

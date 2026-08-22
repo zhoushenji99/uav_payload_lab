@@ -20,6 +20,7 @@ from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
 from .real_hover_gap import (
     diagonal_inertia_flat,
     half_sine_profile,
+    select_delayed_actions,
     select_delayed_ring,
     validate_inertia_diagonal,
 )
@@ -150,14 +151,24 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._policy_actions = torch.zeros_like(self._actions)
         self._prev_policy_actions = torch.zeros_like(self._actions)
 
-        # [新增] 动作延迟队列 (形状: num_envs, delay_steps, action_dim)
-        # 注意处理 delay_steps 为 0 的边界情况
-        self._action_delay_steps = self.cfg.action_delay_steps
-        if self._action_delay_steps > 0:
-            self._action_queue = torch.zeros(
-                (self.num_envs, self._action_delay_steps, self._actions.shape[-1]),
-                device=self.device
-            )
+        # Per-environment action transport: link delay, first-order actuator
+        # response, and conservative thrust/moment effectiveness.
+        delay_lo, delay_hi = getattr(
+            self.cfg,
+            "action_delay_steps_range",
+            (int(self.cfg.action_delay_steps), int(self.cfg.action_delay_steps)),
+        )
+        self._action_max_delay_steps = int(max(delay_lo, delay_hi))
+        self._action_queue = torch.zeros(
+            (self.num_envs, self._action_max_delay_steps + 1, self._actions.shape[-1]),
+            device=self.device,
+        )
+        self._action_delay_steps_per_env = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._action_lpf_alpha_per_env = torch.ones(self.num_envs, 1, device=self.device)
+        self._collective_efficiency = torch.ones(self.num_envs, device=self.device)
+        self._moment_efficiency = torch.ones(self.num_envs, 1, device=self.device)
 
         # [新增] 低通滤波内部状态
         self._filtered_actions = torch.zeros_like(self._actions)
@@ -257,31 +268,29 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._policy_actions = actions.clone()
         self._raw_actions, _, _ = self._decode_px4_ctbr_action(self._policy_actions)
 
-        # 3. 经过延迟队列 (Lagging)
-        if self._action_delay_steps > 0:
-            # 整体左移，丢弃最老的一帧，将最新的一帧放在队尾 (-1)
-            self._action_queue = torch.roll(self._action_queue, shifts=-1, dims=1)
-            self._action_queue[:, -1, :] = self._raw_actions
-            # 取出队头 (0) 作为此时应当执行的动作
-            delayed_actions = self._action_queue[:, 0, :]
-        else:
-            delayed_actions = self._raw_actions
+        # 3. Per-environment link delay.
+        self._action_queue = torch.roll(self._action_queue, shifts=-1, dims=1)
+        self._action_queue[:, -1, :] = self._raw_actions
+        delayed_actions = select_delayed_actions(
+            self._action_queue, self._action_delay_steps_per_env
+        )
 
         # 4. 经过一阶低通滤波 (LPF)
-        alpha = self.cfg.action_lpf_alpha
-        if alpha >= 1.0:
-            self._filtered_actions = delayed_actions.clone()
-        else:
-            self._filtered_actions = (1.0 - alpha) * self._filtered_actions + alpha * delayed_actions
+        alpha = self._action_lpf_alpha_per_env
+        self._filtered_actions = (1.0 - alpha) * self._filtered_actions + alpha * delayed_actions
 
         # 5. PX4 CTBR -> Isaac thrust and moment.
         self._actions, thrust_body_z, rate_sp_isaac = self._decode_px4_ctbr_action(self._filtered_actions)
         self._ctbr_thrust_body_z = thrust_body_z
-        self._thrust[:, 0, 2] = (-thrust_body_z).clamp(0.0, 1.0) * self._F_max
+        self._thrust[:, 0, 2] = (
+            (-thrust_body_z).clamp(0.0, 1.0)
+            * self._F_max
+            * self._collective_efficiency
+        )
 
         rate_meas_b = self._robot.data.root_ang_vel_b
         rate_error = rate_sp_isaac - rate_meas_b
-        moment_cmd = self._ctbr_rate_kp * rate_error
+        moment_cmd = self._ctbr_rate_kp * rate_error * self._moment_efficiency
         self._moment[:, 0, :] = torch.clamp(moment_cmd, -self._ctbr_moment_limit, self._ctbr_moment_limit)
         self._ctbr_rate_cmd = rate_sp_isaac
         self._ctbr_rate_meas = rate_meas_b
@@ -904,6 +913,43 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
             return died, time_out
 
+    def _sample_action_transport(self, env_ids: torch.Tensor) -> None:
+        """Sample provisional actuator/link parameters once per episode."""
+        count = int(env_ids.numel())
+        if count == 0:
+            return
+        delay_lo, delay_hi = getattr(
+            self.cfg,
+            "action_delay_steps_range",
+            (int(self.cfg.action_delay_steps), int(self.cfg.action_delay_steps)),
+        )
+        self._action_delay_steps_per_env[env_ids] = torch.randint(
+            int(delay_lo), int(delay_hi) + 1, (count,), device=self.device
+        )
+        alpha_lo, alpha_hi = getattr(
+            self.cfg, "action_lpf_alpha_range", (self.cfg.action_lpf_alpha, self.cfg.action_lpf_alpha)
+        )
+        collective_lo, collective_hi = getattr(
+            self.cfg, "collective_efficiency_range", (1.0, 1.0)
+        )
+        moment_lo, moment_hi = getattr(self.cfg, "moment_efficiency_range", (1.0, 1.0))
+        self._action_lpf_alpha_per_env[env_ids] = torch.empty(
+            count, 1, device=self.device
+        ).uniform_(float(alpha_lo), float(alpha_hi))
+        self._collective_efficiency[env_ids] = torch.empty(count, device=self.device).uniform_(
+            float(collective_lo), float(collective_hi)
+        )
+        self._moment_efficiency[env_ids] = torch.empty(count, 1, device=self.device).uniform_(
+            float(moment_lo), float(moment_hi)
+        )
+
+    def _fill_action_transport(self, env_ids: torch.Tensor, hover_actions: torch.Tensor) -> None:
+        """Initialize every selected queue slot and filter state at hover."""
+        self._action_queue[env_ids] = hover_actions.unsqueeze(1).expand(
+            -1, self._action_max_delay_steps + 1, -1
+        )
+        self._filtered_actions[env_ids] = hover_actions
+
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
@@ -1036,9 +1082,12 @@ class UavPayloadMetaEnv(DirectRLEnv):
         else:
             self.episode_length_buf[env_ids] = 0
         # [新增]warm
+        self._sample_action_transport(env_ids)
         hover_actions = torch.zeros((len(env_ids), self._actions.shape[-1]), device=self.device)
         F_hover = self._robot_weight[env_ids]
-        hover_actions[:, 0] = (-F_hover / float(self._F_max)).clamp(-1.0, 0.0)
+        hover_actions[:, 0] = (
+            -F_hover / (float(self._F_max) * self._collective_efficiency[env_ids])
+        ).clamp(-1.0, 0.0)
         hover_actions[:, 1:4] = 0.0
 
         self._raw_actions[env_ids] = hover_actions
@@ -1046,10 +1095,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._policy_actions[env_ids] = hover_actions
         self._prev_policy_actions[env_ids] = hover_actions
 
-        if self._action_delay_steps > 0:
-            self._action_queue[env_ids] = hover_actions.unsqueeze(1).repeat(1, self._action_delay_steps, 1)
-
-        self._filtered_actions[env_ids] = hover_actions
+        self._fill_action_transport(env_ids, hover_actions)
         self._actions[env_ids] = hover_actions
         self._prev_actions[env_ids] = hover_actions
         self._ctbr_thrust_body_z[env_ids] = hover_actions[:, 0]

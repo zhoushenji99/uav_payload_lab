@@ -124,6 +124,18 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("def _transport_payload_observation", env)
         self.assertIn("def _reset_payload_sensor_gap", env)
 
+    def test_config_encodes_per_environment_action_transport(self):
+        cfg = CFG_PATH.read_text(encoding="utf-8")
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("action_delay_steps_range = (0, 2)", cfg)
+        self.assertIn("action_lpf_alpha_range = (0.35, 1.0)", cfg)
+        self.assertIn("collective_efficiency_range = (0.85, 1.05)", cfg)
+        self.assertIn("moment_efficiency_range = (0.90, 1.10)", cfg)
+        self.assertIn("_action_delay_steps_per_env", env)
+        self.assertIn("_action_lpf_alpha_per_env", env)
+        self.assertIn("_collective_efficiency", env)
+        self.assertIn("_moment_efficiency", env)
+
 
 if __name__ == "__main__":
     unittest.main()
