@@ -308,6 +308,22 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
     obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)
 
+    # Payload camera/pose pipeline. Most episodes match the measured 25+ FPS
+    # operating region; a small tail covers startup and temporary degradation.
+    enable_payload_sensor_gap = True
+    payload_sensor_tail_probability = 0.15
+    payload_sensor_nominal_hz = (12.0, 30.0)
+    payload_sensor_tail_hz = (5.0, 12.0)
+    payload_sensor_nominal_delay_s = (0.03, 0.15)
+    payload_sensor_tail_delay_s = (0.15, 0.30)
+    payload_sensor_valid_probability = (0.92, 0.98)
+    payload_sensor_hold_cap_s = 0.50
+    payload_position_bias_range_m = (-0.02, 0.02)
+    payload_angle_bias_range_deg = (-3.0, 3.0)
+    attitude_trim_bias_range_deg = (-1.0, 1.0)
+    linear_velocity_bias_range_mps = (-0.03, 0.03)
+    body_rate_bias_range_rps = (-0.01, 0.01)
+
     # ==========================================
     # [新增] Sim2Real: 延迟与动力学建模
     # ==========================================

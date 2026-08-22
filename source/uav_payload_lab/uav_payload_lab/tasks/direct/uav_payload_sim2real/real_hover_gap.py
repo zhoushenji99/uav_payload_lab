@@ -51,3 +51,21 @@ def select_delayed_actions(queue: torch.Tensor, delay_steps: torch.Tensor) -> to
     indices = (max_delay - delay_steps.to(device=queue.device, dtype=torch.long)).clamp(0, max_delay)
     rows = torch.arange(queue.shape[0], device=queue.device)
     return queue[rows, indices]
+
+
+def select_delayed_ring(
+    ring: torch.Tensor,
+    write_index: torch.Tensor,
+    delay_steps: torch.Tensor,
+) -> torch.Tensor:
+    """Select delayed samples from a circular buffer for each environment."""
+    if ring.ndim != 3:
+        raise ValueError("ring must have shape (num_envs, ring_length, sample_dim)")
+    if write_index.shape != (ring.shape[0],) or delay_steps.shape != (ring.shape[0],):
+        raise ValueError("write_index and delay_steps must have shape (num_envs,)")
+    rows = torch.arange(ring.shape[0], device=ring.device)
+    source_index = (
+        write_index.to(device=ring.device, dtype=torch.long)
+        - delay_steps.to(device=ring.device, dtype=torch.long)
+    ) % ring.shape[1]
+    return ring[rows, source_index]

@@ -68,6 +68,20 @@ class RealHoverGapHelperTests(unittest.TestCase):
         out = self.module.select_delayed_actions(queue, torch.tensor([0, 1, 2]))
         torch.testing.assert_close(out[:, 0], torch.tensor([2.0, 11.0, 20.0]))
 
+    def test_select_delayed_ring_uses_per_environment_write_index(self):
+        ring = torch.tensor(
+            [
+                [[0.0], [1.0], [2.0], [3.0]],
+                [[10.0], [11.0], [12.0], [13.0]],
+            ]
+        )
+        out = self.module.select_delayed_ring(
+            ring,
+            write_index=torch.tensor([0, 3]),
+            delay_steps=torch.tensor([1, 2]),
+        )
+        torch.testing.assert_close(out[:, 0], torch.tensor([3.0, 11.0]))
+
 
 class RealHoverGapStaticIntegrationTests(unittest.TestCase):
     def test_config_keeps_interface_and_encodes_measured_uav(self):
@@ -96,6 +110,19 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("downwash_ou_sigma_n_sqrt_s = 0.15", source)
         self.assertIn("downwash_force_clip_n = 1.2", source)
         self.assertIn("residual_accel_norm_max = 5.5", source)
+
+    def test_config_encodes_payload_vision_transport_and_bias(self):
+        cfg = CFG_PATH.read_text(encoding="utf-8")
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("payload_sensor_tail_probability = 0.15", cfg)
+        self.assertIn("payload_sensor_nominal_hz = (12.0, 30.0)", cfg)
+        self.assertIn("payload_sensor_tail_hz = (5.0, 12.0)", cfg)
+        self.assertIn("payload_sensor_nominal_delay_s = (0.03, 0.15)", cfg)
+        self.assertIn("payload_sensor_tail_delay_s = (0.15, 0.30)", cfg)
+        self.assertIn("payload_sensor_valid_probability = (0.92, 0.98)", cfg)
+        self.assertIn("payload_sensor_hold_cap_s = 0.50", cfg)
+        self.assertIn("def _transport_payload_observation", env)
+        self.assertIn("def _reset_payload_sensor_gap", env)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,12 @@ from isaaclab.markers import VisualizationMarkers, CUBOID_MARKER_CFG
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
-from .real_hover_gap import diagonal_inertia_flat, half_sine_profile, validate_inertia_diagonal
+from .real_hover_gap import (
+    diagonal_inertia_flat,
+    half_sine_profile,
+    select_delayed_ring,
+    validate_inertia_diagonal,
+)
 
 
 
@@ -137,6 +142,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self.set_debug_vis(self.cfg.debug_vis)
         # Wind disturbance module (optional)
         self._init_wind_module()
+        self._init_payload_sensor_gap()
 
         # _policy_actions 是网络真 raw 输出，用于 reward 惩罚；_raw_actions 保留为执行边界内的动作缓存。
         self._raw_actions = torch.zeros_like(self._actions)
@@ -347,6 +353,220 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # apply (forces/torques are in body frame, consistent with your thrust)
         self._robot.set_external_force_and_torque(forces, torques, body_ids=body_ids)
 
+    def _init_payload_sensor_gap(self) -> None:
+        """Allocate per-environment payload-camera transport state."""
+        self._payload_sensor_enabled = bool(
+            getattr(self.cfg, "enable_payload_sensor_gap", False)
+        )
+        max_delay_s = max(
+            float(getattr(self.cfg, "payload_sensor_nominal_delay_s", (0.0, 0.0))[1]),
+            float(getattr(self.cfg, "payload_sensor_tail_delay_s", (0.0, 0.0))[1]),
+        )
+        self._payload_ring_len = max(2, int(math.ceil(max_delay_s / self.step_dt)) + 2)
+        self._payload_clean_ring = torch.zeros(
+            self.num_envs, self._payload_ring_len, 5, device=self.device
+        )
+        self._payload_ring_step = torch.full(
+            (self.num_envs, self._payload_ring_len),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._payload_ring_write_idx = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._payload_sensor_elapsed_s = torch.zeros(self.num_envs, device=self.device)
+        self._payload_sensor_period_s = torch.full(
+            (self.num_envs,), self.step_dt, device=self.device
+        )
+        self._payload_sensor_delay_s = torch.zeros(self.num_envs, device=self.device)
+        self._payload_sensor_delay_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._payload_sensor_next_update_s = torch.zeros(self.num_envs, device=self.device)
+        self._payload_sensor_valid_probability = torch.ones(self.num_envs, device=self.device)
+        self._payload_sensor_initialized = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._payload_sensor_held = torch.zeros(self.num_envs, 5, device=self.device)
+        self._payload_sensor_held_rate = torch.zeros(self.num_envs, 2, device=self.device)
+        self._payload_sensor_last_source_step = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
+        self._payload_sensor_last_valid_s = torch.zeros(self.num_envs, device=self.device)
+        self._payload_sensor_valid_updates = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._payload_sensor_dropouts = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._payload_position_bias = torch.zeros(self.num_envs, 3, device=self.device)
+        self._payload_angle_bias = torch.zeros(self.num_envs, 2, device=self.device)
+        self._attitude_trim_bias_rad = torch.zeros(self.num_envs, 2, device=self.device)
+        self._linear_velocity_bias = torch.zeros(self.num_envs, 3, device=self.device)
+        self._body_rate_bias = torch.zeros(self.num_envs, 3, device=self.device)
+        self._reset_payload_sensor_gap(self._robot._ALL_INDICES)
+
+    def _reset_payload_sensor_gap(self, env_ids: torch.Tensor) -> None:
+        """Reset and sample only the requested payload-camera rows."""
+        count = int(env_ids.numel())
+        if count == 0:
+            return
+        device = self.device
+        tail = torch.rand(count, device=device) < float(
+            getattr(self.cfg, "payload_sensor_tail_probability", 0.0)
+        )
+        nominal_hz = getattr(self.cfg, "payload_sensor_nominal_hz", (60.0, 60.0))
+        tail_hz = getattr(self.cfg, "payload_sensor_tail_hz", nominal_hz)
+        nominal_delay = getattr(self.cfg, "payload_sensor_nominal_delay_s", (0.0, 0.0))
+        tail_delay = getattr(self.cfg, "payload_sensor_tail_delay_s", nominal_delay)
+
+        hz_lo = torch.where(
+            tail,
+            torch.full((count,), float(tail_hz[0]), device=device),
+            torch.full((count,), float(nominal_hz[0]), device=device),
+        )
+        hz_hi = torch.where(
+            tail,
+            torch.full((count,), float(tail_hz[1]), device=device),
+            torch.full((count,), float(nominal_hz[1]), device=device),
+        )
+        sampled_hz = hz_lo + (hz_hi - hz_lo) * torch.rand(count, device=device)
+        delay_lo = torch.where(
+            tail,
+            torch.full((count,), float(tail_delay[0]), device=device),
+            torch.full((count,), float(nominal_delay[0]), device=device),
+        )
+        delay_hi = torch.where(
+            tail,
+            torch.full((count,), float(tail_delay[1]), device=device),
+            torch.full((count,), float(nominal_delay[1]), device=device),
+        )
+        sampled_delay = delay_lo + (delay_hi - delay_lo) * torch.rand(count, device=device)
+        valid_lo, valid_hi = getattr(
+            self.cfg, "payload_sensor_valid_probability", (1.0, 1.0)
+        )
+
+        self._payload_sensor_period_s[env_ids] = 1.0 / sampled_hz.clamp_min(1e-6)
+        self._payload_sensor_delay_s[env_ids] = sampled_delay
+        self._payload_sensor_delay_steps[env_ids] = torch.round(
+            sampled_delay / self.step_dt
+        ).to(torch.long).clamp(0, self._payload_ring_len - 1)
+        self._payload_sensor_valid_probability[env_ids] = torch.empty(
+            count, device=device
+        ).uniform_(float(valid_lo), float(valid_hi))
+        self._payload_sensor_elapsed_s[env_ids] = 0.0
+        self._payload_sensor_next_update_s[env_ids] = 0.0
+        self._payload_sensor_initialized[env_ids] = False
+        self._payload_sensor_last_valid_s[env_ids] = 0.0
+        self._payload_sensor_valid_updates[env_ids] = 0
+        self._payload_sensor_dropouts[env_ids] = 0
+        self._payload_sensor_held[env_ids] = 0.0
+        self._payload_sensor_held_rate[env_ids] = 0.0
+        self._payload_sensor_last_source_step[env_ids] = -1
+        self._payload_clean_ring[env_ids] = 0.0
+        self._payload_ring_step[env_ids] = -1
+        self._payload_ring_write_idx[env_ids] = 0
+
+        pos_lo, pos_hi = getattr(self.cfg, "payload_position_bias_range_m", (0.0, 0.0))
+        angle_lo, angle_hi = getattr(self.cfg, "payload_angle_bias_range_deg", (0.0, 0.0))
+        trim_lo, trim_hi = getattr(self.cfg, "attitude_trim_bias_range_deg", (0.0, 0.0))
+        vel_lo, vel_hi = getattr(self.cfg, "linear_velocity_bias_range_mps", (0.0, 0.0))
+        rate_lo, rate_hi = getattr(self.cfg, "body_rate_bias_range_rps", (0.0, 0.0))
+        self._payload_position_bias[env_ids] = torch.empty(count, 3, device=device).uniform_(
+            float(pos_lo), float(pos_hi)
+        )
+        self._payload_angle_bias[env_ids] = torch.empty(count, 2, device=device).uniform_(
+            float(angle_lo), float(angle_hi)
+        )
+        self._attitude_trim_bias_rad[env_ids] = torch.empty(count, 2, device=device).uniform_(
+            math.radians(float(trim_lo)), math.radians(float(trim_hi))
+        )
+        self._linear_velocity_bias[env_ids] = torch.empty(count, 3, device=device).uniform_(
+            float(vel_lo), float(vel_hi)
+        )
+        self._body_rate_bias[env_ids] = torch.empty(count, 3, device=device).uniform_(
+            float(rate_lo), float(rate_hi)
+        )
+
+    def _transport_payload_observation(
+        self,
+        e_load: torch.Tensor,
+        tilt_deg: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply camera timing, latency, dropout, hold, and fixed episode bias."""
+        if not self._payload_sensor_enabled:
+            return e_load, tilt_deg, self._tilt_vel_deg
+
+        rows = torch.arange(self.num_envs, device=self.device)
+        write_idx = self._payload_ring_write_idx
+        clean = torch.cat([e_load, tilt_deg], dim=-1)
+        self._payload_clean_ring[rows, write_idx] = clean
+        current_step = torch.round(self._payload_sensor_elapsed_s / self.step_dt).to(torch.long)
+        self._payload_ring_step[rows, write_idx] = current_step
+        self._payload_sensor_elapsed_s += self.step_dt
+
+        due = self._payload_sensor_elapsed_s >= self._payload_sensor_next_update_s
+        due = due | (~self._payload_sensor_initialized)
+        valid = torch.rand(self.num_envs, device=self.device) <= self._payload_sensor_valid_probability
+        stale = (
+            self._payload_sensor_elapsed_s - self._payload_sensor_last_valid_s
+            >= float(getattr(self.cfg, "payload_sensor_hold_cap_s", 0.50))
+        )
+        update = due & (valid | stale | (~self._payload_sensor_initialized))
+        dropout = due & (~update)
+
+        delayed = select_delayed_ring(
+            self._payload_clean_ring,
+            write_idx,
+            self._payload_sensor_delay_steps,
+        )
+        source_idx = (write_idx - self._payload_sensor_delay_steps) % self._payload_ring_len
+        source_step = self._payload_ring_step[rows, source_idx]
+        source_unavailable = source_step < 0
+        first = ~self._payload_sensor_initialized
+        use_current = first | source_unavailable
+        delayed = torch.where(use_current.unsqueeze(-1), clean, delayed)
+        source_step = torch.where(use_current, current_step, source_step)
+
+        measured = delayed.clone()
+        measured[:, :3] += self._payload_position_bias
+        measured[:, 3:5] += self._payload_angle_bias
+        if getattr(self.cfg, "enable_obs_noise", False):
+            measured[:, :3] += torch.randn_like(measured[:, :3]) * float(
+                self.cfg.obs_noise_e_load_std_m
+            )
+            measured[:, 3:5] += torch.randn_like(measured[:, 3:5]) * float(
+                self.cfg.obs_noise_tilt_std_deg
+            )
+
+        source_delta_s = (
+            source_step - self._payload_sensor_last_source_step
+        ).to(torch.float32) * self.step_dt
+        new_rate = torch.where(
+            (self._payload_sensor_initialized & (source_delta_s > 1e-6)).unsqueeze(-1),
+            (measured[:, 3:5] - self._payload_sensor_held[:, 3:5])
+            / source_delta_s.clamp_min(1e-6).unsqueeze(-1),
+            torch.zeros_like(self._payload_sensor_held_rate),
+        )
+        self._payload_sensor_held[update] = measured[update]
+        self._payload_sensor_held_rate[update] = new_rate[update]
+        self._payload_sensor_last_source_step[update] = source_step[update]
+        self._payload_sensor_last_valid_s[update] = self._payload_sensor_elapsed_s[update]
+        self._payload_sensor_initialized[update] = True
+        self._payload_sensor_valid_updates[update] += 1
+        self._payload_sensor_dropouts[dropout] += 1
+        self._payload_sensor_next_update_s[due] = (
+            self._payload_sensor_elapsed_s[due] + self._payload_sensor_period_s[due]
+        )
+        self._payload_ring_write_idx = (write_idx + 1) % self._payload_ring_len
+
+        return (
+            self._payload_sensor_held[:, :3],
+            self._payload_sensor_held[:, 3:5],
+            self._payload_sensor_held_rate,
+        )
+
     def _get_observations(self) -> dict:
         """构造 17 维的观察量:
 
@@ -421,53 +641,32 @@ class UavPayloadMetaEnv(DirectRLEnv):
         w_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
 
         # --- 4) 打包 obs ---------------------------------------------------
-        # =========================
-        # Observation noise
-        # reward still uses clean self._tilt_vel_deg
-        # =========================
-        if getattr(self.cfg, "enable_obs_noise", False):
-            # 1) additive noise on clean signals
+        # Policy-only sensor transport. Reward and critic stay on clean state.
+        if self._payload_sensor_enabled:
+            e_load_obs, tilt_deg_obs, w_deg_obs = self._transport_payload_observation(
+                e_load, tilt_deg
+            )
+            trim_quat = self._quat_from_roll_pitch(self._attitude_trim_bias_rad)
+            root_quat_w_obs = self._quat_multiply(root_quat_w, trim_quat)
+            root_quat_w_obs = root_quat_w_obs / torch.linalg.norm(
+                root_quat_w_obs, dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+            v_b_obs = v_b + self._linear_velocity_bias
+            w_b_obs = w_b + self._body_rate_bias
+            if getattr(self.cfg, "enable_obs_noise", False):
+                v_b_obs = v_b_obs + torch.randn_like(v_b_obs) * float(
+                    self.cfg.obs_noise_v_b_std_mps
+                )
+                w_b_obs = w_b_obs + torch.randn_like(w_b_obs) * float(
+                    self.cfg.obs_noise_w_b_std_rps
+                )
+        elif getattr(self.cfg, "enable_obs_noise", False):
             e_load_obs = e_load + torch.randn_like(e_load) * float(self.cfg.obs_noise_e_load_std_m)
             tilt_deg_obs = tilt_deg + torch.randn_like(tilt_deg) * float(self.cfg.obs_noise_tilt_std_deg)
             v_b_obs = v_b + torch.randn_like(v_b) * float(self.cfg.obs_noise_v_b_std_mps)
             w_b_obs = w_b + torch.randn_like(w_b) * float(self.cfg.obs_noise_w_b_std_rps)
-
-            # 2) quat: v1 先不加噪，避免归一化/参数化问题
             root_quat_w_obs = root_quat_w
-
-            # 3) noisy theta_dot = diff(noisy tilt)
-            if self._obs_prev_tilt_deg is None:
-                self._obs_prev_tilt_deg = torch.zeros_like(tilt_deg_obs)
-                self._obs_has_prev_tilt = torch.zeros(
-                    self.num_envs, dtype=torch.bool, device=self.device
-                )
-
-            delta_tilt_obs = tilt_deg_obs - self._obs_prev_tilt_deg
-            w_deg_obs_raw = torch.where(
-                self._obs_has_prev_tilt.unsqueeze(-1),
-                delta_tilt_obs / max(self.step_dt, 1e-6),
-                torch.zeros_like(delta_tilt_obs),
-            )
-
-            if self._obs_w_deg_filt is None:
-                self._obs_w_deg_filt = torch.zeros_like(w_deg_obs_raw)
-                self._obs_has_prev_w = torch.zeros(
-                    self.num_envs, dtype=torch.bool, device=self.device
-                )
-
-            alpha = float(self.cfg.obs_theta_dot_lpf_alpha)
-
-            w_deg_obs = torch.where(
-                self._obs_has_prev_w.unsqueeze(-1),
-                alpha * self._obs_w_deg_filt + (1.0 - alpha) * w_deg_obs_raw,
-                w_deg_obs_raw,
-            )
-
-            self._obs_w_deg_filt = w_deg_obs.clone()
-            self._obs_has_prev_w[:] = True
-            self._obs_prev_tilt_deg = tilt_deg_obs.clone()
-            self._obs_has_prev_tilt[:] = True
-
+            w_deg_obs = w_deg
         else:
             e_load_obs = e_load
             tilt_deg_obs = tilt_deg
@@ -797,6 +996,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 确保记录的是新一局的真实质量和绳长
         self._log_task_config(env_ids)
         self._reset_wind(env_ids)
+        self._reset_payload_sensor_gap(env_ids)
         # 4. 计算出生位置 (使用 Config 里的 start_pos_w)
         # 加上 env_origins，让无人机分散开，不要叠在一起
         env_origins = self._terrain.env_origins[env_ids]
@@ -1178,6 +1378,30 @@ class UavPayloadMetaEnv(DirectRLEnv):
     @staticmethod
     def _quat_conjugate(q: torch.Tensor) -> torch.Tensor:
         return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+    @staticmethod
+    def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Hamilton product for wxyz quaternions."""
+        w1, x1, y1, z1 = q1.unbind(dim=-1)
+        w2, x2, y2, z2 = q2.unbind(dim=-1)
+        return torch.stack(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _quat_from_roll_pitch(roll_pitch_rad: torch.Tensor) -> torch.Tensor:
+        """Create a zero-yaw wxyz quaternion from roll/pitch calibration bias."""
+        half_roll = 0.5 * roll_pitch_rad[:, 0]
+        half_pitch = 0.5 * roll_pitch_rad[:, 1]
+        cr, sr = torch.cos(half_roll), torch.sin(half_roll)
+        cp, sp = torch.cos(half_pitch), torch.sin(half_pitch)
+        return torch.stack([cr * cp, sr * cp, cr * sp, -sr * sp], dim=-1)
 
     @staticmethod
     def _quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
