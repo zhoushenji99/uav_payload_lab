@@ -69,5 +69,23 @@ class RealHoverGapHelperTests(unittest.TestCase):
         torch.testing.assert_close(out[:, 0], torch.tensor([2.0, 11.0, 20.0]))
 
 
+class RealHoverGapStaticIntegrationTests(unittest.TestCase):
+    def test_config_keeps_interface_and_encodes_measured_uav(self):
+        source = CFG_PATH.read_text(encoding="utf-8")
+        self.assertIn('real_hover_gap_profile = "real_hover_gap_v1"', source)
+        self.assertIn("uav_mass_kg = 3.230", source)
+        self.assertIn("uav_com_m = (0.00389, 0.02922, 0.17422)", source)
+        self.assertIn("uav_inertia_diag_kg_m2 = (0.0763, 0.0762, 0.1500)", source)
+        self.assertIn("proprio_obs_dim = 21", source)
+        self.assertIn("privileged_obs_dim = 5", source)
+
+    def test_env_uses_runtime_physx_overrides_without_editing_usd(self):
+        source = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("def _apply_uav_physics", source)
+        self.assertIn("set_masses", source)
+        self.assertIn("set_coms", source)
+        self.assertIn("set_inertias", source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from isaaclab.markers import VisualizationMarkers, CUBOID_MARKER_CFG
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
+from .real_hover_gap import diagonal_inertia_flat, validate_inertia_diagonal
 
 
 
@@ -87,6 +88,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 1) 找关节（建议你把 USD 里的 PrismaticJoint prim 改名 rope_joint）
         self._rope_joint_id = self._robot.find_joints("rope_joint")[0][0]   # 取第一个匹配到的 joint index
 
+        # Apply the measured UAV rigid-body properties at runtime.  This keeps
+        # the source USD reusable and makes the deployed nominal values auditable.
+        self._apply_uav_physics(self._robot._ALL_INDICES, randomize=False)
+
         # 2) 计算 F_max（固定：只看 UAV body 质量）
         g = float(self.cfg.sim.gravity[2]) if hasattr(self.cfg.sim, "gravity") else -9.81
         g = abs(g)
@@ -102,8 +107,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # self._rope_len = torch.full((self.num_envs,), self.cfg.rope_length, device=self.device)
         self._F_hover = torch.full((self.num_envs,), uav_mass * g, device=self.device)  # 先给个初值
 
-        # 缓存默认 mass / inertia（用于每次reset从“默认值”开始随机）
+        # 缓存默认 mass / COM / inertia（用于每次reset从标称值开始随机）
         self._default_masses_cpu = self._robot.root_physx_view.get_masses().clone()     # (num_envs, num_bodies) on CPU
+        self._default_coms_cpu = self._robot.root_physx_view.get_coms().clone()
         self._default_inertias_cpu = self._robot.root_physx_view.get_inertias().clone() # (num_envs, num_bodies, 9) on CPU
 
         # 记录每个env当前payload质量（放在env device上用于log）
@@ -160,6 +166,50 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._ctbr_rate_cmd = torch.zeros(self.num_envs, 3, device=self.device)
         self._ctbr_rate_meas = torch.zeros(self.num_envs, 3, device=self.device)
         self._ctbr_rate_error = torch.zeros(self.num_envs, 3, device=self.device)
+
+    def _apply_uav_physics(self, env_ids: torch.Tensor, *, randomize: bool) -> None:
+        """Apply measured UAV mass, COM, and a physical diagonal inertia."""
+        if not getattr(self.cfg, "enable_real_hover_gap", False):
+            return
+
+        env_ids_cpu = env_ids.to(device="cpu", dtype=torch.long)
+        count = int(env_ids_cpu.numel())
+        if count == 0:
+            return
+
+        nominal_inertia = validate_inertia_diagonal(self.cfg.uav_inertia_diag_kg_m2)
+        masses = self._robot.root_physx_view.get_masses().clone()
+        coms = self._robot.root_physx_view.get_coms().clone()
+        inertias = self._robot.root_physx_view.get_inertias().clone()
+        body_id = int(self._body_id[0])
+
+        mass_scale = torch.ones(count, dtype=masses.dtype, device="cpu")
+        inertia_scale = torch.ones(count, dtype=inertias.dtype, device="cpu")
+        com_offset = torch.zeros(count, 3, dtype=coms.dtype, device="cpu")
+        if randomize:
+            mass_lo, mass_hi = self.cfg.uav_mass_scale_range
+            inertia_lo, inertia_hi = self.cfg.uav_inertia_scale_range
+            com_lo, com_hi = self.cfg.uav_com_offset_range_m
+            mass_scale.uniform_(float(mass_lo), float(mass_hi))
+            inertia_scale.uniform_(float(inertia_lo), float(inertia_hi))
+            com_offset.uniform_(float(com_lo), float(com_hi))
+
+        masses[env_ids_cpu, body_id] = float(self.cfg.uav_mass_kg) * mass_scale
+        nominal_com = torch.tensor(self.cfg.uav_com_m, dtype=coms.dtype, device="cpu")
+        coms[env_ids_cpu, body_id, :3] = nominal_com.unsqueeze(0) + com_offset
+        inertia_flat = diagonal_inertia_flat(nominal_inertia, device="cpu").to(inertias.dtype)
+        inertias[env_ids_cpu, body_id] = inertia_flat.unsqueeze(0) * inertia_scale.unsqueeze(1)
+
+        if not (
+            torch.isfinite(masses[env_ids_cpu, body_id]).all()
+            and torch.isfinite(coms[env_ids_cpu, body_id]).all()
+            and torch.isfinite(inertias[env_ids_cpu, body_id]).all()
+        ):
+            raise RuntimeError("Real Hover Gap produced non-finite UAV rigid-body properties.")
+
+        self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
+        self._robot.root_physx_view.set_coms(coms, env_ids_cpu)
+        self._robot.root_physx_view.set_inertias(inertias, env_ids_cpu)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -645,6 +695,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 1. 重置 Robot (清除之前的速度、力等)
         self._robot.reset(env_ids)
 
+        # Episode-level UAV property randomization around the measured nominal.
+        self._apply_uav_physics(env_ids, randomize=True)
+
         # 2. 获取默认状态
         joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
@@ -689,8 +742,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         if hasattr(self.cfg, "payload_mass_range"):
             lo, hi = self.cfg.payload_mass_range
             env_ids_cpu = env_ids.to("cpu")
-            # 假设你已经缓存了 _default_masses_cpu
-            masses = self._default_masses_cpu.clone()
+            # Read the current arrays so the UAV randomization above is retained.
+            masses = self._robot.root_physx_view.get_masses().clone()
+            inertias = self._robot.root_physx_view.get_inertias().clone()
             fixed_payload_mass = getattr(
                 self.cfg, "eval_fixed_payload_mass_kg", None
             )
@@ -706,6 +760,15 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 )
             masses[env_ids_cpu, self._payload_id] = new_mass
             self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
+            # Preserve payload shape and density assumption by scaling inertia
+            # linearly from the nominal payload mass.
+            default_payload_mass = self._default_masses_cpu[env_ids_cpu, self._payload_id].clamp_min(1e-6)
+            mass_ratio = new_mass / default_payload_mass
+            inertias[env_ids_cpu, self._payload_id] = (
+                self._default_inertias_cpu[env_ids_cpu, self._payload_id]
+                * mass_ratio.unsqueeze(1)
+            )
+            self._robot.root_physx_view.set_inertias(inertias, env_ids_cpu)
             # 记录到 buffer
             self._payload_mass[env_ids] = new_mass.to(self.device)
             self._robot_weight[env_ids] = masses[env_ids_cpu].sum(dim=1).to(self.device) * self._gravity_magnitude

@@ -96,6 +96,22 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
 
+    # ---------------------------------------------------------------------
+    # Real Hover Gap v1: measured UAV rigid-body properties
+    # The UAV values exclude the separately modelled rod and payload body.
+    # They are applied through the PhysX tensor API; the source USD is kept intact.
+    # ---------------------------------------------------------------------
+    real_hover_gap_profile = "real_hover_gap_v1"
+    enable_real_hover_gap = True
+    uav_mass_kg = 3.230
+    uav_com_m = (0.00389, 0.02922, 0.17422)
+    # The raw measured Izz=0.160 violates Izz <= Ixx + Iyy. 0.150 is the
+    # nearest conservative physical diagonal used for simulation.
+    uav_inertia_diag_kg_m2 = (0.0763, 0.0762, 0.1500)
+    uav_mass_scale_range = (0.975, 1.025)
+    uav_com_offset_range_m = (-0.005, 0.005)
+    uav_inertia_scale_range = (0.90, 1.10)
+
     # 这里先设为 None，实际的 window 类在 env 文件里定义好以后，
     # 会在那里做：UavPayloadLabEnvCfg.ui_window_class_type = UavPayloadLabEnvWindow
     ui_window_class_type = UavPayloadLabEnvWindow
