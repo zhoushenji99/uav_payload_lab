@@ -459,6 +459,11 @@ def main(env_cfg, agent_cfg):
                 p_mean = priv_sum / max(1, total_samples)
                 p_var = priv_sumsq / max(1, total_samples) - p_mean * p_mean
                 p_std = torch.sqrt(torch.clamp(p_var, min=1e-12))
+                real_hover_gap_audit = (
+                    base_env.get_real_hover_gap_audit()
+                    if hasattr(base_env, "get_real_hover_gap_audit")
+                    else {}
+                )
 
                 meta = {
                     "checkpoint": resume_path,
@@ -475,9 +480,29 @@ def main(env_cfg, agent_cfg):
                     "save_every": args_cli.save_every,
                     "obs_layout": {
                         "policy_obs(21)": "err(3),theta(2),theta_dot(2),quat(4),lin_vel(3),ang_vel(3),prev_actions(4)",
-                        "priv(5)": "m_norm(1), l_norm(1), wind_norm(3)",
+                        "priv(5)": "m_norm(1), l_norm(1), residual_accel_norm(3)",
                         "student_input": "history of policy_obs(21)",
                     },
+                    "real_hover_gap_profile": str(
+                        getattr(env_cfg, "real_hover_gap_profile", "disabled")
+                    ),
+                    "uav_mass_kg": float(getattr(env_cfg, "uav_mass_kg", 0.0)),
+                    "payload_sensor_nominal_hz": list(
+                        getattr(env_cfg, "payload_sensor_nominal_hz", (60.0, 60.0))
+                    ),
+                    "payload_sensor_tail_hz": list(
+                        getattr(env_cfg, "payload_sensor_tail_hz", (60.0, 60.0))
+                    ),
+                    "startup_gust_accel_range_mps2": list(
+                        getattr(env_cfg, "startup_gust_accel_range_mps2", (0.0, 0.0))
+                    ),
+                    "downwash_bias_force_range_n": list(
+                        getattr(env_cfg, "downwash_bias_force_range_n", (0.0, 0.0))
+                    ),
+                    "action_delay_steps_range": list(
+                        getattr(env_cfg, "action_delay_steps_range", (0, 0))
+                    ),
+                    "real_hover_gap_audit": real_hover_gap_audit,
                     "aux_target": "labels_ml = priv[:, :2] = [m_norm, l_norm]",
                     "hard_explicit_identity": teacher_context_mode == "split_hard",
                     "physical_ranges": {
@@ -530,6 +555,10 @@ def main(env_cfg, agent_cfg):
                     "probe_freq": float(args_cli.probe_freq),
                     "trace_csv": bool(args_cli.trace_csv),
                     "teacher_context_mode": teacher_context_mode,
+                    "real_hover_gap_profile": str(
+                        getattr(env_cfg, "real_hover_gap_profile", "disabled")
+                    ),
+                    "real_hover_gap_audit": real_hover_gap_audit,
                 }
 
                 collect_report_path = os.path.join(out_dir, "collect_report.json")

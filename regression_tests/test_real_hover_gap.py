@@ -19,6 +19,10 @@ ENV_PATH = (
     REPO_ROOT
     / "source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_sim2real/meta_uav_env.py"
 )
+COLLECT_PATH = (
+    REPO_ROOT
+    / "source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_sim2real/collect_z_dataset.py"
+)
 
 
 def _load_module():
@@ -135,6 +139,21 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("_action_lpf_alpha_per_env", env)
         self.assertIn("_collective_efficiency", env)
         self.assertIn("_moment_efficiency", env)
+
+    def test_dataset_metadata_persists_real_hover_gap_profile(self):
+        source = COLLECT_PATH.read_text(encoding="utf-8")
+        for key in (
+            '"real_hover_gap_profile"',
+            '"uav_mass_kg"',
+            '"payload_sensor_nominal_hz"',
+            '"payload_sensor_tail_hz"',
+            '"startup_gust_accel_range_mps2"',
+            '"downwash_bias_force_range_n"',
+            '"action_delay_steps_range"',
+            '"real_hover_gap_audit"',
+        ):
+            self.assertIn(key, source)
+        self.assertIn("residual_accel_norm(3)", source)
 
 
 if __name__ == "__main__":

@@ -1152,6 +1152,63 @@ class UavPayloadMetaEnv(DirectRLEnv):
         if "log" not in self.extras: self.extras["log"] = dict()
         self.extras["log"].update(extras)
 
+    def get_real_hover_gap_audit(self) -> dict[str, object]:
+        """Return a JSON-serializable snapshot of configured and realized gaps."""
+        def _list(name: str, default):
+            value = getattr(self.cfg, name, default)
+            return [float(item) for item in value]
+
+        audit = {
+            "real_hover_gap_profile": str(
+                getattr(self.cfg, "real_hover_gap_profile", "disabled")
+            ),
+            "uav_mass_kg": float(getattr(self.cfg, "uav_mass_kg", self._uav_mass)),
+            "uav_com_m": _list("uav_com_m", (0.0, 0.0, 0.0)),
+            "uav_inertia_diag_kg_m2": _list(
+                "uav_inertia_diag_kg_m2", (0.0, 0.0, 0.0)
+            ),
+            "payload_sensor_nominal_hz": _list(
+                "payload_sensor_nominal_hz", (60.0, 60.0)
+            ),
+            "payload_sensor_tail_hz": _list(
+                "payload_sensor_tail_hz", (60.0, 60.0)
+            ),
+            "startup_gust_accel_range_mps2": _list(
+                "startup_gust_accel_range_mps2", (0.0, 0.0)
+            ),
+            "downwash_bias_force_range_n": _list(
+                "downwash_bias_force_range_n", (0.0, 0.0)
+            ),
+            "action_delay_steps_range": [
+                int(item)
+                for item in getattr(self.cfg, "action_delay_steps_range", (0, 0))
+            ],
+            "realized": {
+                "payload_sensor_hz_mean": float(
+                    (1.0 / self._payload_sensor_period_s.clamp_min(1e-6)).mean().item()
+                ),
+                "payload_sensor_delay_s_mean": float(
+                    self._payload_sensor_delay_s.mean().item()
+                ),
+                "payload_sensor_valid_updates": int(
+                    self._payload_sensor_valid_updates.sum().item()
+                ),
+                "payload_sensor_dropouts": int(self._payload_sensor_dropouts.sum().item()),
+                "startup_amplitude_mean_mps2": float(self._startup_amplitude.mean().item()),
+                "startup_duration_mean_s": float(self._startup_duration_s.mean().item()),
+                "downwash_force_mean_n": float(
+                    torch.linalg.norm(self._downwash_force_b, dim=-1).mean().item()
+                ),
+                "action_delay_steps_mean": float(
+                    self._action_delay_steps_per_env.float().mean().item()
+                ),
+                "action_lpf_alpha_mean": float(self._action_lpf_alpha_per_env.mean().item()),
+                "collective_efficiency_mean": float(self._collective_efficiency.mean().item()),
+                "moment_efficiency_mean": float(self._moment_efficiency.mean().item()),
+            },
+        }
+        return audit
+
 
     # ---------------------------------------------------------------------
     # Wind disturbance module (optional)
