@@ -225,15 +225,12 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     spin_weight = 0.15   # 【新增】自旋惩罚权重
     heading_weight = 0.5     # 【新增】航向对齐权重，用于抑制 Yaw 角度 (P控制)
     action_smooth_penalty_scale = 0.03
-    # === 任务设置（相对每个 env 的原点，ENU）===
-    # UAV 起点用于reset：payload 初始在 (0.5, 1.0, 0.4)，绳长 0.8 ⇒ UAV z ≈ 1.2
-    #斜飞start_pos_w = (0.5, 1.0, 1.2)
-    #平飞start_pos_w = (2.0, 0.0, 1.2)
-    start_pos_w = (0.0, 0.0, 2.0)
-    # payload 终点用于reward：0.5 1 0.4 → -0.5 0 1.2
-    #斜飞goal_pos_w = (-0.5, 0.0, 1.2)
-    #平飞goal_pos_w = (-2.0, 0.0, 1.2)
-    goal_pos_w = (4.0, 0.0, 2.0)
+    # === 悬停任务（相对每个 env 的原点，ENU）===
+    # UAV 根节点固定从 1.5 m 出生。
+    start_pos_w = (0.0, 0.0, 1.5)
+    # x/y 是 payload 目标；z 是上端参考高度，reset 时再减去本局绳长 L。
+    goal_pos_w = (0.0, 0.0, 1.5)
+    goal_z_subtract_rope_length = True
     # ---------------- RMA Phase-1 (teacher) ----------------
     proprio_obs_dim = 21          # 可观测部分 还得加last action
     privileged_obs_dim = 5        # e_t = [m_norm, l_norm, wind_norm(3)]

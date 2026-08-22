@@ -720,6 +720,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         default_root_state[:, :3] = env_origins + self._start_offset
         # # 设置目标点
         self._desired_pos_w[env_ids] = env_origins + self._goal_offset
+        if self.cfg.goal_z_subtract_rope_length:
+            self._desired_pos_w[env_ids, 2] -= self._rope_lengths[env_ids]
 
         # 5. 写入物理引擎
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)

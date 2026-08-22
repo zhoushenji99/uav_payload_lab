@@ -125,6 +125,8 @@ def parse_args():
         default=0.5,
         help="Auxiliary supervision weight for pred[:, :2] -> [m_norm, l_norm]. 0 disables.",
     )
+    # Project decision (2026-08-20): do not enable this auxiliary ML loss in new experiments.
+    # Keep the legacy option only for reproducing older runs; new commands must use --aux_ml_coef 0.0.
     p.add_argument("--resume", action="store_true", help="Resume training from a saved checkpoint.")
     p.add_argument("--resume_path", type=str, default="", help="Path to checkpoint for resume.")
     return p.parse_args()
