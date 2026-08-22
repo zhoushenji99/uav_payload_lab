@@ -214,6 +214,25 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     wind_scale_uav = 0.4
     wind_scale_payload = 1.0
 
+    # Smooth one-shot perturbation that represents Position-mode handover
+    # with an already moving payload. It avoids non-physical joint teleporting.
+    enable_startup_gust = True
+    startup_gust_accel_range_mps2 = (0.5, 1.5)
+    startup_gust_duration_range_s = (0.4, 1.0)
+    startup_gust_uav_scale = 0.4
+    startup_gust_payload_scale = 1.0
+
+    # Payload-only horizontal force in the UAV body frame. This is kept
+    # separate from ambient wind because rotor downwash is platform-relative.
+    enable_payload_downwash = True
+    downwash_bias_force_range_n = (0.0, 0.8)
+    downwash_ou_sigma_n_sqrt_s = 0.15
+    downwash_ou_theta = 1.0
+    downwash_force_clip_n = 1.2
+
+    # Privileged residual = ambient/startup acceleration + downwash force / m.
+    residual_accel_norm_max = 5.5
+
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------

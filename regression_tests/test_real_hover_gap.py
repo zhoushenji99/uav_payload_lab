@@ -86,6 +86,17 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("set_coms", source)
         self.assertIn("set_inertias", source)
 
+    def test_config_encodes_startup_gust_and_payload_downwash(self):
+        source = CFG_PATH.read_text(encoding="utf-8")
+        self.assertIn("startup_gust_accel_range_mps2 = (0.5, 1.5)", source)
+        self.assertIn("startup_gust_duration_range_s = (0.4, 1.0)", source)
+        self.assertIn("startup_gust_uav_scale = 0.4", source)
+        self.assertIn("startup_gust_payload_scale = 1.0", source)
+        self.assertIn("downwash_bias_force_range_n = (0.0, 0.8)", source)
+        self.assertIn("downwash_ou_sigma_n_sqrt_s = 0.15", source)
+        self.assertIn("downwash_force_clip_n = 1.2", source)
+        self.assertIn("residual_accel_norm_max = 5.5", source)
+
 
 if __name__ == "__main__":
     unittest.main()

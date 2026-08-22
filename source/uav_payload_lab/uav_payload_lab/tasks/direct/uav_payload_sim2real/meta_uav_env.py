@@ -17,7 +17,7 @@ from isaaclab.markers import VisualizationMarkers, CUBOID_MARKER_CFG
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
-from .real_hover_gap import diagonal_inertia_flat, validate_inertia_diagonal
+from .real_hover_gap import diagonal_inertia_flat, half_sine_profile, validate_inertia_diagonal
 
 
 
@@ -210,6 +210,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
         self._robot.root_physx_view.set_coms(coms, env_ids_cpu)
         self._robot.root_physx_view.set_inertias(inertias, env_ids_cpu)
+        if hasattr(self, "_uav_mass_tensor"):
+            self._uav_mass_tensor[env_ids] = masses[env_ids_cpu, body_id].to(self.device)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -283,8 +285,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._wind_step(self.step_dt)
 
     def _apply_action(self):
-        # 默认行为：无风扰时保持原逻辑不变
-        if not getattr(self, "_wind_enabled", False):
+        # Keep the original direct wrench path when all disturbance gaps are off.
+        if not getattr(self, "_disturbance_enabled", False):
             self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
             return
 
@@ -300,15 +302,24 @@ class UavPayloadMetaEnv(DirectRLEnv):
         torques[:, 0, :] = self._moment[:, 0, :]
 
         # --- Wind: compute in world frame -> rotate into each body's frame ---
-        acc_w = self._wind_acc_w  # (N,3) world
+        ambient_acc_w = self._wind_acc_w  # (N,3) world
+        startup_acc_w = self._startup_acc_w  # (N,3) world
         if self._wind_apply_to_uav:
-            F_uav_w = (self._uav_mass_tensor.unsqueeze(-1) * acc_w) * self._wind_scale_uav
+            F_uav_w = self._uav_mass_tensor.unsqueeze(-1) * (
+                ambient_acc_w * self._wind_scale_uav
+                + startup_acc_w * self._startup_gust_uav_scale
+            )
         else:
-            F_uav_w = torch.zeros_like(acc_w)
+            F_uav_w = self._uav_mass_tensor.unsqueeze(-1) * (
+                startup_acc_w * self._startup_gust_uav_scale
+            )
 
         # payload force uses per-env payload mass buffer
-        if self._wind_apply_to_payload and (len(body_ids) > 1):
-            F_pay_w = (self._payload_mass.unsqueeze(-1) * acc_w) * self._wind_scale_payload
+        if len(body_ids) > 1:
+            F_pay_w = self._payload_mass.unsqueeze(-1) * (
+                ambient_acc_w * (self._wind_scale_payload if self._wind_apply_to_payload else 0.0)
+                + startup_acc_w * self._startup_gust_payload_scale
+            )
         else:
             F_pay_w = None
 
@@ -327,7 +338,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
             else:
                 quat_pay_w = quat_uav_w  # fallback (不会崩，但不够准)
 
-            F_pay_b = self._quat_rotate_inverse(quat_pay_w, F_pay_w)
+            # Downwash is sampled in the UAV frame. Convert it to world and
+            # then to the payload frame before adding it to the payload only.
+            downwash_w = self._quat_rotate(quat_uav_w, self._downwash_force_b)
+            F_pay_b = self._quat_rotate_inverse(quat_pay_w, F_pay_w + downwash_w)
             forces[:, 1, :] = forces[:, 1, :] + F_pay_b
 
         # apply (forces/torques are in body frame, consistent with your thrust)
@@ -504,11 +518,17 @@ class UavPayloadMetaEnv(DirectRLEnv):
             l_norm = (self._rope_lengths - float(lo_l)) / denom_l
             l_norm = torch.clamp(l_norm, 0.0, 1.0).unsqueeze(-1)
 
-            # C. Wind in body frame (clean)
-            wind_w = self._wind_acc_w
-            wind_b = self._quat_rotate_inverse(root_quat_w, wind_w)
-            max_wind = getattr(self.cfg, "wind_total_accel_max", 3.0)
-            wind_norm = wind_b / max(max_wind, 1e-6)
+            # C. Control-relevant residual acceleration in the UAV body frame.
+            # It includes ambient/startup acceleration and payload-only downwash.
+            downwash_w = self._quat_rotate(root_quat_w, self._downwash_force_b)
+            residual_w = (
+                self._wind_acc_w * self._wind_scale_payload
+                + self._startup_acc_w * self._startup_gust_payload_scale
+                + downwash_w / self._payload_mass.clamp_min(1e-6).unsqueeze(-1)
+            )
+            residual_b = self._quat_rotate_inverse(root_quat_w, residual_w)
+            max_residual = float(getattr(self.cfg, "residual_accel_norm_max", 5.5))
+            wind_norm = residual_b / max(max_residual, 1e-6)
 
             obs_policy = torch.cat([obs_policy, m_norm, l_norm, wind_norm], dim=-1)
             obs_critic = torch.cat([obs_critic, m_norm, l_norm, wind_norm], dim=-1)
@@ -899,13 +919,23 @@ class UavPayloadMetaEnv(DirectRLEnv):
             getattr(self.cfg, "enable_wind", False)
             and not getattr(self.cfg, "eval_disable_wind", False)
         )
+        self._startup_gust_enabled = bool(getattr(self.cfg, "enable_startup_gust", False))
+        self._downwash_enabled = bool(getattr(self.cfg, "enable_payload_downwash", False))
+        self._disturbance_enabled = bool(
+            self._wind_enabled or self._startup_gust_enabled or self._downwash_enabled
+        )
 
         # always create buffer to avoid attribute errors
         self._wind_acc_w = torch.zeros(self.num_envs, 3, device=self.device)
         self._eval_wind_elapsed_s = torch.zeros(self.num_envs, device=self.device)
-
-        if not self._wind_enabled:
-            return
+        self._startup_acc_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._startup_direction_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._startup_amplitude = torch.zeros(self.num_envs, device=self.device)
+        self._startup_duration_s = torch.zeros(self.num_envs, device=self.device)
+        self._startup_elapsed_s = torch.zeros(self.num_envs, device=self.device)
+        self._downwash_bias_force_b = torch.zeros(self.num_envs, 3, device=self.device)
+        self._downwash_ou_b = torch.zeros(self.num_envs, 3, device=self.device)
+        self._downwash_force_b = torch.zeros(self.num_envs, 3, device=self.device)
 
         # switches
         self._wind_apply_to_uav = bool(getattr(self.cfg, "wind_apply_to_uav", True))
@@ -922,6 +952,11 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._wind_ou_sigma = float(getattr(self.cfg, "wind_ou_sigma", 1.0))
         self._wind_scale_uav = float(getattr(self.cfg, "wind_scale_uav", 0.4))
         self._wind_scale_payload = float(getattr(self.cfg, "wind_scale_payload", 1.0))
+        self._startup_gust_uav_scale = float(getattr(self.cfg, "startup_gust_uav_scale", 0.4))
+        self._startup_gust_payload_scale = float(getattr(self.cfg, "startup_gust_payload_scale", 1.0))
+        self._downwash_ou_sigma = float(getattr(self.cfg, "downwash_ou_sigma_n_sqrt_s", 0.15))
+        self._downwash_ou_theta = float(getattr(self.cfg, "downwash_ou_theta", 1.0))
+        self._downwash_force_clip = float(getattr(self.cfg, "downwash_force_clip_n", 1.2))
         self._eval_wind_scale = float(getattr(self.cfg, "eval_wind_scale", 1.0))
         if not math.isfinite(self._eval_wind_scale) or self._eval_wind_scale < 0.0:
             raise ValueError(
@@ -974,7 +1009,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # body ids for external wrench application
         self._uav_body_idx = int(self._body_id[0])
         self._ext_body_ids = [self._uav_body_idx]
-        if self._wind_apply_to_payload:
+        if self._wind_apply_to_payload or self._startup_gust_enabled or self._downwash_enabled:
             self._ext_body_ids.append(int(self._payload_id))
 
         self._ext_forces_buf = torch.zeros(self.num_envs, len(self._ext_body_ids), 3, device=self.device)
@@ -994,17 +1029,20 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._reset_wind(self._robot._ALL_INDICES)
 
     def _reset_wind(self, env_ids: torch.Tensor):
-        if not getattr(self, "_wind_enabled", False):
+        if not getattr(self, "_disturbance_enabled", getattr(self, "_wind_enabled", False)):
             return
         dev = self.device
         m = int(env_ids.shape[0])
 
         # episode-constant mean wind direction (XY)
-        ang = 2.0 * math.pi * torch.rand(m, device=dev)
-        dir_xy = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)  # (m,2)
-        mag = self._wind_mean_accel_max * torch.rand(m, device=dev)
-        mean_xy = dir_xy * mag.unsqueeze(-1)
-        self._wind_mean[env_ids] = torch.cat([mean_xy, torch.zeros(m, 1, device=dev)], dim=-1)
+        if getattr(self, "_wind_enabled", False):
+            ang = 2.0 * math.pi * torch.rand(m, device=dev)
+            dir_xy = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)  # (m,2)
+            mag = self._wind_mean_accel_max * torch.rand(m, device=dev)
+            mean_xy = dir_xy * mag.unsqueeze(-1)
+            self._wind_mean[env_ids] = torch.cat([mean_xy, torch.zeros(m, 1, device=dev)], dim=-1)
+        else:
+            self._wind_mean[env_ids] = 0.0
 
         # clear gust/ou and timers
         self._wind_gust[env_ids] = 0.0
@@ -1016,16 +1054,46 @@ class UavPayloadMetaEnv(DirectRLEnv):
         dt_next = self._wind_gust_dt_min + (self._wind_gust_dt_max - self._wind_gust_dt_min) * torch.rand(m, device=dev)
         self._wind_t_next[env_ids] = dt_next
 
+        # Smooth random startup pulse in a horizontal world-frame direction.
+        if getattr(self, "_startup_gust_enabled", False):
+            startup_ang = 2.0 * math.pi * torch.rand(m, device=dev)
+            self._startup_direction_w[env_ids] = torch.stack(
+                [torch.cos(startup_ang), torch.sin(startup_ang), torch.zeros(m, device=dev)],
+                dim=-1,
+            )
+            accel_lo, accel_hi = self.cfg.startup_gust_accel_range_mps2
+            duration_lo, duration_hi = self.cfg.startup_gust_duration_range_s
+            self._startup_amplitude[env_ids] = torch.empty(m, device=dev).uniform_(
+                float(accel_lo), float(accel_hi)
+            )
+            self._startup_duration_s[env_ids] = torch.empty(m, device=dev).uniform_(
+                float(duration_lo), float(duration_hi)
+            )
+            self._startup_elapsed_s[env_ids] = 0.0
+            self._startup_acc_w[env_ids] = 0.0
+
+        # Episode-constant payload downwash bias plus a zero-initialized OU term.
+        if getattr(self, "_downwash_enabled", False):
+            downwash_ang = 2.0 * math.pi * torch.rand(m, device=dev)
+            force_lo, force_hi = self.cfg.downwash_bias_force_range_n
+            downwash_mag = torch.empty(m, device=dev).uniform_(float(force_lo), float(force_hi))
+            self._downwash_bias_force_b[env_ids] = torch.stack(
+                [torch.cos(downwash_ang) * downwash_mag, torch.sin(downwash_ang) * downwash_mag, torch.zeros(m, device=dev)],
+                dim=-1,
+            )
+            self._downwash_ou_b[env_ids] = 0.0
+            self._downwash_force_b[env_ids] = self._downwash_bias_force_b[env_ids]
+
     def _wind_step(self, dt: float):
-        """Update wind state and write self._wind_acc_w (world frame)."""
-        if not getattr(self, "_wind_enabled", False):
+        """Update ambient wind, startup pulse, and payload-only downwash."""
+        if not getattr(self, "_disturbance_enabled", getattr(self, "_wind_enabled", False)):
             return
 
         dev = self.device
         n = self.num_envs
         self._eval_wind_elapsed_s += dt
 
-        if getattr(self, "_eval_wind_mode", "training") == "sinusoid":
+        if getattr(self, "_wind_enabled", False) and getattr(self, "_eval_wind_mode", "training") == "sinusoid":
             elapsed = self._eval_wind_elapsed_s
             active = elapsed >= self._eval_wind_start_sec
             phase = (
@@ -1040,53 +1108,71 @@ class UavPayloadMetaEnv(DirectRLEnv):
             self._wind_acc_w.zero_()
             axis_index = 0 if self._eval_wind_axis == "x" else 1
             self._wind_acc_w[:, axis_index] = value * self._eval_wind_scale
-            return
+        elif getattr(self, "_wind_enabled", False):
+            # Existing piecewise gust + OU ambient-wind model.
+            self._wind_t += dt
+            mask = self._wind_t >= self._wind_t_next
+            if mask.any():
+                idx = torch.nonzero(mask).squeeze(-1)
+                m = int(idx.shape[0])
+                ang = 2.0 * math.pi * torch.rand(m, device=dev)
+                dir_xy = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+                mag = self._wind_gust_accel_max * (2.0 * torch.rand(m, device=dev) - 1.0)
+                gust_xy = dir_xy * mag.unsqueeze(-1)
+                self._wind_gust[idx] = torch.cat([gust_xy, torch.zeros(m, 1, device=dev)], dim=-1)
+                self._wind_t[idx] = 0.0
+                dt_next = self._wind_gust_dt_min + (
+                    self._wind_gust_dt_max - self._wind_gust_dt_min
+                ) * torch.rand(m, device=dev)
+                self._wind_t_next[idx] = dt_next
 
-        # gust: piecewise constant
-        self._wind_t += dt
-        mask = self._wind_t >= self._wind_t_next
-        if mask.any():
-            idx = torch.nonzero(mask).squeeze(-1)
-            m = int(idx.shape[0])
+            noise = torch.randn(n, 3, device=dev)
+            if self._wind_axis == "xy":
+                noise[:, 2] = 0.0
+            self._wind_ou = (
+                self._wind_ou
+                + (-self._wind_ou_theta * self._wind_ou) * dt
+                + self._wind_ou_sigma * math.sqrt(max(dt, 1e-6)) * noise
+            )
+            if self._wind_axis == "xy":
+                self._wind_ou[:, 2] = 0.0
 
-            ang = 2.0 * math.pi * torch.rand(m, device=dev)
-            dir_xy = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+            a_w = self._wind_mean + self._wind_gust + self._wind_ou
+            if self._wind_axis == "xy":
+                a_w[:, 2] = 0.0
+            xy = a_w[:, :2]
+            norm = torch.norm(xy, dim=-1).clamp_min(1e-6)
+            scale = torch.clamp(self._wind_total_accel_max / norm, max=1.0)
+            a_w[:, :2] = xy * scale.unsqueeze(-1)
+            if self._wind_axis == "xy":
+                a_w[:, 2] = 0.0
+            # Evaluation scaling is applied after the training-range clamp.
+            self._wind_acc_w = a_w * self._eval_wind_scale
+        else:
+            self._wind_acc_w.zero_()
 
-            # allow +/- gust along sampled direction
-            mag = self._wind_gust_accel_max * (2.0 * torch.rand(m, device=dev) - 1.0)
-            gust_xy = dir_xy * mag.unsqueeze(-1)
-            self._wind_gust[idx] = torch.cat([gust_xy, torch.zeros(m, 1, device=dev)], dim=-1)
+        if getattr(self, "_startup_gust_enabled", False):
+            self._startup_elapsed_s += dt
+            profile = half_sine_profile(self._startup_elapsed_s, self._startup_duration_s)
+            self._startup_acc_w = (
+                self._startup_direction_w
+                * self._startup_amplitude.unsqueeze(-1)
+                * profile.unsqueeze(-1)
+            )
 
-            self._wind_t[idx] = 0.0
-            dt_next = self._wind_gust_dt_min + (self._wind_gust_dt_max - self._wind_gust_dt_min) * torch.rand(m, device=dev)
-            self._wind_t_next[idx] = dt_next
-
-        # OU: smooth, time-varying
-        noise = torch.randn(n, 3, device=dev)
-        if self._wind_axis == "xy":
-            noise[:, 2] = 0.0
-
-        self._wind_ou = self._wind_ou + (-self._wind_ou_theta * self._wind_ou) * dt + self._wind_ou_sigma * math.sqrt(max(dt, 1e-6)) * noise
-        if self._wind_axis == "xy":
-            self._wind_ou[:, 2] = 0.0
-
-        # total accel
-        a_w = self._wind_mean + self._wind_gust + self._wind_ou
-        if self._wind_axis == "xy":
-            a_w[:, 2] = 0.0
-
-        # clamp XY magnitude to avoid blow-ups
-        xy = a_w[:, :2]
-        norm = torch.norm(xy, dim=-1).clamp_min(1e-6)
-        scale = torch.clamp(self._wind_total_accel_max / norm, max=1.0)
-        a_w[:, :2] = xy * scale.unsqueeze(-1)
-        if self._wind_axis == "xy":
-            a_w[:, 2] = 0.0
-
-        # Evaluation-only physical scaling is deliberately applied after the
-        # training-range clamp.  The observation normalization still divides
-        # by cfg.wind_total_accel_max, making scale > 1 a genuine OOD input.
-        self._wind_acc_w = a_w * self._eval_wind_scale
+        if getattr(self, "_downwash_enabled", False):
+            downwash_noise = torch.randn(n, 3, device=dev)
+            downwash_noise[:, 2] = 0.0
+            self._downwash_ou_b = (
+                self._downwash_ou_b
+                + (-self._downwash_ou_theta * self._downwash_ou_b) * dt
+                + self._downwash_ou_sigma * math.sqrt(max(dt, 1e-6)) * downwash_noise
+            )
+            total_force = self._downwash_bias_force_b + self._downwash_ou_b
+            total_force[:, 2] = 0.0
+            force_norm = torch.linalg.norm(total_force[:, :2], dim=-1).clamp_min(1e-6)
+            force_scale = torch.clamp(self._downwash_force_clip / force_norm, max=1.0)
+            self._downwash_force_b = total_force * force_scale.unsqueeze(-1)
 
     # ---------------- Quaternion helpers (wxyz) ----------------
     @staticmethod
