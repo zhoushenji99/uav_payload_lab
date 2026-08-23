@@ -86,6 +86,53 @@ class RealHoverGapHelperTests(unittest.TestCase):
         )
         torch.testing.assert_close(out[:, 0], torch.tensor([3.0, 11.0]))
 
+    def test_normalized_quadratic_thrust_curve_matches_measured_endpoints(self):
+        signal = torch.tensor([0.0, 0.58, 1.0])
+        ratio = self.module.normalized_quadratic_thrust_ratio(
+            signal,
+            (14.584, 5.438, 0.0),
+        )
+        expected_mid = (14.584 * 0.58**2 + 5.438 * 0.58) / (14.584 + 5.438)
+        torch.testing.assert_close(
+            ratio,
+            torch.tensor([0.0, expected_mid, 1.0]),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
+    def test_normalized_quadratic_thrust_curve_inverse_round_trip(self):
+        signal = torch.linspace(0.0, 1.0, 21)
+        ratio = self.module.normalized_quadratic_thrust_ratio(
+            signal,
+            (14.584, 5.438, 0.0),
+        )
+        recovered = self.module.inverse_normalized_quadratic_thrust_ratio(
+            ratio,
+            (14.584, 5.438, 0.0),
+        )
+        torch.testing.assert_close(recovered, signal, atol=1e-6, rtol=0.0)
+
+    def test_lumped_payload_mass_tracks_rope_length_and_ballast(self):
+        total_mass, rope_mass = self.module.compose_lumped_payload_mass(
+            rope_length_m=torch.tensor([0.25, 0.525, 0.8]),
+            ballast_mass_kg=torch.tensor([0.2, 0.5, 0.8]),
+            rope_length_range_m=(0.25, 0.8),
+            rope_mass_range_kg=(0.010, 0.030),
+            fixed_moving_mass_kg=0.10265,
+        )
+        torch.testing.assert_close(
+            rope_mass,
+            torch.tensor([0.010, 0.020, 0.030]),
+            atol=1e-7,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            total_mass,
+            torch.tensor([0.31265, 0.62265, 0.93265]),
+            atol=1e-7,
+            rtol=0.0,
+        )
+
 
 class RealHoverGapStaticIntegrationTests(unittest.TestCase):
     def test_config_keeps_interface_and_encodes_measured_uav(self):
@@ -139,6 +186,26 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("_action_lpf_alpha_per_env", env)
         self.assertIn("_collective_efficiency", env)
         self.assertIn("_moment_efficiency", env)
+
+    def test_env_applies_and_inverts_measured_quadratic_thrust_curve(self):
+        cfg = CFG_PATH.read_text(encoding="utf-8")
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn('ctbr_thrust_model = "normalized_quadratic"', cfg)
+        self.assertIn("normalized_quadratic_thrust_ratio", env)
+        self.assertIn("inverse_normalized_quadratic_thrust_ratio", env)
+        self.assertIn("def _collective_signal_to_thrust_ratio", env)
+        self.assertIn("def _thrust_ratio_to_collective_signal", env)
+
+    def test_config_and_reset_use_lumped_payload_mass_components(self):
+        cfg = CFG_PATH.read_text(encoding="utf-8")
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("payload_ballast_mass_range = (0.2, 0.8)", cfg)
+        self.assertIn("payload_fixed_moving_mass_kg = 0.10265", cfg)
+        self.assertIn("rope_mass_range_kg = (0.010, 0.030)", cfg)
+        self.assertIn("payload_mass_range = (0.31265, 0.93265)", cfg)
+        self.assertIn("compose_lumped_payload_mass", env)
+        self.assertIn("self._payload_ballast_mass", env)
+        self.assertIn("self._rope_mass", env)
 
     def test_dataset_metadata_persists_real_hover_gap_profile(self):
         source = COLLECT_PATH.read_text(encoding="utf-8")

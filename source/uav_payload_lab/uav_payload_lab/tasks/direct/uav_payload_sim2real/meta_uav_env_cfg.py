@@ -155,6 +155,9 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     action_interface = "px4_ctbr"
     ctbr_single_motor_max_thrust_n = 19.73
     ctbr_total_max_thrust_n = 78.92
+    # Bench fit: T_motor = 14.584*u^2 + 5.438*u. Normalize its endpoint
+    # to the independently measured 19.73 N/motor (78.92 N total).
+    ctbr_thrust_model = "normalized_quadratic"
     ctbr_thrust_curve_coeffs = (14.584, 5.438, 0.0)
     ctbr_pwm_range_us = (1150.0, 1900.0)
     measured_voltage_range_v = (23.5, 25.2)
@@ -164,11 +167,17 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     ctbr_moment_limit = (1.0, 1.0, 0.25)
     ctbr_px4_to_isaac_rate_sign = (1.0, -1.0, -1.0)
 
-    # 绳长（m），暂时手动指定；后续可改为从 usd 读取 rope 可视长度
-    rope_length_range = (0.25,0.8) # 绳长随机范围 (米)
+    # Scheme-1 lumped suspended assembly. Rope mass varies linearly with L;
+    # the moving gimbal half and AprilTag plate are fixed at the payload link.
+    rope_length_range = (0.25, 0.8)
+    rope_mass_range_kg = (0.010, 0.030)
+    payload_fixed_moving_mass_kg = 0.10265  # 31.75 g moving gimbal + 70.9 g tag
+    payload_ballast_mass_range = (0.2, 0.8)
 
     use_oracle_mass_obs = True
-    payload_mass_range = (0.3, 0.8)   # kg，每个episode随机
+    # Total mass seen by physics and hard-explicit z0:
+    # fixed moving hardware + length-dependent rope + random ballast.
+    payload_mass_range = (0.31265, 0.93265)
     # Evaluation-only fixed values.  Keep the ranges above unchanged because
     # they define the hard-explicit mass/rope normalization seen in training.
     eval_fixed_rope_length_m: float | None = None

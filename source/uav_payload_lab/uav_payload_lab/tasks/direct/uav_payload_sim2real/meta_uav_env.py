@@ -18,8 +18,11 @@ from isaaclab.utils.math import subtract_frame_transforms
 
 from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
 from .real_hover_gap import (
+    compose_lumped_payload_mass,
     diagonal_inertia_flat,
     half_sine_profile,
+    inverse_normalized_quadratic_thrust_ratio,
+    normalized_quadratic_thrust_ratio,
     select_delayed_actions,
     select_delayed_ring,
     validate_inertia_diagonal,
@@ -120,6 +123,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # 记录每个env当前payload质量（放在env device上用于log）
         self._payload_mass = torch.zeros(self.num_envs, device=self.device)
+        self._payload_ballast_mass = torch.zeros(self.num_envs, device=self.device)
+        self._rope_mass = torch.zeros(self.num_envs, device=self.device)
 
 
         # gravity (float)
@@ -259,6 +264,30 @@ class UavPayloadMetaEnv(DirectRLEnv):
         rate_sp_isaac = decoded[:, 1:4] * self._ctbr_rate_sign
         return decoded, thrust_body_z, rate_sp_isaac
 
+    def _collective_signal_to_thrust_ratio(self, signal: torch.Tensor) -> torch.Tensor:
+        """Map normalized PX4 collective signal to realized thrust ratio."""
+        model = str(getattr(self.cfg, "ctbr_thrust_model", "linear"))
+        if model == "linear":
+            return signal.clamp(0.0, 1.0)
+        if model == "normalized_quadratic":
+            return normalized_quadratic_thrust_ratio(
+                signal,
+                self.cfg.ctbr_thrust_curve_coeffs,
+            )
+        raise ValueError(f"Unsupported ctbr_thrust_model: {model!r}")
+
+    def _thrust_ratio_to_collective_signal(self, thrust_ratio: torch.Tensor) -> torch.Tensor:
+        """Invert the configured collective-thrust model for reset seeding."""
+        model = str(getattr(self.cfg, "ctbr_thrust_model", "linear"))
+        if model == "linear":
+            return thrust_ratio.clamp(0.0, 1.0)
+        if model == "normalized_quadratic":
+            return inverse_normalized_quadratic_thrust_ratio(
+                thrust_ratio,
+                self.cfg.ctbr_thrust_curve_coeffs,
+            )
+        raise ValueError(f"Unsupported ctbr_thrust_model: {model!r}")
+
     def _pre_physics_step(self, actions: torch.Tensor):
         # 1. 记录上一帧动作缓存
         self._prev_raw_actions = self._raw_actions.clone()
@@ -282,8 +311,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 5. PX4 CTBR -> Isaac thrust and moment.
         self._actions, thrust_body_z, rate_sp_isaac = self._decode_px4_ctbr_action(self._filtered_actions)
         self._ctbr_thrust_body_z = thrust_body_z
+        collective_signal = (-thrust_body_z).clamp(0.0, 1.0)
+        thrust_ratio = self._collective_signal_to_thrust_ratio(collective_signal)
         self._thrust[:, 0, 2] = (
-            (-thrust_body_z).clamp(0.0, 1.0)
+            thrust_ratio
             * self._F_max
             * self._collective_efficiency
         )
@@ -1003,9 +1034,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         else:
             # 如果没有随机化配置，给个默认值防止报错
             self._rope_lengths[env_ids] = 0.8
-        # 5. 质量随机化 (你之前的代码好像漏了这一段，我帮你补上，为了Log正确)
+        # 5. Lumped suspended mass: moving gimbal + tag + rope(L) + ballast.
         if hasattr(self.cfg, "payload_mass_range"):
-            lo, hi = self.cfg.payload_mass_range
             env_ids_cpu = env_ids.to("cpu")
             # Read the current arrays so the UAV randomization above is retained.
             masses = self._robot.root_physx_view.get_masses().clone()
@@ -1014,15 +1044,36 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 self.cfg, "eval_fixed_payload_mass_kg", None
             )
             if fixed_payload_mass is None:
-                new_mass = torch.empty(
-                    (len(env_ids_cpu),), device="cpu"
-                ).uniform_(float(lo), float(hi))
-            else:
-                new_mass = torch.full(
-                    (len(env_ids_cpu),),
-                    float(fixed_payload_mass),
-                    device="cpu",
+                ballast_lo, ballast_hi = self.cfg.payload_ballast_mass_range
+                ballast_mass = torch.empty(
+                    (len(env_ids),), device=self.device
+                ).uniform_(float(ballast_lo), float(ballast_hi))
+                new_mass_device, rope_mass = compose_lumped_payload_mass(
+                    self._rope_lengths[env_ids],
+                    ballast_mass,
+                    rope_length_range_m=self.cfg.rope_length_range,
+                    rope_mass_range_kg=self.cfg.rope_mass_range_kg,
+                    fixed_moving_mass_kg=float(self.cfg.payload_fixed_moving_mass_kg),
                 )
+            else:
+                new_mass_device = torch.full(
+                    (len(env_ids),),
+                    float(fixed_payload_mass),
+                    device=self.device,
+                )
+                _, rope_mass = compose_lumped_payload_mass(
+                    self._rope_lengths[env_ids],
+                    torch.zeros_like(new_mass_device),
+                    rope_length_range_m=self.cfg.rope_length_range,
+                    rope_mass_range_kg=self.cfg.rope_mass_range_kg,
+                    fixed_moving_mass_kg=float(self.cfg.payload_fixed_moving_mass_kg),
+                )
+                ballast_mass = (
+                    new_mass_device
+                    - float(self.cfg.payload_fixed_moving_mass_kg)
+                    - rope_mass
+                )
+            new_mass = new_mass_device.to("cpu")
             masses[env_ids_cpu, self._payload_id] = new_mass
             self._robot.root_physx_view.set_masses(masses, env_ids_cpu)
             # Preserve payload shape and density assumption by scaling inertia
@@ -1035,7 +1086,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
             )
             self._robot.root_physx_view.set_inertias(inertias, env_ids_cpu)
             # 记录到 buffer
-            self._payload_mass[env_ids] = new_mass.to(self.device)
+            self._payload_mass[env_ids] = new_mass_device
+            self._payload_ballast_mass[env_ids] = ballast_mass
+            self._rope_mass[env_ids] = rope_mass
             self._robot_weight[env_ids] = masses[env_ids_cpu].sum(dim=1).to(self.device) * self._gravity_magnitude
 
         # === 6.【关键修改】随机化完参数后，立刻记本局参数 ===
@@ -1085,9 +1138,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._sample_action_transport(env_ids)
         hover_actions = torch.zeros((len(env_ids), self._actions.shape[-1]), device=self.device)
         F_hover = self._robot_weight[env_ids]
-        hover_actions[:, 0] = (
-            -F_hover / (float(self._F_max) * self._collective_efficiency[env_ids])
-        ).clamp(-1.0, 0.0)
+        hover_thrust_ratio = (
+            F_hover / (float(self._F_max) * self._collective_efficiency[env_ids])
+        ).clamp(0.0, 1.0)
+        hover_actions[:, 0] = -self._thrust_ratio_to_collective_signal(hover_thrust_ratio)
         hover_actions[:, 1:4] = 0.0
 
         self._raw_actions[env_ids] = hover_actions
@@ -1139,11 +1193,15 @@ class UavPayloadMetaEnv(DirectRLEnv):
     def _log_task_config(self, env_ids):
         m = self._payload_mass[env_ids]
         l = self._rope_lengths[env_ids]
+        ballast = self._payload_ballast_mass[env_ids]
+        rope_mass = self._rope_mass[env_ids]
 
         extras = dict()
         extras["Metrics/payload_mass_true_mean"] = float(m.mean().item())
         extras["Metrics/payload_mass_true_min"]  = float(m.min().item())
         extras["Metrics/payload_mass_true_max"]  = float(m.max().item())
+        extras["Metrics/payload_ballast_mass_mean"] = float(ballast.mean().item())
+        extras["Metrics/rope_mass_mean"] = float(rope_mass.mean().item())
 
         extras["Metrics/rope_length_mean"] = float(l.mean().item())
         extras["Metrics/rope_length_min"]  = float(l.min().item())
@@ -1179,6 +1237,17 @@ class UavPayloadMetaEnv(DirectRLEnv):
             "downwash_bias_force_range_n": _list(
                 "downwash_bias_force_range_n", (0.0, 0.0)
             ),
+            "payload_ballast_mass_range": _list(
+                "payload_ballast_mass_range", (0.0, 0.0)
+            ),
+            "payload_fixed_moving_mass_kg": float(
+                getattr(self.cfg, "payload_fixed_moving_mass_kg", 0.0)
+            ),
+            "rope_mass_range_kg": _list("rope_mass_range_kg", (0.0, 0.0)),
+            "ctbr_thrust_model": str(getattr(self.cfg, "ctbr_thrust_model", "linear")),
+            "ctbr_thrust_curve_coeffs": _list(
+                "ctbr_thrust_curve_coeffs", (0.0, 1.0, 0.0)
+            ),
             "action_delay_steps_range": [
                 int(item)
                 for item in getattr(self.cfg, "action_delay_steps_range", (0, 0))
@@ -1205,6 +1274,10 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 "action_lpf_alpha_mean": float(self._action_lpf_alpha_per_env.mean().item()),
                 "collective_efficiency_mean": float(self._collective_efficiency.mean().item()),
                 "moment_efficiency_mean": float(self._moment_efficiency.mean().item()),
+                "payload_ballast_mass_mean_kg": float(
+                    self._payload_ballast_mass.mean().item()
+                ),
+                "rope_mass_mean_kg": float(self._rope_mass.mean().item()),
             },
         }
         return audit
