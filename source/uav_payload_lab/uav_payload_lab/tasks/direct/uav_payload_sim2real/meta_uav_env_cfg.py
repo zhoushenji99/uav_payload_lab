@@ -98,12 +98,16 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
 
     # ---------------------------------------------------------------------
     # Real Hover Gap v1: measured UAV rigid-body properties
-    # The UAV values exclude the separately modelled rod and payload body.
+    # The 3.100 kg bare-airframe measurement excludes the gimbal. One measured
+    # half of the 63.5 g two-stage gimbal is fixed to the UAV root; the other
+    # half is included in payload_fixed_moving_mass_kg below.
     # They are applied through the PhysX tensor API; the source USD is kept intact.
     # ---------------------------------------------------------------------
     real_hover_gap_profile = "real_hover_gap_v1"
     enable_real_hover_gap = True
-    uav_mass_kg = 3.230
+    uav_bare_mass_kg = 3.100
+    uav_fixed_gimbal_mass_kg = 0.03175
+    uav_mass_kg = uav_bare_mass_kg + uav_fixed_gimbal_mass_kg
     uav_com_m = (0.00389, 0.02922, 0.17422)
     # The raw measured Izz=0.160 violates Izz <= Ixx + Iyy. 0.150 is the
     # nearest conservative physical diagonal used for simulation.
