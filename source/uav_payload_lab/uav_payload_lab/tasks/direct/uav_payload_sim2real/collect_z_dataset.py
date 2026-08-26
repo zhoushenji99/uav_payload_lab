@@ -273,12 +273,23 @@ def main(env_cfg, agent_cfg):
     shard_labels = []
     shard_labels_ml = []
     shard_sources = []
+    shard_seeds = []
+    shard_env_ids = []
+    shard_episode_ids = []
+    shard_episode_steps = []
     shard_idx = 0
     step_count = 0
     warmup = position_precondition_steps + history_len
     stored_steps = 0
     stored_samples = 0
     skipped_incomplete_samples = 0
+    collection_seed = int(
+        args_cli.seed if args_cli.seed is not None else getattr(env_cfg, "seed", 42)
+    )
+    env_ids_all = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
+    episode_generation = torch.zeros_like(env_ids_all)
+    episode_ids = env_ids_all.clone()
+    episode_steps = torch.zeros_like(env_ids_all)
     # meta stats accumulators (CPU)
     z_sum = torch.zeros(z_dim)
     z_sumsq = torch.zeros(z_dim)
@@ -384,6 +395,18 @@ def main(env_cfg, agent_cfg):
                     shard_sources.append(
                         position_history_mask[valid_history_mask].detach().clone().cpu().to(torch.uint8)
                     )
+                    shard_seeds.append(
+                        torch.full((valid_count,), collection_seed, dtype=torch.int64)
+                    )
+                    shard_env_ids.append(
+                        env_ids_all[valid_history_mask].detach().clone().cpu().to(torch.int64)
+                    )
+                    shard_episode_ids.append(
+                        episode_ids[valid_history_mask].detach().clone().cpu().to(torch.int64)
+                    )
+                    shard_episode_steps.append(
+                        episode_steps[valid_history_mask].detach().clone().cpu().to(torch.int64)
+                    )
                     stored_steps += 1
                     stored_samples += valid_count
 
@@ -435,9 +458,16 @@ def main(env_cfg, agent_cfg):
 
             # ---- 6) update last_actions & reset buffers for done envs ----
             done_mask = dones.to(dtype=torch.bool).reshape(-1)
+            episode_steps += 1
             if torch.any(done_mask):
                 obs_history[done_mask] = 0.0
                 history_fill_count[done_mask] = 0
+                episode_generation[done_mask] += 1
+                episode_ids[done_mask] = (
+                    episode_generation[done_mask] * env.num_envs
+                    + env_ids_all[done_mask]
+                )
+                episode_steps[done_mask] = 0
                 policy_nn.reset(done_mask)
 
             step_count += 1
@@ -449,6 +479,13 @@ def main(env_cfg, agent_cfg):
                     labels = torch.cat(shard_labels, dim=0)
                     labels_ml = torch.cat(shard_labels_ml, dim=0)
                     history_source = torch.cat(shard_sources, dim=0)
+                    sample_seed = torch.cat(shard_seeds, dim=0)
+                    sample_env_id = torch.cat(shard_env_ids, dim=0)
+                    sample_episode_id = torch.cat(shard_episode_ids, dim=0)
+                    sample_episode_step = torch.cat(shard_episode_steps, dim=0)
+                    episode_keys = torch.unique(
+                        torch.stack((sample_seed, sample_episode_id), dim=1), dim=0
+                    ).tolist()
                     shard_audit = audit_shard_tensors(
                         inputs,
                         labels,
@@ -478,6 +515,11 @@ def main(env_cfg, agent_cfg):
                             "labels": labels,
                             "labels_ml": labels_ml,
                             "history_source": history_source,
+                            "seed": sample_seed,
+                            "env_id": sample_env_id,
+                            "episode_id": sample_episode_id,
+                            "episode_step": sample_episode_step,
+                            "episode_keys": episode_keys,
                         },
                         shard_path,
                     )
@@ -490,6 +532,10 @@ def main(env_cfg, agent_cfg):
                     shard_labels.clear()
                     shard_labels_ml.clear()
                     shard_sources.clear()
+                    shard_seeds.clear()
+                    shard_env_ids.clear()
+                    shard_episode_ids.clear()
+                    shard_episode_steps.clear()
                     shard_idx += 1
 
             # stop condition
@@ -499,6 +545,13 @@ def main(env_cfg, agent_cfg):
                     labels = torch.cat(shard_labels, dim=0)
                     labels_ml = torch.cat(shard_labels_ml, dim=0)
                     history_source = torch.cat(shard_sources, dim=0)
+                    sample_seed = torch.cat(shard_seeds, dim=0)
+                    sample_env_id = torch.cat(shard_env_ids, dim=0)
+                    sample_episode_id = torch.cat(shard_episode_ids, dim=0)
+                    sample_episode_step = torch.cat(shard_episode_steps, dim=0)
+                    episode_keys = torch.unique(
+                        torch.stack((sample_seed, sample_episode_id), dim=1), dim=0
+                    ).tolist()
                     shard_audit = audit_shard_tensors(
                         inputs,
                         labels,
@@ -528,6 +581,11 @@ def main(env_cfg, agent_cfg):
                             "labels": labels,
                             "labels_ml": labels_ml,
                             "history_source": history_source,
+                            "seed": sample_seed,
+                            "env_id": sample_env_id,
+                            "episode_id": sample_episode_id,
+                            "episode_step": sample_episode_step,
+                            "episode_keys": episode_keys,
                         },
                         shard_path,
                     )

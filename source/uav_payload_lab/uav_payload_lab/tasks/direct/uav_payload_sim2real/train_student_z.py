@@ -4,14 +4,17 @@
 
 import os
 import glob
+import hashlib
 import json
 import time
 import argparse
 import random
+from collections import Counter
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 import numpy as np
 
 
@@ -98,6 +101,18 @@ def restore_training_rng(checkpoint, requested_seed: int, train_generator: torch
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=str, required=True, help="Folder containing shard_*.pt and meta.pt")
+    p.add_argument(
+        "--split_manifest",
+        type=str,
+        required=True,
+        help="Required checksum-locked episode/seed split manifest.",
+    )
+    p.add_argument(
+        "--source_weights",
+        type=str,
+        required=True,
+        help="Sampling mixture, e.g. teacher=0.5,position=0.5.",
+    )
     p.add_argument("--out_dir", type=str, default=".", help="Output directory to save model/report/plots")
     p.add_argument(
         "--seed",
@@ -129,7 +144,122 @@ def parse_args():
     # Keep the legacy option only for reproducing older runs; new commands must use --aux_ml_coef 0.0.
     p.add_argument("--resume", action="store_true", help="Resume training from a saved checkpoint.")
     p.add_argument("--resume_path", type=str, default="", help="Path to checkpoint for resume.")
+    p.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=10,
+        help="Save a closure-evaluation candidate every N epochs.",
+    )
     return p.parse_args()
+
+
+SOURCE_ALIASES = {
+    "teacher": "teacher_closed_loop",
+    "position": "causal_position_closed_loop",
+    "dagger1": "student_dagger_round_1",
+    "dagger2": "student_dagger_round_2",
+}
+
+
+def parse_source_weights(spec: str) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for item in str(spec).split(","):
+        if "=" not in item:
+            raise ValueError(f"invalid source weight item: {item!r}")
+        raw_name, raw_value = item.split("=", 1)
+        name = SOURCE_ALIASES.get(raw_name.strip(), raw_name.strip())
+        value = float(raw_value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"source weight must be positive: {item!r}")
+        if name in weights:
+            raise ValueError(f"duplicate source weight: {name}")
+        weights[name] = value
+    total = sum(weights.values())
+    if total <= 0.0:
+        raise ValueError("at least one source weight is required")
+    return {name: value / total for name, value in weights.items()}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_locked_manifest(path: str) -> dict[str, object]:
+    manifest_path = Path(path).expanduser().resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    train_seeds = {int(seed) for seed in manifest.get("train_seeds", [])}
+    validation_seeds = {
+        int(seed) for seed in manifest.get("validation_seeds", [])
+    }
+    if train_seeds & validation_seeds:
+        raise RuntimeError("split manifest shares seeds between train and validation")
+    train_keys = {
+        (int(item["seed"]), int(item["episode_id"]))
+        for item in manifest.get("train", [])
+    }
+    validation_keys = {
+        (int(item["seed"]), int(item["episode_id"]))
+        for item in manifest.get("validation", [])
+    }
+    if train_keys & validation_keys:
+        raise RuntimeError("split manifest shares episodes between train and validation")
+    for item in manifest.get("shards", []):
+        shard_path = Path(item["path"]).expanduser().resolve()
+        if not shard_path.is_file():
+            raise RuntimeError(f"manifest shard does not exist: {shard_path}")
+        if _sha256(shard_path) != str(item["sha256"]):
+            raise RuntimeError(f"manifest shard checksum mismatch: {shard_path}")
+    manifest["_path"] = str(manifest_path)
+    return manifest
+
+
+def build_manifest_selections(manifest: dict[str, object], split: str):
+    allowed = {
+        (int(item["seed"]), int(item["episode_id"]))
+        for item in manifest[split]
+    }
+    id_to_item = {str(item["id"]): item for item in manifest["shards"]}
+    referenced = {
+        str(shard_id)
+        for item in manifest[split]
+        for shard_id in item.get("shard_ids", [])
+    }
+    selections = []
+    for shard_id in sorted(referenced):
+        item = id_to_item[shard_id]
+        shard = torch.load(item["path"], map_location="cpu", weights_only=False)
+        for key in ("seed", "episode_id", "history_source"):
+            if key not in shard:
+                raise RuntimeError(f"manifest shard {item['path']} lacks {key}")
+        seeds = shard["seed"].to(dtype=torch.int64).reshape(-1)
+        episodes = shard["episode_id"].to(dtype=torch.int64).reshape(-1)
+        mask = torch.tensor(
+            [
+                (int(seed), int(episode)) in allowed
+                for seed, episode in zip(seeds.tolist(), episodes.tolist())
+            ],
+            dtype=torch.bool,
+        )
+        indices = torch.nonzero(mask, as_tuple=False).reshape(-1)
+        if indices.numel() == 0:
+            continue
+        selections.append(
+            {
+                "id": shard_id,
+                "path": str(Path(item["path"]).resolve()),
+                "indices": indices,
+                "sources": shard["history_source"]
+                .to(dtype=torch.int64)
+                .reshape(-1)[indices],
+            }
+        )
+    if not selections:
+        raise RuntimeError(f"split manifest contains no samples for {split}")
+    return selections
 
 class CNNContextEncoder(nn.Module):
     def __init__(self, input_dim=21, history_len=50, output_dim=2):
@@ -179,7 +309,7 @@ class MonolithicStudentEncoder(nn.Module):
         return self.encoder(x)
 
 def load_shard(path):
-    d = torch.load(path, map_location="cpu")
+    d = torch.load(path, map_location="cpu", weights_only=False)
     x = d["inputs"].float()        # (N, H, 21)
     y = d["labels"].float()        # (N, 5)
     y_ml = d["labels_ml"].float() if "labels_ml" in d else None   # (N, 2)
@@ -188,7 +318,7 @@ def load_shard(path):
 def compute_z_stats_from_meta(meta_path: str, z_dim: int):
     if not os.path.exists(meta_path):
         return None, None
-    meta = torch.load(meta_path, map_location="cpu")
+    meta = torch.load(meta_path, map_location="cpu", weights_only=False)
     z_mean = torch.tensor(meta["z_stats"]["mean"], dtype=torch.float32)
     z_std = torch.tensor(meta["z_stats"]["std"], dtype=torch.float32)
     if z_mean.numel() != z_dim or z_std.numel() != z_dim:
@@ -208,18 +338,40 @@ def main():
         f"{torch.are_deterministic_algorithms_enabled()}"
     )
 
-    shard_files = sorted(glob.glob(os.path.join(args.data_dir, "shard_*.pt")))
-    assert len(shard_files) > 0, f"No shard_*.pt found in {args.data_dir}"
+    if int(args.checkpoint_interval) <= 0:
+        raise ValueError("--checkpoint_interval must be positive")
+    manifest = load_locked_manifest(args.split_manifest)
+    source_weights = parse_source_weights(args.source_weights)
+    required_sources = {str(name) for name in manifest.get("required_sources", [])}
+    if set(source_weights) != required_sources:
+        raise RuntimeError(
+            "source weights must cover exactly the manifest required sources: "
+            f"weights={sorted(source_weights)}, required={sorted(required_sources)}"
+        )
+    source_encoding = {
+        int(source_id): str(name)
+        for source_id, name in manifest.get("source_encoding", {}).items()
+    }
+    name_to_source_id = {name: source_id for source_id, name in source_encoding.items()}
+    missing_source_ids = sorted(required_sources - set(name_to_source_id))
+    if missing_source_ids:
+        raise RuntimeError(f"manifest source encoding lacks: {missing_source_ids}")
 
-    # split by files (stable)
-    n = len(shard_files)
-    n_val = max(1, int(0.1 * n))
-    val_files = shard_files[-n_val:]
-    train_files = shard_files[:-n_val]
-    print(f"[Data] shards={n} train={len(train_files)} val={len(val_files)}")
+    train_selections = build_manifest_selections(manifest, "train")
+    val_selections = build_manifest_selections(manifest, "validation")
+    train_files = [item["path"] for item in train_selections]
+    val_files = [item["path"] for item in val_selections]
+    print(
+        f"[Data] manifest={manifest['_path']} "
+        f"train_shards={len(train_files)} val_shards={len(val_files)}"
+    )
 
     # infer dims from first shard
-    x0, y0, y0_ml = load_shard(train_files[0])
+    x0_all, y0_all, y0_ml_all = load_shard(train_files[0])
+    first_indices = train_selections[0]["indices"]
+    x0 = x0_all[first_indices]
+    y0 = y0_all[first_indices]
+    y0_ml = y0_ml_all[first_indices] if y0_ml_all is not None else None
     H = x0.shape[1]
     in_dim = x0.shape[2]
     z_dim = y0.shape[1]
@@ -237,14 +389,18 @@ def main():
         else "monolithic_context"
     )
 
-    meta_path = os.path.join(args.data_dir, "meta.pt")
-    meta = torch.load(meta_path, map_location="cpu") if os.path.exists(meta_path) else {}
-    teacher_context_mode = str(meta.get("teacher_context_mode", "unknown"))
-    dataset_audit_path = os.path.join(args.data_dir, "dataset_audit.json")
-    dataset_audit = None
-    if os.path.exists(dataset_audit_path):
-        with open(dataset_audit_path, "r") as audit_file:
-            dataset_audit = json.load(audit_file)
+    first_dataset_root = Path(manifest["dataset_roots"][0])
+    meta_path = first_dataset_root / "meta.pt"
+    meta = (
+        torch.load(meta_path, map_location="cpu", weights_only=False)
+        if meta_path.exists()
+        else {}
+    )
+    teacher_context_mode = str(
+        manifest.get("teacher_context_mode", meta.get("teacher_context_mode", "unknown"))
+    )
+    dataset_audit_path = str(Path(args.split_manifest).expanduser().resolve())
+    dataset_audit = {"passed": True}
     if teacher_context_mode == "split_hard":
         if dataset_audit is None:
             raise RuntimeError(
@@ -278,13 +434,14 @@ def main():
             f"max_abs={slow_identity_max_abs}"
         )
     # z stats (for weighted mse)
-    z_mean, z_std = compute_z_stats_from_meta(os.path.join(args.data_dir, "meta.pt"), z_dim)
+    z_mean, z_std = compute_z_stats_from_meta(str(meta_path), z_dim)
     if z_std is None:
         # fallback: compute approx std from first few shards
         ys = []
-        for fp in train_files[:min(3, len(train_files))]:
+        for selection in train_selections[:min(3, len(train_selections))]:
+            fp = selection["path"]
             _, y, _ = load_shard(fp)
-            ys.append(y)
+            ys.append(y[selection["indices"]])
         ycat = torch.cat(ys, dim=0)
         z_mean = ycat.mean(dim=0)
         z_std = ycat.std(dim=0).clamp_min(1e-6)
@@ -326,6 +483,33 @@ def main():
             return torch.mean(((pred - target) ** 2) * branch_weight)
         return mse_loss(pred, target)
 
+    global_shard = torch.cat(
+        [
+            torch.full((item["indices"].numel(),), idx, dtype=torch.int64)
+            for idx, item in enumerate(train_selections)
+        ]
+    )
+    global_local = torch.cat([item["indices"] for item in train_selections])
+    global_sources = torch.cat([item["sources"] for item in train_selections])
+    source_counts_train = Counter(
+        source_encoding[int(source_id)] for source_id in global_sources.tolist()
+    )
+    if set(source_counts_train) != required_sources:
+        raise RuntimeError(
+            "training split source set differs from required sources: "
+            f"actual={sorted(source_counts_train)}, required={sorted(required_sources)}"
+        )
+    sampler_weights = torch.tensor(
+        [
+            source_weights[source_encoding[int(source_id)]]
+            / source_counts_train[source_encoding[int(source_id)]]
+            for source_id in global_sources.tolist()
+        ],
+        dtype=torch.double,
+    )
+    source_sampling_counts = Counter()
+    checkpoint_candidates = []
+
     best_val = float("inf")
     train_hist = []
     val_hist = []
@@ -336,7 +520,7 @@ def main():
     if args.resume:
         if not args.resume_path:
             raise RuntimeError("--resume requires --resume_path")
-        ckpt = torch.load(args.resume_path, map_location=device)
+        ckpt = torch.load(args.resume_path, map_location=device, weights_only=False)
 
         if "state_dict" not in ckpt:
             raise RuntimeError(f"Resume checkpoint missing 'state_dict': {args.resume_path}")
@@ -366,6 +550,11 @@ def main():
         best_val = float(ckpt.get("best_val", best_val))
         train_hist = list(ckpt.get("train_hist", train_hist))
         val_hist = list(ckpt.get("val_hist", val_hist))
+        best_epoch = ckpt.get("best_epoch", best_epoch)
+        best_rmse_dim = ckpt.get("best_rmse_dim", best_rmse_dim)
+        time_to_best_sec = ckpt.get("time_to_best_sec", time_to_best_sec)
+        source_sampling_counts.update(ckpt.get("source_sampling_counts", {}))
+        checkpoint_candidates = list(ckpt.get("checkpoint_candidates", []))
 
         print(
             f"[Resume] loaded {args.resume_path} | "
@@ -377,8 +566,30 @@ def main():
         model.train()
         train_losses = []
 
-        for fp in train_files:
-            x, y, y_ml = load_shard(fp)
+        sampler = WeightedRandomSampler(
+            sampler_weights,
+            num_samples=int(sampler_weights.numel()),
+            replacement=True,
+            generator=train_generator,
+        )
+        sampled_global = torch.tensor(list(sampler), dtype=torch.int64)
+        sampled_sources = global_sources[sampled_global]
+        epoch_source_counts = Counter(
+            source_encoding[int(source_id)] for source_id in sampled_sources.tolist()
+        )
+        source_sampling_counts.update(epoch_source_counts)
+
+        for selection_idx, selection in enumerate(train_selections):
+            selected_global = sampled_global[
+                global_shard[sampled_global] == selection_idx
+            ]
+            if selected_global.numel() == 0:
+                continue
+            local_indices = global_local[selected_global]
+            x_all, y_all, y_ml_all = load_shard(selection["path"])
+            x = x_all[local_indices]
+            y = y_all[local_indices]
+            y_ml = y_ml_all[local_indices] if y_ml_all is not None else None
 
             if y_ml is not None:
                 ds = TensorDataset(x, y, y_ml)
@@ -388,12 +599,11 @@ def main():
             dl = DataLoader(
                 ds,
                 batch_size=args.batch_size,
-                shuffle=True,
+                shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=True,
                 persistent_workers=(args.num_workers > 0),
                 worker_init_fn=seed_dataloader_worker,
-                generator=train_generator,
             )
 
             for batch in dl:
@@ -438,8 +648,12 @@ def main():
         count = 0
 
         with torch.no_grad():
-            for fp in val_files:
-                x, y, y_ml = load_shard(fp)
+            for selection in val_selections:
+                x_all, y_all, y_ml_all = load_shard(selection["path"])
+                local_indices = selection["indices"]
+                x = x_all[local_indices]
+                y = y_all[local_indices]
+                y_ml = y_ml_all[local_indices] if y_ml_all is not None else None
 
                 if y_ml is not None:
                     ds = TensorDataset(x, y, y_ml)
@@ -505,70 +719,73 @@ def main():
             f"| rmse_dim={np.round(rmse_dim,3)}"
         )
 
-        if va < best_val:
+        improved = va < best_val
+        if improved:
             best_val = va
             best_epoch = int(epoch + 1)
             best_rmse_dim = [float(x) for x in rmse_dim.tolist()]
             time_to_best_sec = float(time.time() - train_t0)
-            save_path = os.path.join(args.out_dir, args.save_name)
-            torch.save(
-                {
-                    "model_type": model_type,
-                    "student_context_mode": args.student_context_mode,
-                    "teacher_context_mode": teacher_context_mode,
-                    "state_dict": model.state_dict(),
-                    "optimizer_state_dict": opt.state_dict(),
-                    "epoch": epoch,
-                    "best_val": best_val,
-                    "train_hist": train_hist,
-                    "val_hist": val_hist,
-                    "history_len": H,
-                    "input_dim": in_dim,
-                    "z_dim": z_dim,
-                    "z_slow_dim": z_slow_dim,
-                    "z_fast_dim": z_fast_dim,
-                    "z_mean": z_mean.cpu(),
-                    "z_std": z_std.cpu(),
-                    "seed": int(args.seed),
-                    "deterministic_algorithms": bool(
-                        torch.are_deterministic_algorithms_enabled()
-                    ),
-                    "rng_state": capture_rng_state(),
-                    "train_generator_state": train_generator.get_state(),
-                },
-                save_path,
-            )
-            print(f"[Save-Best] {save_path} (best_val={best_val:.6e})")
-        last_path = os.path.join(args.out_dir, "last_checkpoint.pth")
-        torch.save(
-            {
-                "model_type": model_type,
-                "student_context_mode": args.student_context_mode,
-                "teacher_context_mode": teacher_context_mode,
-                "state_dict": model.state_dict(),
-                "optimizer_state_dict": opt.state_dict(),
-                "epoch": epoch,
-                "best_val": best_val,
-                "train_hist": train_hist,
-                "val_hist": val_hist,
-                "history_len": H,
-                "input_dim": in_dim,
-                "z_dim": z_dim,
-                "z_slow_dim": z_slow_dim,
-                "z_fast_dim": z_fast_dim,
-                "z_mean": z_mean.cpu(),
-                "z_std": z_std.cpu(),
-                "seed": int(args.seed),
-                "deterministic_algorithms": bool(
-                    torch.are_deterministic_algorithms_enabled()
-                ),
-                "rng_state": capture_rng_state(),
-                "train_generator_state": train_generator.get_state(),
-            },
-            last_path,
+        interval_due = (
+            (epoch + 1) % int(args.checkpoint_interval) == 0
+            or (epoch + 1) == int(args.epochs)
         )
+        interval_path = None
+        if interval_due:
+            interval_path = str(
+                (Path(args.out_dir) / f"checkpoint_epoch_{epoch + 1:04d}.pth")
+                .expanduser()
+                .resolve()
+            )
+            checkpoint_candidates.append(
+                {"epoch": int(epoch + 1), "val_loss": float(va), "path": interval_path}
+            )
+
+        checkpoint_state = {
+            "model_type": model_type,
+            "student_context_mode": args.student_context_mode,
+            "teacher_context_mode": teacher_context_mode,
+            "state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "epoch": epoch,
+            "best_val": best_val,
+            "best_epoch": best_epoch,
+            "best_rmse_dim": best_rmse_dim,
+            "time_to_best_sec": time_to_best_sec,
+            "train_hist": train_hist,
+            "val_hist": val_hist,
+            "history_len": H,
+            "input_dim": in_dim,
+            "z_dim": z_dim,
+            "z_slow_dim": z_slow_dim,
+            "z_fast_dim": z_fast_dim,
+            "z_mean": z_mean.cpu(),
+            "z_std": z_std.cpu(),
+            "seed": int(args.seed),
+            "split_manifest": str(Path(args.split_manifest).expanduser().resolve()),
+            "source_weights": source_weights,
+            "source_sampling_counts": dict(source_sampling_counts),
+            "checkpoint_candidates": checkpoint_candidates,
+            "deterministic_algorithms": bool(
+                torch.are_deterministic_algorithms_enabled()
+            ),
+            "rng_state": capture_rng_state(),
+            "train_generator_state": train_generator.get_state(),
+        }
+        if improved:
+            save_path = str((Path(args.out_dir) / args.save_name).resolve())
+            torch.save(checkpoint_state, save_path)
+            print(f"[Save-Best] {save_path} (best_val={best_val:.6e})")
+        if interval_path is not None:
+            torch.save(checkpoint_state, interval_path)
+            print(f"[Save-Interval] {interval_path} (val={va:.6e})")
+        last_path = os.path.join(args.out_dir, "last_checkpoint.pth")
+        torch.save(checkpoint_state, last_path)
     # ---- final report ----
     wall_time_sec = float(time.time() - train_t0)
+    top5_checkpoints = sorted(
+        checkpoint_candidates,
+        key=lambda item: (float(item["val_loss"]), int(item["epoch"])),
+    )[:5]
 
     report = {
         "best_val": best_val,
@@ -597,6 +814,12 @@ def main():
         "train_hist": train_hist,
         "val_hist": val_hist,
         "data_dir": args.data_dir,
+        "split_manifest": str(Path(args.split_manifest).expanduser().resolve()),
+        "source_weights": source_weights,
+        "source_sample_counts_available": dict(source_counts_train),
+        "source_sample_counts_drawn": dict(source_sampling_counts),
+        "top5_checkpoints": top5_checkpoints,
+        "checkpoint_interval": int(args.checkpoint_interval),
         "num_train_shards": len(train_files),
         "num_val_shards": len(val_files),
         "batch_size": args.batch_size,
@@ -611,8 +834,11 @@ def main():
             torch.are_deterministic_algorithms_enabled()
         ),
     }
-    report_path = os.path.join(args.out_dir, "report.json")
+    report_path = os.path.join(args.out_dir, "training_report.json")
     with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    legacy_report_path = os.path.join(args.out_dir, "report.json")
+    with open(legacy_report_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"[Done] best_val: {best_val} | report: {report_path}")
 

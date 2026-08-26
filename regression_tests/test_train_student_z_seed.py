@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -38,7 +39,17 @@ def test_seed_argument_is_required(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["train_student_z.py", "--data_dir", "/tmp/data", "--seed", "42"],
+        [
+            "train_student_z.py",
+            "--data_dir",
+            "/tmp/data",
+            "--split_manifest",
+            "/tmp/manifest.json",
+            "--source_weights",
+            "teacher=0.5,position=0.5",
+            "--seed",
+            "42",
+        ],
     )
     args = trainer.parse_args()
     assert args.seed == 42
@@ -109,23 +120,78 @@ def _write_tiny_dataset(data_dir: Path):
     for shard_idx in range(10):
         inputs = torch.randn(2, 50, 21, generator=generator)
         labels = torch.randn(2, 5, generator=generator)
+        dataset_seed = 42 if shard_idx < 8 else 101
+        source = shard_idx % 2
         torch.save(
             {
                 "inputs": inputs,
                 "labels": labels,
                 "labels_ml": labels[:, :2].clone(),
+                "seed": torch.full((2,), dataset_seed, dtype=torch.int64),
+                "env_id": torch.tensor([0, 0]),
+                "episode_id": torch.full((2,), shard_idx, dtype=torch.int64),
+                "episode_step": torch.tensor([50, 55]),
+                "history_source": torch.full((2,), source, dtype=torch.uint8),
+                "episode_keys": [[dataset_seed, shard_idx]],
             },
             data_dir / f"shard_{shard_idx:04d}.pt",
         )
     torch.save(
         {
             "teacher_context_mode": "split_hard",
+            "history_source_encoding": {
+                "0": "teacher_closed_loop",
+                "1": "causal_position_closed_loop",
+            },
             "z_stats": {"mean": [0.0] * 5, "std": [1.0] * 5},
         },
         data_dir / "meta.pt",
     )
     (data_dir / "dataset_audit.json").write_text(
         json.dumps({"passed": True}), encoding="utf-8"
+    )
+    shards = []
+    train = []
+    validation = []
+    for shard_idx in range(10):
+        path = (data_dir / f"shard_{shard_idx:04d}.pt").resolve()
+        dataset_seed = 42 if shard_idx < 8 else 101
+        shard_id = f"shard_{shard_idx:06d}"
+        shards.append(
+            {
+                "id": shard_id,
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "sample_count": 2,
+                "seed": dataset_seed,
+                "episode_ids": [shard_idx],
+            }
+        )
+        (train if dataset_seed == 42 else validation).append(
+            {"seed": dataset_seed, "episode_id": shard_idx, "shard_ids": [shard_id]}
+        )
+    manifest = {
+        "schema_version": 1,
+        "dataset_roots": [str(data_dir.resolve())],
+        "teacher_context_mode": "split_hard",
+        "required_sources": ["teacher_closed_loop", "causal_position_closed_loop"],
+        "source_encoding": {
+            "0": "teacher_closed_loop",
+            "1": "causal_position_closed_loop",
+        },
+        "shards": shards,
+        "train_seeds": [42],
+        "validation_seeds": [101],
+        "train": train,
+        "validation": validation,
+        "source_counts": {
+            "all": {"teacher_closed_loop": 10, "causal_position_closed_loop": 10},
+            "train": {"teacher_closed_loop": 8, "causal_position_closed_loop": 8},
+            "validation": {"teacher_closed_loop": 2, "causal_position_closed_loop": 2},
+        },
+    }
+    (data_dir / "dataset_split_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
     )
 
 
@@ -137,6 +203,10 @@ def _run_trainer(data_dir: Path, out_dir: Path, epochs: int, resume: bool = Fals
         str(data_dir),
         "--out_dir",
         str(out_dir),
+        "--split_manifest",
+        str(data_dir / "dataset_split_manifest.json"),
+        "--source_weights",
+        "teacher=0.5,position=0.5",
         "--student_context_mode",
         "split",
         "--epochs",
@@ -153,6 +223,8 @@ def _run_trainer(data_dir: Path, out_dir: Path, epochs: int, resume: bool = Fals
         "123",
         "--save_name",
         "best.pth",
+        "--checkpoint_interval",
+        "1",
     ]
     if resume:
         command.extend(
@@ -195,3 +267,14 @@ def test_two_stage_resume_matches_uninterrupted_training_exactly(tmp_path):
     assert full["state_dict"].keys() == resumed["state_dict"].keys()
     for name in full["state_dict"]:
         assert torch.equal(full["state_dict"][name], resumed["state_dict"][name]), name
+
+    report = json.loads((full_dir / "training_report.json").read_text())
+    assert report["source_weights"] == {
+        "teacher_closed_loop": 0.5,
+        "causal_position_closed_loop": 0.5,
+    }
+    assert report["source_sample_counts_drawn"]
+    assert report["top5_checkpoints"]
+    assert all(
+        Path(item["path"]).is_absolute() for item in report["top5_checkpoints"]
+    )

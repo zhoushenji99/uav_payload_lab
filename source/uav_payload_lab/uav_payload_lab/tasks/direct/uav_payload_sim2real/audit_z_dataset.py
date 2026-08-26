@@ -10,12 +10,92 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 
 import torch
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def audit_split_manifest(path: str | os.PathLike[str]) -> dict[str, object]:
+    """Verify manifest checksums and enforce disjoint seed/episode splits."""
+    manifest_path = Path(path).expanduser().resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    train_seeds = {int(seed) for seed in manifest.get("train_seeds", [])}
+    val_seeds = {int(seed) for seed in manifest.get("validation_seeds", [])}
+    seed_overlap = sorted(train_seeds & val_seeds)
+    train_keys = {
+        (int(item["seed"]), int(item["episode_id"]))
+        for item in manifest.get("train", [])
+    }
+    val_keys = {
+        (int(item["seed"]), int(item["episode_id"]))
+        for item in manifest.get("validation", [])
+    }
+    episode_overlap = sorted(train_keys & val_keys)
+
+    shard_reports = []
+    shard_paths = []
+    checksum_ok = True
+    for item in manifest.get("shards", []):
+        shard_path = Path(item["path"]).expanduser().resolve()
+        exists = shard_path.is_file()
+        actual = _sha256(shard_path) if exists else None
+        matches = bool(exists and actual == str(item["sha256"]))
+        checksum_ok = checksum_ok and matches
+        shard_reports.append(
+            {
+                "id": str(item["id"]),
+                "path": str(shard_path),
+                "exists": exists,
+                "expected_sha256": str(item["sha256"]),
+                "actual_sha256": actual,
+                "checksum_ok": matches,
+            }
+        )
+        if exists:
+            shard_paths.append(str(shard_path))
+
+    source_counts = manifest.get("source_counts", {})
+    required_sources = [str(name) for name in manifest.get("required_sources", [])]
+    missing_sources = {
+        split: [
+            name
+            for name in required_sources
+            if int(source_counts.get(split, {}).get(name, 0)) <= 0
+        ]
+        for split in ("train", "validation")
+    }
+    passed = bool(
+        shard_reports
+        and checksum_ok
+        and not seed_overlap
+        and not episode_overlap
+        and not missing_sources["train"]
+        and not missing_sources["validation"]
+    )
+    return {
+        "path": str(manifest_path),
+        "manifest": manifest,
+        "shard_paths": shard_paths,
+        "shards": shard_reports,
+        "checksum_ok": checksum_ok,
+        "seed_overlap": seed_overlap,
+        "episode_overlap": [list(key) for key in episode_overlap],
+        "source_counts": source_counts,
+        "missing_required_sources": missing_sources,
+        "passed": passed,
+    }
 
 
 def audit_shard_tensors(
@@ -121,16 +201,29 @@ def audit_dataset(
     data_dir: str | os.PathLike[str],
     *,
     require_hard_identity: bool = False,
+    split_manifest: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     """Load and validate all shards in ``data_dir``."""
 
     data_path = Path(data_dir).expanduser().resolve()
-    shard_paths = sorted(glob.glob(str(data_path / "shard_*.pt")))
+    manifest_audit = audit_split_manifest(split_manifest) if split_manifest else None
+    if manifest_audit is not None:
+        shard_paths = list(manifest_audit["shard_paths"])
+    else:
+        shard_paths = sorted(glob.glob(str(data_path / "shard_*.pt")))
     if not shard_paths:
         raise RuntimeError(f"No shard_*.pt files found in {data_path}")
 
     meta_path = data_path / "meta.pt"
-    meta = torch.load(meta_path, map_location="cpu") if meta_path.exists() else {}
+    meta = (
+        torch.load(meta_path, map_location="cpu", weights_only=False)
+        if meta_path.exists()
+        else {}
+    )
+    if manifest_audit is not None and not meta:
+        first_root = Path(manifest_audit["manifest"]["dataset_roots"][0])
+        root_meta = first_root / "meta.pt"
+        meta = torch.load(root_meta, map_location="cpu", weights_only=False)
     history_len = int(meta.get("history_len", 50))
     input_dim = int(meta.get("input_dim", 21))
     z_dim = int(meta.get("z_dim", 5))
@@ -146,7 +239,7 @@ def audit_dataset(
     shard_reports = []
 
     for shard_path in shard_paths:
-        shard = torch.load(shard_path, map_location="cpu")
+        shard = torch.load(shard_path, map_location="cpu", weights_only=False)
         missing = [key for key in ("inputs", "labels", "labels_ml") if key not in shard]
         if missing:
             raise RuntimeError(f"{shard_path} is missing keys: {missing}")
@@ -180,7 +273,7 @@ def audit_dataset(
 
     finite_ok = sum(total_nonfinite.values()) == 0
     identity_ok = (not require_identity) or identity_max == 0.0
-    meta_samples = meta.get("total_samples")
+    meta_samples = None if manifest_audit is not None else meta.get("total_samples")
     meta_count_ok = meta_samples is None or int(meta_samples) == total_samples
     report = {
         "data_dir": str(data_path),
@@ -202,14 +295,29 @@ def audit_dataset(
         "labels_ml_stats": ml_summary,
         "normalized_slow_coverage_span": normalized_slow_coverage,
         "shards": shard_reports,
+        "split_manifest_audit": (
+            {key: value for key, value in manifest_audit.items() if key != "manifest"}
+            if manifest_audit is not None
+            else None
+        ),
     }
-    report["passed"] = bool(finite_ok and identity_ok and meta_count_ok)
+    report["passed"] = bool(
+        finite_ok
+        and identity_ok
+        and meta_count_ok
+        and (manifest_audit is None or manifest_audit["passed"])
+    )
     return report
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit all Phase-II z-dataset shards.")
     parser.add_argument("--data_dir", required=True)
+    parser.add_argument(
+        "--split_manifest",
+        default="",
+        help="Episode/seed split manifest whose shard hashes must all verify.",
+    )
     parser.add_argument(
         "--require_hard_identity",
         action="store_true",
@@ -228,6 +336,7 @@ def main() -> None:
     report = audit_dataset(
         args.data_dir,
         require_hard_identity=bool(args.require_hard_identity),
+        split_manifest=args.split_manifest or None,
     )
     out_path = (
         Path(args.out).expanduser().resolve()
