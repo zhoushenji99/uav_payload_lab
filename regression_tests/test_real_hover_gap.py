@@ -86,6 +86,54 @@ class RealHoverGapHelperTests(unittest.TestCase):
         )
         torch.testing.assert_close(out[:, 0], torch.tensor([3.0, 11.0]))
 
+    def test_delayed_relative_payload_is_composed_with_current_uav_pose(self):
+        uav_pos = torch.tensor([[2.0, 3.0, 1.5]])
+        yaw_90_wxyz = torch.tensor(
+            [[2.0**-0.5, 0.0, 0.0, 2.0**-0.5]]
+        )
+        delayed_uav_to_payload_b = torch.tensor([[1.0, 0.0, -0.7]])
+        actual = self.module.compose_delayed_payload_world_position(
+            uav_pos,
+            yaw_90_wxyz,
+            delayed_uav_to_payload_b,
+        )
+        torch.testing.assert_close(
+            actual,
+            torch.tensor([[2.0, 4.0, 0.8]]),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
+    def test_payload_rate_lpf_filters_only_an_initialized_update(self):
+        actual = self.module.update_payload_rate_lpf(
+            previous_filtered_rate=torch.tensor([[4.0, -2.0]]),
+            raw_rate=torch.tensor([[10.0, 6.0]]),
+            initialized=torch.tensor([True]),
+            update=torch.tensor([True]),
+            alpha=0.5,
+        )
+        torch.testing.assert_close(actual, torch.tensor([[7.0, 2.0]]))
+
+    def test_payload_rate_lpf_first_measurement_is_zero(self):
+        actual = self.module.update_payload_rate_lpf(
+            previous_filtered_rate=torch.tensor([[4.0, -2.0]]),
+            raw_rate=torch.tensor([[10.0, 6.0]]),
+            initialized=torch.tensor([False]),
+            update=torch.tensor([True]),
+            alpha=0.5,
+        )
+        torch.testing.assert_close(actual, torch.zeros(1, 2))
+
+    def test_payload_rate_lpf_dropout_holds_previous_value(self):
+        actual = self.module.update_payload_rate_lpf(
+            previous_filtered_rate=torch.tensor([[4.0, -2.0]]),
+            raw_rate=torch.tensor([[10.0, 6.0]]),
+            initialized=torch.tensor([True]),
+            update=torch.tensor([False]),
+            alpha=0.5,
+        )
+        torch.testing.assert_close(actual, torch.tensor([[4.0, -2.0]]))
+
     def test_normalized_quadratic_thrust_curve_matches_measured_endpoints(self):
         signal = torch.tensor([0.0, 0.58, 1.0])
         ratio = self.module.normalized_quadratic_thrust_ratio(

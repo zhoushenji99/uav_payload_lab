@@ -214,3 +214,97 @@ def select_delayed_ring(
         - delay_steps.to(device=ring.device, dtype=torch.long)
     ) % ring.shape[1]
     return ring[rows, source_index]
+
+
+def compose_delayed_payload_world_position(
+    current_uav_pos_w: torch.Tensor,
+    current_uav_quat_w: torch.Tensor,
+    delayed_uav_to_payload_b: torch.Tensor,
+) -> torch.Tensor:
+    """Compose a held body-relative payload measurement with the current UAV pose.
+
+    Quaternions use the Isaac/PX4 ``wxyz`` convention. This mirrors the real
+    observation builder, which combines the latest relative camera measurement
+    with the current vehicle pose instead of delaying an already-composed world
+    payload position.
+    """
+    uav_pos = torch.as_tensor(current_uav_pos_w)
+    if not uav_pos.is_floating_point():
+        uav_pos = uav_pos.to(dtype=torch.float32)
+    uav_quat = torch.as_tensor(
+        current_uav_quat_w,
+        device=uav_pos.device,
+        dtype=uav_pos.dtype,
+    )
+    relative_b = torch.as_tensor(
+        delayed_uav_to_payload_b,
+        device=uav_pos.device,
+        dtype=uav_pos.dtype,
+    )
+    if (
+        uav_pos.shape[-1:] != (3,)
+        or relative_b.shape != uav_pos.shape
+        or uav_quat.shape != uav_pos.shape[:-1] + (4,)
+    ):
+        raise ValueError(
+            "uav position, quaternion, and relative payload must have matching "
+            "(..., 3), (..., 4), and (..., 3) shapes"
+        )
+    if (
+        not torch.isfinite(uav_pos).all()
+        or not torch.isfinite(uav_quat).all()
+        or not torch.isfinite(relative_b).all()
+    ):
+        raise ValueError("payload pose composition inputs must be finite")
+    quat_norm = torch.linalg.norm(uav_quat, dim=-1, keepdim=True)
+    if torch.any(quat_norm <= 1e-8):
+        raise ValueError("UAV quaternion norm must be positive")
+    uav_quat = uav_quat / quat_norm
+    qw = uav_quat[..., 0:1]
+    qv = uav_quat[..., 1:4]
+    cross_term = 2.0 * torch.cross(qv, relative_b, dim=-1)
+    relative_w = (
+        relative_b
+        + qw * cross_term
+        + torch.cross(qv, cross_term, dim=-1)
+    )
+    return uav_pos + relative_w
+
+
+def update_payload_rate_lpf(
+    previous_filtered_rate: torch.Tensor,
+    raw_rate: torch.Tensor,
+    initialized: torch.Tensor,
+    update: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Update payload angular-rate LPF only for a new valid camera sample."""
+    previous = torch.as_tensor(previous_filtered_rate)
+    if not previous.is_floating_point():
+        previous = previous.to(dtype=torch.float32)
+    raw = torch.as_tensor(raw_rate, device=previous.device, dtype=previous.dtype)
+    initialized_mask = torch.as_tensor(
+        initialized, device=previous.device, dtype=torch.bool
+    )
+    update_mask = torch.as_tensor(update, device=previous.device, dtype=torch.bool)
+    if (
+        previous.shape != raw.shape
+        or previous.shape[-1:] != (2,)
+        or initialized_mask.shape != previous.shape[:-1]
+        or update_mask.shape != previous.shape[:-1]
+    ):
+        raise ValueError(
+            "rates must have matching (..., 2) shapes and masks must match the batch shape"
+        )
+    alpha_value = float(alpha)
+    if not math.isfinite(alpha_value) or not 0.0 <= alpha_value <= 1.0:
+        raise ValueError("payload angular-rate LPF alpha must be finite and in [0, 1]")
+    if not torch.isfinite(previous).all() or not torch.isfinite(raw).all():
+        raise ValueError("payload angular rates must be finite")
+    filtered = alpha_value * previous + (1.0 - alpha_value) * raw
+    candidate = torch.where(
+        initialized_mask.unsqueeze(-1),
+        filtered,
+        torch.zeros_like(raw),
+    )
+    return torch.where(update_mask.unsqueeze(-1), candidate, previous)
