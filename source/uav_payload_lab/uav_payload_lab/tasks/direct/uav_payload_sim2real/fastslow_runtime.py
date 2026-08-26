@@ -11,6 +11,7 @@ import math
 from typing import Iterable
 
 import numpy as np
+import torch
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,84 @@ class MultirateSchedule:
 
     def to_dict(self) -> dict[str, float | int]:
         return asdict(self)
+
+
+@dataclass
+class FastSlowContextStep:
+    z_hat: torch.Tensor
+    slow_update_mask: torch.Tensor
+    fast_update_mask: torch.Tensor
+    slow_inference_ms: float
+    fast_inference_ms: float
+
+
+def update_fastslow_context(
+    *,
+    encoder,
+    obs_history: torch.Tensor,
+    episode_steps: torch.Tensor,
+    schedule: MultirateSchedule,
+    slow_filter_alpha: float,
+    context_runtime_mode: str,
+    z_slow_raw: torch.Tensor,
+    z_slow_target: torch.Tensor,
+    z_slow_cache: torch.Tensor,
+    z_fast_cache: torch.Tensor,
+    timed_call=None,
+) -> FastSlowContextStep:
+    """Apply the one authoritative split Student fast/slow state transition."""
+    if context_runtime_mode not in {"fast_slow", "all_60hz"}:
+        raise ValueError(f"unsupported context_runtime_mode: {context_runtime_mode}")
+    if episode_steps.ndim != 1 or episode_steps.shape[0] != obs_history.shape[0]:
+        raise ValueError("episode_steps must contain one value per history batch")
+    if timed_call is None:
+        timed_call = lambda function: (function(), 0.0)
+
+    fast_update_mask = episode_steps.remainder(schedule.fast_period_steps) == 0
+    if context_runtime_mode == "all_60hz":
+        slow_update_mask = torch.ones_like(fast_update_mask)
+    else:
+        startup = episode_steps < schedule.slow_warmup_steps
+        periodic = (episode_steps >= schedule.slow_warmup_steps) & (
+            (episode_steps - schedule.slow_warmup_steps).remainder(
+                schedule.slow_period_steps
+            )
+            == 0
+        )
+        slow_update_mask = startup | periodic
+
+    fast_inference_ms = 0.0
+    if torch.any(fast_update_mask):
+        z_fast_new, fast_inference_ms = timed_call(
+            lambda: encoder.encode_fast(obs_history[fast_update_mask]).detach()
+        )
+        z_fast_cache[fast_update_mask] = z_fast_new
+
+    slow_inference_ms = 0.0
+    if torch.any(slow_update_mask):
+        z_slow_new, slow_inference_ms = timed_call(
+            lambda: encoder.encode_slow(obs_history[slow_update_mask]).detach()
+        )
+        z_slow_raw[slow_update_mask] = z_slow_new
+        z_slow_target[slow_update_mask] = z_slow_new
+
+    if context_runtime_mode == "all_60hz":
+        z_slow_cache[:] = z_slow_target
+    else:
+        startup = episode_steps < schedule.slow_warmup_steps
+        z_slow_cache[startup] = z_slow_target[startup]
+        post_startup = ~startup
+        z_slow_cache[post_startup] += float(slow_filter_alpha) * (
+            z_slow_target[post_startup] - z_slow_cache[post_startup]
+        )
+
+    return FastSlowContextStep(
+        z_hat=torch.cat((z_slow_cache, z_fast_cache), dim=-1),
+        slow_update_mask=slow_update_mask,
+        fast_update_mask=fast_update_mask,
+        slow_inference_ms=float(slow_inference_ms),
+        fast_inference_ms=float(fast_inference_ms),
+    )
 
 
 def validate_evaluation_overrides(

@@ -174,6 +174,7 @@ from uav_payload_lab.tasks.direct.uav_payload_sim2real.fastslow_runtime import (
     compute_gust_response_latency,
     compute_multirate_schedule,
     summarize_latency_ms,
+    update_fastslow_context,
     validate_evaluation_overrides,
 )
 from uav_payload_lab.tasks.direct.uav_payload_sim2real.phase2_shadow_handover import (
@@ -723,60 +724,45 @@ def main(env_cfg, agent_cfg):
                     call_counts["full_env_samples"] += int(env.num_envs)
                     latency_samples["full"].append(full_inference_ms)
                 else:
-                    fast_update_mask = _periodic_update_mask(
-                        episode_steps, fast_period_steps
-                    )
-                    if torch.any(fast_update_mask):
-                        z_fast_new, fast_inference_ms = _timed_call(
-                            lambda: encoder.encode_fast(
-                                obs_history[fast_update_mask]
-                            ).detach(),
+                    context_step = update_fastslow_context(
+                        encoder=encoder,
+                        obs_history=obs_history,
+                        episode_steps=episode_steps,
+                        schedule=schedule,
+                        slow_filter_alpha=slow_filter_alpha,
+                        context_runtime_mode=str(args_cli.context_runtime_mode),
+                        z_slow_raw=z_slow_raw,
+                        z_slow_target=z_slow_target,
+                        z_slow_cache=z_slow_cache,
+                        z_fast_cache=z_fast_cache,
+                        timed_call=lambda function: _timed_call(
+                            function,
                             env.device,
                             bool(args_cli.profile_inference),
-                        )
-                        z_fast_cache[fast_update_mask] = z_fast_new
+                        ),
+                    )
+                    slow_update_mask = context_step.slow_update_mask
+                    fast_update_mask = context_step.fast_update_mask
+                    slow_inference_ms = context_step.slow_inference_ms
+                    fast_inference_ms = context_step.fast_inference_ms
+                    if torch.any(fast_update_mask):
                         call_counts["fast_batch_calls"] += 1
                         call_counts["fast_env_samples"] += int(
                             fast_update_mask.sum().item()
                         )
                         latency_samples["fast"].append(fast_inference_ms)
-
-                    if args_cli.context_runtime_mode == "all_60hz":
-                        slow_update_mask[:] = True
-                    else:
-                        slow_update_mask = _slow_update_mask(
-                            episode_steps,
-                            slow_warmup_steps,
-                            slow_period_steps,
-                        )
                     if torch.any(slow_update_mask):
-                        z_slow_new, slow_inference_ms = _timed_call(
-                            lambda: encoder.encode_slow(
-                                obs_history[slow_update_mask]
-                            ).detach(),
-                            env.device,
-                            bool(args_cli.profile_inference),
-                        )
-                        z_slow_raw[slow_update_mask] = z_slow_new
-                        z_slow_target[slow_update_mask] = z_slow_new
                         call_counts["slow_batch_calls"] += 1
                         call_counts["slow_env_samples"] += int(
                             slow_update_mask.sum().item()
                         )
                         latency_samples["slow"].append(slow_inference_ms)
 
-                    if args_cli.context_runtime_mode == "all_60hz":
-                        z_slow_cache[:] = z_slow_target
-                    else:
-                        startup_mask = episode_steps < slow_warmup_steps
-                        z_slow_cache[startup_mask] = z_slow_target[startup_mask]
-                        post_startup_mask = ~startup_mask
-                        z_slow_cache[post_startup_mask] += slow_filter_alpha * (
-                            z_slow_target[post_startup_mask]
-                            - z_slow_cache[post_startup_mask]
-                        )
-
-                z_hat = torch.cat([z_slow_cache, z_fast_cache], dim=-1)
+                z_hat = (
+                    context_step.z_hat
+                    if student_context_mode == "split"
+                    else torch.cat([z_slow_cache, z_fast_cache], dim=-1)
+                )
                 policy_in = torch.cat([obs_proprio, z_hat], dim=1)  # (N, 21+z_dim)
 
             # ---- 3) build obs dict for policy ----
