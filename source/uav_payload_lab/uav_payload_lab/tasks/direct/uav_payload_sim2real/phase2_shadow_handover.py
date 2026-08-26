@@ -7,6 +7,27 @@ import math
 import torch
 
 
+def select_precontrol_actions(
+    *,
+    student: torch.Tensor,
+    position: torch.Tensor,
+    episode_steps: torch.Tensor,
+    precontrol_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute precontrol before the exact boundary, then execute Student."""
+    if student.ndim != 2 or position.shape != student.shape:
+        raise ValueError("student and position actions must share a two-dimensional shape")
+    if episode_steps.shape != (student.shape[0],):
+        raise ValueError("episode_steps must contain one value per environment")
+    precontrol_steps = int(precontrol_steps)
+    if precontrol_steps < 0:
+        raise ValueError("precontrol_steps must be non-negative")
+
+    mask = episode_steps < precontrol_steps
+    executed = torch.where(mask.unsqueeze(-1), position, student)
+    return executed, mask
+
+
 def validate_shadow_warmup(
     *,
     shadow_warmup_sec: float,

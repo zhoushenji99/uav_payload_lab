@@ -88,6 +88,18 @@ class Phase2ShadowHandoverTests(unittest.TestCase):
 
         self.assertEqual(mask.tolist(), [True, True, False, False])
 
+    def test_position_precontrol_executes_position_until_exact_boundary(self):
+        steps = torch.tensor([179, 180])
+        executed, mask = self.module.select_precontrol_actions(
+            student=torch.tensor([[1.0], [2.0]]),
+            position=torch.tensor([[10.0], [20.0]]),
+            episode_steps=steps,
+            precontrol_steps=180,
+        )
+
+        torch.testing.assert_close(executed, torch.tensor([[10.0], [2.0]]))
+        self.assertEqual(mask.tolist(), [True, False])
+
     def test_action_selection_is_per_environment_and_keeps_student_candidate(self):
         student_raw = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         student_clipped = torch.tensor([[0.8, 0.9], [0.7, 0.6]])
@@ -118,10 +130,13 @@ class Phase2ShadowHandoverTests(unittest.TestCase):
         source = PLAY_PATH.read_text(encoding="utf-8")
 
         self.assertIn("--student_shadow_warmup_sec", source)
-        self.assertIn("select_shadow_actions(", source)
+        self.assertIn('"--precontrol"', source)
+        self.assertIn('"--precontrol_sec"', source)
+        self.assertIn("select_precontrol_actions(", source)
+        self.assertIn("compute_position_hold_ctbr", source)
         self.assertIn('"control_source"', source)
         self.assertIn('"student_candidate_a0_raw"', source)
-        self.assertIn('"student_shadow_warmup_steps"', source)
+        self.assertIn('"precontrol_steps"', source)
 
 
 if __name__ == "__main__":

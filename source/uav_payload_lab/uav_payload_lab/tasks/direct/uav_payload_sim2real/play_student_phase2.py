@@ -43,13 +43,24 @@ parser.add_argument("--mode", type=str, default="student", choices=["student", "
 parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
 parser.add_argument("--history_len", type=int, default=50)
 parser.add_argument(
+    "--precontrol",
+    type=str,
+    default="none",
+    choices=["position", "teacher", "none"],
+    help="Physical controller executed before Student handover.",
+)
+parser.add_argument(
+    "--precontrol_sec",
+    type=float,
+    default=3.0,
+    help="Duration of causal precontrol before direct Student handover.",
+)
+parser.add_argument(
     "--student_shadow_warmup_sec",
     type=float,
-    default=0.0,
+    default=None,
     help=(
-        "Student-mode only. Let the Teacher execute actions for this duration while "
-        "the Student runs in shadow and fills its history/context caches; 0 keeps "
-        "the legacy immediate-Student behavior."
+        "Deprecated: maps to --precontrol teacher with the supplied duration."
     ),
 )
 parser.add_argument("--slow_warmup_sec", type=float, default=3.0, help="Run the slow encoder at policy rate during startup.")
@@ -166,7 +177,7 @@ from uav_payload_lab.tasks.direct.uav_payload_sim2real.fastslow_runtime import (
     validate_evaluation_overrides,
 )
 from uav_payload_lab.tasks.direct.uav_payload_sim2real.phase2_shadow_handover import (
-    select_shadow_actions,
+    select_precontrol_actions,
     validate_shadow_warmup,
 )
 
@@ -535,8 +546,23 @@ def main(env_cfg, agent_cfg):
     slow_period_steps = schedule.slow_period_steps
     fast_period_steps = schedule.fast_period_steps
     slow_filter_alpha = causal_ema_alpha(dt, float(args_cli.slow_filter_tau_sec))
-    student_shadow_warmup_steps = validate_shadow_warmup(
-        shadow_warmup_sec=float(args_cli.student_shadow_warmup_sec),
+    effective_precontrol = str(args_cli.precontrol)
+    effective_precontrol_sec = (
+        0.0 if effective_precontrol == "none" else float(args_cli.precontrol_sec)
+    )
+    if args_cli.student_shadow_warmup_sec is not None:
+        if effective_precontrol != "none":
+            raise ValueError(
+                "--student_shadow_warmup_sec cannot be combined with --precontrol"
+            )
+        effective_precontrol = "teacher"
+        effective_precontrol_sec = float(args_cli.student_shadow_warmup_sec)
+        print(
+            "[DEPRECATED] --student_shadow_warmup_sec maps to "
+            "--precontrol teacher; use the new arguments explicitly."
+        )
+    precontrol_steps = validate_shadow_warmup(
+        shadow_warmup_sec=effective_precontrol_sec,
         policy_dt=dt,
         history_len=history_len,
         slow_warmup_sec=float(args_cli.slow_warmup_sec),
@@ -603,7 +629,7 @@ def main(env_cfg, agent_cfg):
         f"slow_warmup_steps={slow_warmup_steps} slow_period_steps={slow_period_steps} "
         f"slow_filter_tau={args_cli.slow_filter_tau_sec:.3f}s alpha={slow_filter_alpha:.8f} "
         f"runtime_mode={args_cli.context_runtime_mode} "
-        f"student_shadow_warmup_steps={student_shadow_warmup_steps}"
+        f"precontrol={effective_precontrol} precontrol_steps={precontrol_steps}"
     )
     print(f"[INFO] CSV -> {csv_path}")
 
@@ -780,38 +806,50 @@ def main(env_cfg, agent_cfg):
                 end_to_end_inference_ms = 0.0
             latency_samples["end_to_end"].append(end_to_end_inference_ms)
 
-            # During the opt-in shadow interval, the Student encoder, caches, and
-            # Actor still run normally, but the privileged Teacher action is the
-            # one executed by the environment. At handover no runtime state is
-            # reset: only this per-environment action selector changes source.
+            # Student history, caches, and candidate Actor run continuously. The
+            # requested causal precontroller physically drives the plant before
+            # the exact handover boundary; no runtime state is reset at handover.
             actions_raw = student_actions_raw
             actions = student_actions
-            teacher_shadow_active = torch.zeros(
+            precontrol_active = torch.zeros(
                 env.num_envs, dtype=torch.bool, device=env.device
             )
-            if args_cli.mode == "student" and student_shadow_warmup_steps > 0:
-                if not hasattr(policy_nn, "use_mu"):
+            if args_cli.mode == "student" and precontrol_steps > 0:
+                if effective_precontrol == "position":
+                    precontrol_actions_raw = base_env.compute_position_hold_ctbr()
+                elif effective_precontrol == "teacher":
+                    if not hasattr(policy_nn, "use_mu"):
+                        raise RuntimeError(
+                            "Teacher precontrol requires policy_nn.use_mu support."
+                        )
+                    policy_nn.use_mu = True
+                    try:
+                        precontrol_actions_raw = policy_nn.act_inference(
+                            {"policy": obs_tensor}
+                        )
+                    finally:
+                        policy_nn.use_mu = False
+                else:
                     raise RuntimeError(
-                        "Teacher shadow warm-up requires policy_nn.use_mu support."
+                        "positive precontrol duration requires position or teacher"
                     )
-                policy_nn.use_mu = True
-                try:
-                    teacher_actions_raw = policy_nn.act_inference(
-                        {"policy": obs_tensor}
-                    )
-                finally:
-                    policy_nn.use_mu = False
-                teacher_actions = _clip_actions_to_bounds(
-                    teacher_actions_raw, action_low, action_high
+                precontrol_actions = _clip_actions_to_bounds(
+                    precontrol_actions_raw, action_low, action_high
                 )
-                actions_raw, actions, teacher_shadow_active = select_shadow_actions(
-                    student_raw=student_actions_raw,
-                    student_clipped=student_actions,
-                    teacher_raw=teacher_actions_raw,
-                    teacher_clipped=teacher_actions,
+                actions_raw, precontrol_active = select_precontrol_actions(
+                    student=student_actions_raw,
+                    position=precontrol_actions_raw,
                     episode_steps=episode_steps,
-                    shadow_steps=student_shadow_warmup_steps,
+                    precontrol_steps=precontrol_steps,
                 )
+                actions, clipped_precontrol_active = select_precontrol_actions(
+                    student=student_actions,
+                    position=precontrol_actions,
+                    episode_steps=episode_steps,
+                    precontrol_steps=precontrol_steps,
+                )
+                if not torch.equal(precontrol_active, clipped_precontrol_active):
+                    raise RuntimeError("precontrol masks disagree")
 
             # Counterfactual refresh diagnostic: under the same observation and
             # current fast context, compare old cache vs newly refreshed raw target.
@@ -887,8 +925,8 @@ def main(env_cfg, agent_cfg):
             student_a_clp = student_actions[e].detach().cpu().numpy().tolist()
             if args_cli.mode == "teacher":
                 control_source = "teacher"
-            elif bool(teacher_shadow_active[e].item()):
-                control_source = "teacher_shadow"
+            elif bool(precontrol_active[e].item()):
+                control_source = f"{effective_precontrol}_precontrol"
             else:
                 control_source = "student"
             slow_raw_e = z_slow_raw[e].detach().cpu().numpy().tolist()
@@ -1075,8 +1113,14 @@ def main(env_cfg, agent_cfg):
         "slow_update_hz": float(args_cli.slow_update_hz),
         "slow_warmup_steps": int(slow_warmup_steps),
         "slow_period_steps": int(slow_period_steps),
-        "student_shadow_warmup_sec": float(args_cli.student_shadow_warmup_sec),
-        "student_shadow_warmup_steps": int(student_shadow_warmup_steps),
+        "precontrol": effective_precontrol,
+        "precontrol_sec": float(effective_precontrol_sec),
+        "precontrol_steps": int(precontrol_steps),
+        "deprecated_student_shadow_warmup_sec": (
+            float(args_cli.student_shadow_warmup_sec)
+            if args_cli.student_shadow_warmup_sec is not None
+            else None
+        ),
         "slow_filter_tau_sec": float(args_cli.slow_filter_tau_sec),
         "slow_filter_alpha": float(slow_filter_alpha),
         "profile_inference": bool(args_cli.profile_inference),
