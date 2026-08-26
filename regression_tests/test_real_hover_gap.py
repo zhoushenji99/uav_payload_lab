@@ -263,7 +263,8 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
     def test_policy_history_uses_last_transmitted_clamped_ctbr(self):
         env = ENV_PATH.read_text(encoding="utf-8")
         self.assertIn("self._last_transmitted_actions", env)
-        self.assertIn("self._last_transmitted_actions = self._raw_actions.clone()", env)
+        self.assertIn("self._last_transmitted_actions = shape_ctbr_torch(", env)
+        self.assertIn("self._action_queue[:, -1, :] = self._last_transmitted_actions", env)
         self.assertEqual(env.count("self._last_transmitted_actions, # 17-20"), 2)
 
     def test_gap_audit_covers_identifiability_sensitive_ranges(self):

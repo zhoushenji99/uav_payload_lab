@@ -167,7 +167,8 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     ctbr_pwm_range_us = (1150.0, 1900.0)
     measured_voltage_range_v = (23.5, 25.2)
     measured_current_range_a = (0.22, 13.6)
-    ctbr_body_rate_limit = (2.5, 2.5, 1.5)
+    ctbr_body_rate_limit = (1.2, 1.2, 0.6)
+    ctbr_max_delta_per_step = (0.03, 0.25, 0.25, 0.10)
     # First-order PX4 body-rate closed-loop uncertainty. The 0.935 s first-flight
     # window suggests roughly 0.10-0.16 s lag but is too short for a point
     # estimate, so training spans a deliberately wider per-axis interval.

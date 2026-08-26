@@ -9,6 +9,7 @@ from __future__ import annotations
 import gymnasium as gym
 import torch
 import math
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -17,6 +18,7 @@ from isaaclab.markers import VisualizationMarkers, CUBOID_MARKER_CFG
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
+from .ctbr_command_contract import CtbrLimits, shape_ctbr_torch
 from .real_hover_gap import (
     compose_lumped_payload_mass,
     diagonal_inertia_flat,
@@ -160,6 +162,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # Last CTBR actually transmitted across the deployment interface after
         # command clipping, before unobservable actuator delay/LPF dynamics.
         self._last_transmitted_actions = torch.zeros_like(self._actions)
+        self._prev_transmitted_actions = torch.zeros_like(self._actions)
+        self._transmitted_delta = torch.zeros_like(self._actions)
+        self._prev_transmitted_delta = torch.zeros_like(self._actions)
 
         # Per-environment action transport: link delay, first-order actuator
         # response, and conservative thrust/moment effectiveness.
@@ -183,6 +188,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # [新增] 低通滤波内部状态
         self._filtered_actions = torch.zeros_like(self._actions)
         self._ctbr_body_rate_limit = torch.tensor(self.cfg.ctbr_body_rate_limit, dtype=torch.float, device=self.device)
+        contract_path = Path(__file__).resolve().parents[6] / "configs/v89_training_acceptance_contract.json"
+        self._ctbr_limits = CtbrLimits.from_contract(contract_path)
         self._ctbr_rate_kp = torch.tensor(self.cfg.ctbr_rate_kp, dtype=torch.float, device=self.device)
         self._ctbr_rate_kp_per_env = self._ctbr_rate_kp.unsqueeze(0).repeat(self.num_envs, 1)
         self._ctbr_rate_time_constant_s = torch.zeros(self.num_envs, 3, device=self.device)
@@ -410,14 +417,23 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._prev_raw_actions = self._raw_actions.clone()
         self._prev_policy_actions = self._policy_actions.clone()
 
-        # 2. 记录当前网络输出，并按 PX4 CTBR 执行边界截断
+        # 2. 记录当前网络输出，并按统一PX4 CTBR绝对/变化率合同整形。
         self._policy_actions = actions.clone()
-        self._raw_actions, _, _ = self._decode_px4_ctbr_action(self._policy_actions)
-        self._last_transmitted_actions = self._raw_actions.clone()
+        decoded_target, _, _ = self._decode_px4_ctbr_action(self._policy_actions)
+        self._prev_transmitted_actions = self._last_transmitted_actions.clone()
+        self._last_transmitted_actions = shape_ctbr_torch(
+            decoded_target,
+            self._prev_transmitted_actions,
+            self._ctbr_limits,
+        )
+        self._transmitted_delta = (
+            self._last_transmitted_actions - self._prev_transmitted_actions
+        )
+        self._raw_actions = self._last_transmitted_actions.clone()
 
         # 3. Per-environment link delay.
         self._action_queue = torch.roll(self._action_queue, shifts=-1, dims=1)
-        self._action_queue[:, -1, :] = self._raw_actions
+        self._action_queue[:, -1, :] = self._last_transmitted_actions
         delayed_actions = select_delayed_actions(
             self._action_queue, self._action_delay_steps_per_env
         )
@@ -1281,6 +1297,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._policy_actions[env_ids] = hover_actions
         self._prev_policy_actions[env_ids] = hover_actions
         self._last_transmitted_actions[env_ids] = hover_actions
+        self._prev_transmitted_actions[env_ids] = hover_actions
+        self._transmitted_delta[env_ids] = 0.0
+        self._prev_transmitted_delta[env_ids] = 0.0
 
         self._fill_action_transport(env_ids, hover_actions)
         self._actions[env_ids] = hover_actions
