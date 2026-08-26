@@ -339,12 +339,12 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # and separate stress evaluation.
     enable_payload_sensor_gap = True
     payload_sensor_tail_probability = 0.05
-    payload_sensor_nominal_hz = (8.0, 20.0)
+    payload_sensor_nominal_hz = (8.0, 30.0)
     payload_sensor_tail_hz = (5.0, 8.0)
     payload_sensor_nominal_delay_s = (0.03, 0.20)
-    payload_sensor_tail_delay_s = (0.20, 0.30)
+    payload_sensor_tail_delay_s = (0.20, 0.50)
     payload_sensor_valid_probability = (0.93, 0.99)
-    payload_sensor_hold_cap_s = 0.25
+    payload_sensor_hold_cap_s = 0.5
     payload_position_bias_range_m = (-0.01, 0.01)
     payload_angle_bias_range_deg = (-1.5, 1.5)
     attitude_trim_bias_range_deg = (-1.0, 1.0)
@@ -373,13 +373,13 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # values are retained as compatibility fallbacks when this profile is off.
     action_delay_steps: int = 0
     action_lpf_alpha: float = 1.0
-    action_delay_steps_range = (0, 1)
-    action_lpf_alpha_range = (0.75, 1.0)
+    action_delay_steps_range = (0, 2)
+    action_lpf_alpha_range = (0.35, 0.85)
     # The measured thrust curve is the nominal model. Independent efficiency
     # randomization is disabled because it is not separately identifiable from
     # payload mass in a 21-D history.
     collective_efficiency_range = (1.0, 1.0)
-    moment_efficiency_range = (1.0, 1.0)
+    moment_efficiency_range = (0.85, 1.15)
 
     # ==========================================
     # [修改] 动作惩罚项
