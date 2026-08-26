@@ -160,11 +160,12 @@ def load_torchscript_runtime(
     """Load the three standard TorchScript artifacts from a deployment bundle."""
 
     root = Path(bundle_dir)
+    models_root = root / "models" if (root / "models").is_dir() else root
     device_value = torch.device(device)
     required = {
-        "slow_encoder": root / "slow_encoder.ts",
-        "fast_encoder": root / "fast_encoder.ts",
-        "actor": root / "actor.ts",
+        "slow_encoder": models_root / "slow_encoder.ts",
+        "fast_encoder": models_root / "fast_encoder.ts",
+        "actor": models_root / "actor.ts",
     }
     missing = [str(path) for path in required.values() if not path.is_file()]
     if missing:

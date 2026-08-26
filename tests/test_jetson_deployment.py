@@ -32,12 +32,17 @@ from jetson_reference_runtime import (  # noqa: E402
 )
 from export_jetson_bundle import (  # noqa: E402
     REQUIRED_ARTIFACTS,
+    _copy_required,
     build_manifest,
     load_parity_history,
     sha256_file,
     validate_existing_bundle_lineage,
 )
-from verify_jetson_bundle import verify_checksums  # noqa: E402
+from verify_jetson_bundle import (  # noqa: E402
+    verify_checksums,
+    verify_manifest,
+    verify_torchscript,
+)
 
 
 class JetsonDeploymentTests(unittest.TestCase):
@@ -190,6 +195,21 @@ class JetsonReferenceRuntimeTests(unittest.TestCase):
         self.assertEqual(tuple(result["context"].shape), (1, 5))
         self.assertEqual(tuple(result["action_clamped"].shape), (1, 4))
 
+    def test_load_torchscript_runtime_supports_nested_model_directory(self):
+        slow = torch.jit.trace(_HistoryProbe(2), torch.zeros(1, 50, 21))
+        fast = torch.jit.trace(_HistoryProbe(3), torch.zeros(1, 50, 21))
+        actor = torch.jit.trace(_ConstantActor(), torch.zeros(1, 26))
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            models = bundle / "models"
+            models.mkdir()
+            torch.jit.save(slow, models / "slow_encoder.ts")
+            torch.jit.save(fast, models / "fast_encoder.ts")
+            torch.jit.save(actor, models / "actor.ts")
+            runtime = load_torchscript_runtime(bundle)
+            result = runtime.step(torch.zeros(21))
+        self.assertEqual(tuple(result["context"].shape), (1, 5))
+
 
 class JetsonExporterTests(unittest.TestCase):
     def test_manifest_records_complete_runtime_contract(self):
@@ -222,6 +242,11 @@ class JetsonExporterTests(unittest.TestCase):
         self.assertEqual(manifest["runtime"]["fast_period_steps"], 1)
         self.assertEqual(manifest["action"]["low"], [-1.0, -2.5, -2.5, -1.5])
         self.assertTrue(manifest["safety"]["startup_guard_required_before_flight"])
+        self.assertEqual(manifest["training_ranges"]["payload_mass_kg"], [0.31265, 0.93265])
+        self.assertEqual(manifest["training_ranges"]["rope_length_m"], [0.25, 0.8])
+        self.assertEqual(manifest["models"]["actor"]["onnx"], "models/actor.onnx")
+        self.assertEqual(manifest["student_source"], "models/source_student_best.pth")
+        self.assertNotIn("last_checkpoint.pth", "\n".join(manifest["artifacts"]))
         self.assertEqual(set(manifest["artifacts"]), set(REQUIRED_ARTIFACTS))
 
     def test_lineage_guard_rejects_different_source_models(self):
@@ -246,6 +271,17 @@ class JetsonExporterTests(unittest.TestCase):
                 sha256_file(path),
                 "fd2e48431be6b10054d6fa6b494c029aa39d893c890b542560cdd08d935600c0",
             )
+
+    def test_copy_required_can_replace_read_only_previous_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.py"
+            destination = root / "destination.py"
+            source.write_text("new", encoding="utf-8")
+            destination.write_text("old", encoding="utf-8")
+            destination.chmod(0o444)
+            _copy_required(source, destination)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "new")
 
     def test_parity_history_uses_float32_physical_dataset_samples(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -279,6 +315,64 @@ class JetsonExporterTests(unittest.TestCase):
         self.assertTrue(clean["passed"])
         self.assertFalse(tampered["passed"])
         self.assertEqual(tampered["mismatched"], ["actor.ts"])
+
+    def test_torchscript_verifier_reads_nested_models_and_vectors(self):
+        slow = torch.jit.trace(_HistoryProbe(2), torch.zeros(1, 50, 21))
+        fast = torch.jit.trace(_HistoryProbe(3), torch.zeros(1, 50, 21))
+        actor = torch.jit.trace(_ConstantActor(), torch.zeros(1, 26))
+        history = torch.zeros(1, 50, 21)
+        actor_input = torch.zeros(1, 26)
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            models = bundle / "models"
+            verification = bundle / "verification"
+            models.mkdir()
+            verification.mkdir()
+            torch.jit.save(slow, models / "slow_encoder.ts")
+            torch.jit.save(fast, models / "fast_encoder.ts")
+            torch.jit.save(actor, models / "actor.ts")
+            import numpy as np
+
+            np.savez(
+                verification / "parity_vectors.npz",
+                history=history.numpy(),
+                actor_input=actor_input.numpy(),
+                slow_expected=slow(history).detach().numpy(),
+                fast_expected=fast(history).detach().numpy(),
+                actor_expected=actor(actor_input).detach().numpy(),
+            )
+            report = verify_torchscript(bundle)
+        self.assertTrue(report["passed"])
+
+    def test_required_artifacts_use_complete_nested_bundle_layout(self):
+        required = set(REQUIRED_ARTIFACTS)
+        self.assertIn("models/actor.onnx", required)
+        self.assertIn("runtime/rl_fastslow_inference_onnx_v1.py", required)
+        self.assertIn("verification/parity_vectors.npz", required)
+        self.assertIn("config/manifest.json", required)
+        self.assertIn("models/source_student_best.pth", required)
+        self.assertNotIn("models/last_checkpoint.pth", required)
+
+    def test_manifest_verifier_rejects_extra_student_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            (bundle / "config").mkdir()
+            (bundle / "models").mkdir()
+            (bundle / "models/source_student_best.pth").write_bytes(b"best")
+            (bundle / "models/last_checkpoint.pth").write_bytes(b"last")
+            (bundle / "config/manifest.json").write_text(
+                json.dumps(
+                    {
+                        "student_source": "models/source_student_best.pth",
+                        "artifacts": ["models/source_student_best.pth"],
+                        "observation_21": {"topic": "/uav_payload/observation21"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = verify_manifest(bundle)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["unexpected_student_checkpoints"], ["models/last_checkpoint.pth"])
 
 
 if __name__ == "__main__":

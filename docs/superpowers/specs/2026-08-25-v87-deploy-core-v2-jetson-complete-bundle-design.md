@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-将当前已经完成仿真闭环检查的悬停策略导出为可复制到 NVIDIA
+将当前候选悬停策略导出为可复制到 NVIDIA
 Jetson、无需 Isaac Sim 的 ROS 2 Humble 部署包。部署包必须同时满足：
 
 1. 在 Jetson 使用 ONNX Runtime 以 60 Hz 运行 Fast-Slow Student 与 Actor；
@@ -49,7 +49,7 @@ JetPack/TensorRT 版本绑定的 engine。
 推理节点执行以下数据流：
 
 ```text
-/uav_payload/observation_21
+/uav_payload/observation21
     -> 合法性、时效性和单位检查
     -> 50x21 FIFO历史
     -> Slow/Fast ONNX
@@ -96,7 +96,7 @@ JetPack/TensorRT 版本绑定的 engine。
 - wall/monotonic/PX4/observation 时间戳；
 - 原始 21 维观测；
 - history fill count；
-- z0-z4；
+- z0-z4 raw、clamped和越界标志；
 - slow raw、slow target、slow cache；
 - slow/fast refresh 标志；
 - Actor raw CTBR；
@@ -113,7 +113,11 @@ history fill count 足以严格重建任意时刻的 50H，同时避免阻塞控
 两个CSV使用同一运行目录和单调时钟，可离线对齐。
 
 CSV 使用缓冲写入并定期 flush；节点正常退出时必须关闭文件。推理异常、
-输入过期或非有限值时记录原因并停止发布 ready candidate，不得发送旧动作。
+输入过期、非有限值或上下文严重越界时记录原因并停止发布 candidate，不得发送旧动作。
+
+部署包本身不证明 Student 已满足实飞条件。Position真实CTBR前缀与Student训练
+分布的一致性、多seed闭环、持续掉高和上下文越界必须在仿真预导出验收报告中
+单独给出；证据不足时Manifest保持 `flight_approved=false`，部署包仅允许shadow。
 
 ## 7. 部署包结构
 
@@ -172,4 +176,3 @@ V8.7_DeployCoreV2_model1500_StudentBest_Jetson完整部署包/
 - 权限网关和飞手拥有退出权；
 - RL推理节点不Arm、不Disarm、不切模式；
 - ULog和Jetson日志同时记录。
-

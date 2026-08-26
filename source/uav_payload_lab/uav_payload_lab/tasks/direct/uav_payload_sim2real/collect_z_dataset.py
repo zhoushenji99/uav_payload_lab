@@ -50,6 +50,25 @@ parser.add_argument("--probe_freq", type=float, default=1.0,
 parser.add_argument("--sample_stride", type=int, default=5,
                     help="Store one sample every K env steps after warmup.")
 parser.add_argument(
+    "--position_history_ratio",
+    type=float,
+    default=0.0,
+    help=(
+        "Fraction of fully labeled Teacher trajectories whose previous-action "
+        "history is augmented with Position-style CTBR tokens. Use 0.4 for the "
+        "first-flight 60/40 Teacher/Position-prefix mixture."
+    ),
+)
+parser.add_argument(
+    "--position_precondition_sec",
+    type=float,
+    default=3.0,
+    help=(
+        "Teacher stabilization time before Position-prefix environments clear "
+        "and refill a fresh deployable history."
+    ),
+)
+parser.add_argument(
     "--rma_context_mode",
     type=str,
     default=None,
@@ -202,6 +221,13 @@ def main(env_cfg, agent_cfg):
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     base_env = env.unwrapped
     action_low, action_high = _get_action_bounds(base_env, env.device)
+    position_history_ratio = float(args_cli.position_history_ratio)
+    if not 0.0 <= position_history_ratio <= 1.0:
+        raise ValueError("--position_history_ratio must be within [0, 1]")
+    position_history_count = int(round(position_history_ratio * env.num_envs))
+    position_history_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    position_history_mask[:position_history_count] = True
+    position_history_ratio_realized = position_history_count / max(1, env.num_envs)
 
     runner_cfg = _build_rma_runner_cfg(agent_cfg, env_cfg)
     runner = OnPolicyRunner(env, runner_cfg, log_dir=None, device=agent_cfg.device)
@@ -225,9 +251,17 @@ def main(env_cfg, agent_cfg):
     obs = env.get_observations()
     dt = env.unwrapped.step_dt
     probe_steps = int(args_cli.probe_sec / dt)
+    if float(args_cli.position_precondition_sec) < 0.0:
+        raise ValueError("--position_precondition_sec must be nonnegative")
+    position_precondition_steps = (
+        int(round(float(args_cli.position_precondition_sec) / float(dt)))
+        if position_history_count > 0
+        else 0
+    )
 
     # history buffer: (N, H, 21)
     obs_history = torch.zeros((env.num_envs, history_len, input_dim), device=env.device)
+    history_fill_count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
     out_dir = os.path.join(log_dir, args_cli.out_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -236,10 +270,13 @@ def main(env_cfg, agent_cfg):
     shard_inputs = []
     shard_labels = []
     shard_labels_ml = []
+    shard_sources = []
     shard_idx = 0
     step_count = 0
-    warmup = history_len
+    warmup = position_precondition_steps + history_len
     stored_steps = 0
+    stored_samples = 0
+    skipped_incomplete_samples = 0
     # meta stats accumulators (CPU)
     z_sum = torch.zeros(z_dim)
     z_sumsq = torch.zeros(z_dim)
@@ -271,16 +308,27 @@ def main(env_cfg, agent_cfg):
     )
     print(f"[Collect] saving shards to: {out_dir}")
     print(f"[Collect] action_low={action_low.detach().cpu().tolist()} action_high={action_high.detach().cpu().tolist()}")
+    print(
+        "[Collect] history mixture: "
+        f"teacher={1.0 - position_history_ratio_realized:.3f} "
+        f"position={position_history_ratio_realized:.3f}"
+    )
 
     while simulation_app.is_running():
         start_time = time.time()
         with torch.inference_mode():
+            # Match deployment: first stabilize under Teacher control, then
+            # start a fresh history window with Position-style action tokens.
+            if position_history_count > 0 and step_count == position_precondition_steps:
+                obs_history[position_history_mask] = 0.0
+                history_fill_count[position_history_mask] = 0
+
             # ---- 0) compute teacher action from current obs(t) ----
             actions_raw = policy(obs)                                   # (N,4)
             actions_exec = _clip_actions_to_bounds(actions_raw, action_low, action_high)
 
             # ---- 1) OPTIONAL probe: override action for first probe_steps ----
-            actions_to_step = actions_exec
+            actions_to_step = actions_exec.clone()
 
             probe_start = warmup
             probe_end = warmup + probe_steps   # probe_steps 仍然由 probe_sec/dt 决定
@@ -295,13 +343,19 @@ def main(env_cfg, agent_cfg):
                 actions_to_step[:, 3] = 0.0
                 actions_to_step = _clip_actions_to_bounds(actions_to_step, action_low, action_high)
 
-
             # ---- 2) build history input from obs(t) and last_action(t-1) ----
             obs_tensor = _get_obs_tensor(obs)      # (N,26)
-            feat = obs_tensor[:, :input_dim]       # (N,21)
+            feat = obs_tensor[:, :input_dim].clone()       # (N,21)
+            # Keep the Teacher closed loop physically coherent, but expose the
+            # Student to the Position-mode previous-action prefix seen before
+            # real handover. Every sample still owns exact privileged labels.
+            if position_history_count > 0 and step_count >= position_precondition_steps:
+                position_actions = base_env.compute_position_hold_ctbr()
+                feat[position_history_mask, 17:21] = position_actions[position_history_mask]
 
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
+            history_fill_count = torch.clamp(history_fill_count + 1, max=history_len)
 
             # ---- 3) teacher label z_teacher: use mu(priv) (robust; no dependency on last_z timing) ----
             priv = obs_tensor[:, 21:26]             # (N,5)
@@ -313,26 +367,44 @@ def main(env_cfg, agent_cfg):
 
             # ---- 4) store sample after warmup ----
             if step_count >= warmup and ((step_count - warmup) % args_cli.sample_stride == 0):
-                shard_inputs.append(obs_history.detach().clone().cpu().to(torch.float16))
-                shard_labels.append(z_teacher.detach().clone().cpu().to(torch.float32))
-                shard_labels_ml.append(priv[:, :2].detach().clone().cpu().to(torch.float32))
-                stored_steps += 1
+                valid_history_mask = history_fill_count >= history_len
+                valid_count = int(valid_history_mask.sum().item())
+                skipped_incomplete_samples += int((~valid_history_mask).sum().item())
+                if valid_count > 0:
+                    shard_inputs.append(
+                        obs_history[valid_history_mask].detach().clone().cpu().to(torch.float16)
+                    )
+                    shard_labels.append(
+                        z_teacher[valid_history_mask].detach().clone().cpu().to(torch.float32)
+                    )
+                    shard_labels_ml.append(
+                        priv[valid_history_mask, :2].detach().clone().cpu().to(torch.float32)
+                    )
+                    shard_sources.append(
+                        position_history_mask[valid_history_mask].detach().clone().cpu().to(torch.uint8)
+                    )
+                    stored_steps += 1
+                    stored_samples += valid_count
 
-                # stats (CPU): accumulate per stored sample
-                z_cpu = z_teacher.detach().cpu()
-                z_sum += z_cpu.sum(dim=0)
-                z_sumsq += (z_cpu * z_cpu).sum(dim=0)
-                z_min = torch.minimum(z_min, z_cpu.min(dim=0).values)
-                z_max = torch.maximum(z_max, z_cpu.max(dim=0).values)
+                    # stats (CPU): accumulate only genuinely full histories.
+                    z_cpu = z_teacher[valid_history_mask].detach().cpu()
+                    z_sum += z_cpu.sum(dim=0)
+                    z_sumsq += (z_cpu * z_cpu).sum(dim=0)
+                    z_min = torch.minimum(z_min, z_cpu.min(dim=0).values)
+                    z_max = torch.maximum(z_max, z_cpu.max(dim=0).values)
 
-                p_cpu = priv.detach().cpu()
-                priv_sum += p_cpu.sum(dim=0)
-                priv_sumsq += (p_cpu * p_cpu).sum(dim=0)
-                priv_min = torch.minimum(priv_min, p_cpu.min(dim=0).values)
-                priv_max = torch.maximum(priv_max, p_cpu.max(dim=0).values)
+                    p_cpu = priv[valid_history_mask].detach().cpu()
+                    priv_sum += p_cpu.sum(dim=0)
+                    priv_sumsq += (p_cpu * p_cpu).sum(dim=0)
+                    priv_min = torch.minimum(priv_min, p_cpu.min(dim=0).values)
+                    priv_max = torch.maximum(priv_max, p_cpu.max(dim=0).values)
 
-                # trace
-                if args_cli.trace_csv and trace_env < env.num_envs:
+                # trace only when the selected environment owns a full window.
+                if (
+                    args_cli.trace_csv
+                    and trace_env < env.num_envs
+                    and bool(valid_history_mask[trace_env].item())
+                ):
                     e = trace_env
                     payload_err = obs_tensor[e, 0:3].detach().cpu().numpy()
                     theta_deg = obs_tensor[e, 3:5].detach().cpu().numpy()
@@ -357,6 +429,7 @@ def main(env_cfg, agent_cfg):
             done_mask = dones.to(dtype=torch.bool).reshape(-1)
             if torch.any(done_mask):
                 obs_history[done_mask] = 0.0
+                history_fill_count[done_mask] = 0
                 policy_nn.reset(done_mask)
 
             step_count += 1
@@ -364,9 +437,10 @@ def main(env_cfg, agent_cfg):
             # ---- 7) save shards & stop ----
             if (step_count >= warmup) and ((step_count - warmup + 1) % args_cli.save_every == 0):
                 if len(shard_inputs) > 0:
-                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
-                    labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
-                    labels_ml = torch.stack(shard_labels_ml, dim=0).reshape(-1, 2)
+                    inputs = torch.cat(shard_inputs, dim=0)
+                    labels = torch.cat(shard_labels, dim=0)
+                    labels_ml = torch.cat(shard_labels_ml, dim=0)
+                    history_source = torch.cat(shard_sources, dim=0)
                     shard_audit = audit_shard_tensors(
                         inputs,
                         labels,
@@ -395,6 +469,7 @@ def main(env_cfg, agent_cfg):
                             "inputs": inputs,
                             "labels": labels,
                             "labels_ml": labels_ml,
+                            "history_source": history_source,
                         },
                         shard_path,
                     )
@@ -406,14 +481,16 @@ def main(env_cfg, agent_cfg):
                     shard_inputs.clear()
                     shard_labels.clear()
                     shard_labels_ml.clear()
+                    shard_sources.clear()
                     shard_idx += 1
 
             # stop condition
             if step_count >= (args_cli.steps + warmup):
                 if len(shard_inputs) > 0:
-                    inputs = torch.stack(shard_inputs, dim=0).reshape(-1, history_len, input_dim)
-                    labels = torch.stack(shard_labels, dim=0).reshape(-1, z_dim)
-                    labels_ml = torch.stack(shard_labels_ml, dim=0).reshape(-1, 2)
+                    inputs = torch.cat(shard_inputs, dim=0)
+                    labels = torch.cat(shard_labels, dim=0)
+                    labels_ml = torch.cat(shard_labels_ml, dim=0)
+                    history_source = torch.cat(shard_sources, dim=0)
                     shard_audit = audit_shard_tensors(
                         inputs,
                         labels,
@@ -442,6 +519,7 @@ def main(env_cfg, agent_cfg):
                             "inputs": inputs,
                             "labels": labels,
                             "labels_ml": labels_ml,
+                            "history_source": history_source,
                         },
                         shard_path,
                     )
@@ -451,7 +529,7 @@ def main(env_cfg, agent_cfg):
                     )
 
                 # write meta + stat
-                total_samples = stored_steps * env.num_envs
+                total_samples = stored_samples
                 z_mean = z_sum / max(1, total_samples)
                 z_var = z_sumsq / max(1, total_samples) - z_mean * z_mean
                 z_std = torch.sqrt(torch.clamp(z_var, min=1e-12))
@@ -476,6 +554,7 @@ def main(env_cfg, agent_cfg):
                     "z_dim": z_dim,
                     "z_exp_dim": z_exp_dim,
                     "total_samples": total_samples,
+                    "skipped_incomplete_history_samples": skipped_incomplete_samples,
                     "steps": args_cli.steps,
                     "save_every": args_cli.save_every,
                     "obs_layout": {
@@ -486,6 +565,14 @@ def main(env_cfg, agent_cfg):
                     "real_hover_gap_profile": str(
                         getattr(env_cfg, "real_hover_gap_profile", "disabled")
                     ),
+                    "position_history_ratio_requested": position_history_ratio,
+                    "position_history_ratio_realized": position_history_ratio_realized,
+                    "position_precondition_sec": float(args_cli.position_precondition_sec),
+                    "position_precondition_steps": int(position_precondition_steps),
+                    "history_source_encoding": {
+                        "0": "teacher_rl_closed_loop",
+                        "1": "teacher_state_with_position_ctbr_history_augmentation",
+                    },
                     "uav_mass_kg": float(getattr(env_cfg, "uav_mass_kg", 0.0)),
                     "payload_sensor_nominal_hz": list(
                         getattr(env_cfg, "payload_sensor_nominal_hz", (60.0, 60.0))
@@ -531,7 +618,7 @@ def main(env_cfg, agent_cfg):
                 torch.save(meta, os.path.join(out_dir, "meta.pt"))
                 wall_time_sec = time.time() - collect_t0
                 num_shards = shard_idx + (1 if len(shard_inputs) > 0 else 0)
-                total_samples = stored_steps * env.num_envs
+                total_samples = stored_samples
 
                 collect_report = {
                     "checkpoint": resume_path,
@@ -543,6 +630,7 @@ def main(env_cfg, agent_cfg):
                     "env_steps_total": int(step_count),
                     "stored_steps": int(stored_steps),
                     "total_samples": int(total_samples),
+                    "skipped_incomplete_history_samples": int(skipped_incomplete_samples),
                     "num_shards": int(num_shards),
                     "samples_per_sec": float(total_samples / max(wall_time_sec, 1e-9)),
                     "history_len": int(history_len),
@@ -558,6 +646,10 @@ def main(env_cfg, agent_cfg):
                     "real_hover_gap_profile": str(
                         getattr(env_cfg, "real_hover_gap_profile", "disabled")
                     ),
+                    "position_history_ratio_requested": position_history_ratio,
+                    "position_history_ratio_realized": position_history_ratio_realized,
+                    "position_precondition_sec": float(args_cli.position_precondition_sec),
+                    "position_precondition_steps": int(position_precondition_steps),
                     "real_hover_gap_audit": real_hover_gap_audit,
                 }
 

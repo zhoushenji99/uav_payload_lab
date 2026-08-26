@@ -42,6 +42,16 @@ parser = argparse.ArgumentParser(description="Phase-2 Play: Teacher(mu(priv)) vs
 parser.add_argument("--mode", type=str, default="student", choices=["student", "teacher"])
 parser.add_argument("--encoder", type=str, default="", help="Student encoder .pth (required if --mode student).")
 parser.add_argument("--history_len", type=int, default=50)
+parser.add_argument(
+    "--student_shadow_warmup_sec",
+    type=float,
+    default=0.0,
+    help=(
+        "Student-mode only. Let the Teacher execute actions for this duration while "
+        "the Student runs in shadow and fills its history/context caches; 0 keeps "
+        "the legacy immediate-Student behavior."
+    ),
+)
 parser.add_argument("--slow_warmup_sec", type=float, default=3.0, help="Run the slow encoder at policy rate during startup.")
 parser.add_argument("--slow_update_hz", type=float, default=1.0, help="Slow encoder rate after startup.")
 parser.add_argument("--fast_update_hz", type=float, default=60.0, help="Fast encoder update rate.")
@@ -154,6 +164,10 @@ from uav_payload_lab.tasks.direct.uav_payload_sim2real.fastslow_runtime import (
     compute_multirate_schedule,
     summarize_latency_ms,
     validate_evaluation_overrides,
+)
+from uav_payload_lab.tasks.direct.uav_payload_sim2real.phase2_shadow_handover import (
+    select_shadow_actions,
+    validate_shadow_warmup,
 )
 
 
@@ -521,6 +535,13 @@ def main(env_cfg, agent_cfg):
     slow_period_steps = schedule.slow_period_steps
     fast_period_steps = schedule.fast_period_steps
     slow_filter_alpha = causal_ema_alpha(dt, float(args_cli.slow_filter_tau_sec))
+    student_shadow_warmup_steps = validate_shadow_warmup(
+        shadow_warmup_sec=float(args_cli.student_shadow_warmup_sec),
+        policy_dt=dt,
+        history_len=history_len,
+        slow_warmup_sec=float(args_cli.slow_warmup_sec),
+        mode=str(args_cli.mode),
+    )
 
     trace_env = int(args_cli.trace_env)
     if trace_env < 0 or trace_env >= env.num_envs:
@@ -533,6 +554,7 @@ def main(env_cfg, agent_cfg):
     header = [
         "time_s",
         "mode",
+        "control_source",
         # UAV / payload / goal positions
         "uav_px","uav_py","uav_pz",
         "payload_px","payload_py","payload_pz",
@@ -563,6 +585,9 @@ def main(env_cfg, agent_cfg):
         "wind_acc_x_mps2","wind_acc_y_mps2","wind_acc_z_mps2",
         "context_refresh_action_l1","context_refresh_action_l2","context_refresh_action_max",
         "executed_action_delta_l1",
+        # Student Actor candidate is logged even while Teacher controls shadow warm-up.
+        "student_candidate_a0_raw","student_candidate_a1_raw","student_candidate_a2_raw","student_candidate_a3_raw",
+        "student_candidate_a0_clamp","student_candidate_a1_clamp","student_candidate_a2_clamp","student_candidate_a3_clamp",
         # actions
         "a0_raw","a1_raw","a2_raw","a3_raw",
         "a0_clamp","a1_clamp","a2_clamp","a3_clamp",
@@ -577,7 +602,8 @@ def main(env_cfg, agent_cfg):
         f"[INFO] policy_hz={schedule.policy_hz:.1f} fast_hz={schedule.fast_update_hz:.1f} "
         f"slow_warmup_steps={slow_warmup_steps} slow_period_steps={slow_period_steps} "
         f"slow_filter_tau={args_cli.slow_filter_tau_sec:.3f}s alpha={slow_filter_alpha:.8f} "
-        f"runtime_mode={args_cli.context_runtime_mode}"
+        f"runtime_mode={args_cli.context_runtime_mode} "
+        f"student_shadow_warmup_steps={student_shadow_warmup_steps}"
     )
     print(f"[INFO] CSV -> {csv_path}")
 
@@ -735,12 +761,14 @@ def main(env_cfg, agent_cfg):
             # ---- 4) action inference (t) ----
             if not hasattr(policy_nn, "act_inference"):
                 raise RuntimeError("policy_nn has no act_inference(); unexpected policy type.")
-            actions_raw, actor_inference_ms = _timed_call(
+            student_actions_raw, actor_inference_ms = _timed_call(
                 lambda: policy_nn.act_inference(obs_in),
                 env.device,
                 bool(args_cli.profile_inference),
             )
-            actions = _clip_actions_to_bounds(actions_raw, action_low, action_high)
+            student_actions = _clip_actions_to_bounds(
+                student_actions_raw, action_low, action_high
+            )
             latency_samples["actor"].append(actor_inference_ms)
 
             if args_cli.profile_inference:
@@ -751,6 +779,39 @@ def main(env_cfg, agent_cfg):
             else:
                 end_to_end_inference_ms = 0.0
             latency_samples["end_to_end"].append(end_to_end_inference_ms)
+
+            # During the opt-in shadow interval, the Student encoder, caches, and
+            # Actor still run normally, but the privileged Teacher action is the
+            # one executed by the environment. At handover no runtime state is
+            # reset: only this per-environment action selector changes source.
+            actions_raw = student_actions_raw
+            actions = student_actions
+            teacher_shadow_active = torch.zeros(
+                env.num_envs, dtype=torch.bool, device=env.device
+            )
+            if args_cli.mode == "student" and student_shadow_warmup_steps > 0:
+                if not hasattr(policy_nn, "use_mu"):
+                    raise RuntimeError(
+                        "Teacher shadow warm-up requires policy_nn.use_mu support."
+                    )
+                policy_nn.use_mu = True
+                try:
+                    teacher_actions_raw = policy_nn.act_inference(
+                        {"policy": obs_tensor}
+                    )
+                finally:
+                    policy_nn.use_mu = False
+                teacher_actions = _clip_actions_to_bounds(
+                    teacher_actions_raw, action_low, action_high
+                )
+                actions_raw, actions, teacher_shadow_active = select_shadow_actions(
+                    student_raw=student_actions_raw,
+                    student_clipped=student_actions,
+                    teacher_raw=teacher_actions_raw,
+                    teacher_clipped=teacher_actions,
+                    episode_steps=episode_steps,
+                    shadow_steps=student_shadow_warmup_steps,
+                )
 
             # Counterfactual refresh diagnostic: under the same observation and
             # current fast context, compare old cache vs newly refreshed raw target.
@@ -820,6 +881,16 @@ def main(env_cfg, agent_cfg):
             # actions (t)
             a_raw = actions_raw[e].detach().cpu().numpy().tolist()
             a_clp = actions[e].detach().cpu().numpy().tolist()
+            student_a_raw = (
+                student_actions_raw[e].detach().cpu().numpy().tolist()
+            )
+            student_a_clp = student_actions[e].detach().cpu().numpy().tolist()
+            if args_cli.mode == "teacher":
+                control_source = "teacher"
+            elif bool(teacher_shadow_active[e].item()):
+                control_source = "teacher_shadow"
+            else:
+                control_source = "student"
             slow_raw_e = z_slow_raw[e].detach().cpu().numpy().tolist()
             slow_target_e = z_slow_target[e].detach().cpu().numpy().tolist()
             slow_cache_e = z_slow_cache[e].detach().cpu().numpy().tolist()
@@ -856,6 +927,7 @@ def main(env_cfg, agent_cfg):
             w.writerow([
                 step_count * dt,
                 args_cli.mode,
+                control_source,
                 *uav_pos,
                 *payload_pos,
                 *goal_pos,
@@ -892,6 +964,8 @@ def main(env_cfg, agent_cfg):
                 context_delta_l2,
                 context_delta_max,
                 executed_action_delta_l1,
+                *student_a_raw,
+                *student_a_clp,
                 *a_raw,
                 *a_clp,
             ])
@@ -1001,6 +1075,8 @@ def main(env_cfg, agent_cfg):
         "slow_update_hz": float(args_cli.slow_update_hz),
         "slow_warmup_steps": int(slow_warmup_steps),
         "slow_period_steps": int(slow_period_steps),
+        "student_shadow_warmup_sec": float(args_cli.student_shadow_warmup_sec),
+        "student_shadow_warmup_steps": int(student_shadow_warmup_steps),
         "slow_filter_tau_sec": float(args_cli.slow_filter_tau_sec),
         "slow_filter_alpha": float(slow_filter_alpha),
         "profile_inference": bool(args_cli.profile_inference),

@@ -133,11 +133,47 @@ class RealHoverGapHelperTests(unittest.TestCase):
             rtol=0.0,
         )
 
+    def test_physical_context_normalization_matches_v87_contract(self):
+        mass = torch.tensor([0.31265, 0.62265, 0.93265])
+        length = torch.tensor([0.25, 0.6004, 0.8])
+        z0, z1 = self.module.normalize_physical_context(
+            mass,
+            length,
+            payload_mass_range_kg=(0.31265, 0.93265),
+            rope_length_range_m=(0.25, 0.8),
+        )
+        torch.testing.assert_close(z0, torch.tensor([0.0, 0.5, 1.0]))
+        torch.testing.assert_close(
+            z1,
+            torch.tensor([0.0, 0.6370909, 1.0]),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
+    def test_rate_gain_is_derived_from_inertia_and_time_constant(self):
+        gain = self.module.rate_gain_from_time_constant(
+            torch.tensor([[0.0763, 0.0762, 0.1500]]),
+            torch.tensor([[0.10, 0.20, 0.30]]),
+        )
+        torch.testing.assert_close(
+            gain,
+            torch.tensor([[0.763, 0.381, 0.500]]),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
+    def test_rate_gain_rejects_nonpositive_time_constant(self):
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self.module.rate_gain_from_time_constant(
+                torch.ones(1, 3),
+                torch.tensor([[0.1, 0.0, 0.2]]),
+            )
+
 
 class RealHoverGapStaticIntegrationTests(unittest.TestCase):
     def test_config_keeps_interface_and_encodes_measured_uav(self):
         source = CFG_PATH.read_text(encoding="utf-8")
-        self.assertIn('real_hover_gap_profile = "real_hover_gap_v1"', source)
+        self.assertIn('real_hover_gap_profile = "first_flight_gap_v3"', source)
         self.assertIn("uav_bare_mass_kg = 3.100", source)
         self.assertIn("uav_fixed_gimbal_mass_kg = 0.03175", source)
         self.assertIn(
@@ -146,6 +182,9 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         )
         self.assertIn("uav_com_m = (0.00389, 0.02922, 0.17422)", source)
         self.assertIn("uav_inertia_diag_kg_m2 = (0.0763, 0.0762, 0.1500)", source)
+        self.assertIn("uav_mass_scale_range = (0.99, 1.01)", source)
+        self.assertIn("uav_com_offset_range_m = (-0.002, 0.002)", source)
+        self.assertIn("uav_inertia_scale_range = (0.95, 1.05)", source)
         self.assertIn("proprio_obs_dim = 21", source)
         self.assertIn("privileged_obs_dim = 5", source)
 
@@ -158,39 +197,97 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
 
     def test_config_encodes_startup_gust_and_payload_downwash(self):
         source = CFG_PATH.read_text(encoding="utf-8")
-        self.assertIn("startup_gust_accel_range_mps2 = (0.5, 1.5)", source)
-        self.assertIn("startup_gust_duration_range_s = (0.4, 1.0)", source)
-        self.assertIn("startup_gust_uav_scale = 0.4", source)
+        self.assertIn("startup_gust_accel_range_mps2 = (0.3, 0.8)", source)
+        self.assertIn("startup_gust_duration_range_s = (0.4, 0.8)", source)
+        self.assertIn("startup_gust_uav_scale = 0.2", source)
         self.assertIn("startup_gust_payload_scale = 1.0", source)
         self.assertIn("downwash_bias_force_range_n = (0.0, 0.8)", source)
-        self.assertIn("downwash_ou_sigma_n_sqrt_s = 0.15", source)
-        self.assertIn("downwash_force_clip_n = 1.2", source)
-        self.assertIn("residual_accel_norm_max = 5.5", source)
+        self.assertIn("downwash_ou_sigma_n_sqrt_s = 0.03", source)
+        self.assertIn("downwash_force_clip_n = 0.9", source)
+        self.assertIn("residual_accel_norm_max = 4.5", source)
+
+    def test_config_uses_identifiable_indoor_wind_domain(self):
+        source = CFG_PATH.read_text(encoding="utf-8")
+        self.assertIn("wind_mean_accel_max = 0.1", source)
+        self.assertIn("wind_gust_accel_max = 0.3", source)
+        self.assertIn("wind_total_accel_max = 0.6", source)
+        self.assertIn("wind_gust_dt_min = 1.0", source)
+        self.assertIn("wind_gust_dt_max = 3.0", source)
+        self.assertIn("wind_ou_sigma = 0.2", source)
 
     def test_config_encodes_payload_vision_transport_and_bias(self):
         cfg = CFG_PATH.read_text(encoding="utf-8")
         env = ENV_PATH.read_text(encoding="utf-8")
-        self.assertIn("payload_sensor_tail_probability = 0.15", cfg)
-        self.assertIn("payload_sensor_nominal_hz = (12.0, 30.0)", cfg)
-        self.assertIn("payload_sensor_tail_hz = (5.0, 12.0)", cfg)
-        self.assertIn("payload_sensor_nominal_delay_s = (0.03, 0.15)", cfg)
-        self.assertIn("payload_sensor_tail_delay_s = (0.15, 0.30)", cfg)
-        self.assertIn("payload_sensor_valid_probability = (0.92, 0.98)", cfg)
-        self.assertIn("payload_sensor_hold_cap_s = 0.50", cfg)
+        self.assertIn("payload_sensor_tail_probability = 0.05", cfg)
+        self.assertIn("payload_sensor_nominal_hz = (8.0, 20.0)", cfg)
+        self.assertIn("payload_sensor_tail_hz = (5.0, 8.0)", cfg)
+        self.assertIn("payload_sensor_nominal_delay_s = (0.03, 0.20)", cfg)
+        self.assertIn("payload_sensor_tail_delay_s = (0.20, 0.30)", cfg)
+        self.assertIn("payload_sensor_valid_probability = (0.93, 0.99)", cfg)
+        self.assertIn("payload_sensor_hold_cap_s = 0.25", cfg)
+        self.assertIn("payload_position_bias_range_m = (-0.01, 0.01)", cfg)
+        self.assertIn("payload_angle_bias_range_deg = (-1.5, 1.5)", cfg)
+        self.assertIn("linear_velocity_bias_range_mps = (-0.015, 0.015)", cfg)
+        self.assertIn("body_rate_bias_range_rps = (-0.005, 0.005)", cfg)
+        self.assertIn("enable_obs_noise = True", cfg)
+        self.assertIn("obs_noise_e_load_std_m = 0.003", cfg)
+        self.assertIn("obs_noise_tilt_std_deg = 0.75", cfg)
+        self.assertIn("obs_noise_v_b_std_mps = 0.01", cfg)
+        self.assertIn("obs_noise_w_b_std_rps = 0.005", cfg)
         self.assertIn("def _transport_payload_observation", env)
         self.assertIn("def _reset_payload_sensor_gap", env)
+
+    def test_config_and_env_use_randomized_body_rate_time_constants(self):
+        cfg = CFG_PATH.read_text(encoding="utf-8")
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("ctbr_rate_time_constant_range_s", cfg)
+        self.assertIn("((0.08, 0.25), (0.08, 0.25), (0.12, 0.45))", cfg)
+        self.assertIn("def _sample_body_rate_dynamics", env)
+        self.assertIn("rate_gain_from_time_constant", env)
+        self.assertIn("self._ctbr_rate_kp_per_env", env)
+        self.assertIn("self._ctbr_rate_time_constant_s", env)
+        self.assertIn("moment_cmd = self._ctbr_rate_kp_per_env * rate_error", env)
 
     def test_config_encodes_per_environment_action_transport(self):
         cfg = CFG_PATH.read_text(encoding="utf-8")
         env = ENV_PATH.read_text(encoding="utf-8")
-        self.assertIn("action_delay_steps_range = (0, 2)", cfg)
-        self.assertIn("action_lpf_alpha_range = (0.35, 1.0)", cfg)
-        self.assertIn("collective_efficiency_range = (0.85, 1.05)", cfg)
-        self.assertIn("moment_efficiency_range = (0.90, 1.10)", cfg)
+        self.assertIn("action_delay_steps_range = (0, 1)", cfg)
+        self.assertIn("action_lpf_alpha_range = (0.75, 1.0)", cfg)
+        self.assertIn("collective_efficiency_range = (1.0, 1.0)", cfg)
+        self.assertIn("moment_efficiency_range = (1.0, 1.0)", cfg)
         self.assertIn("_action_delay_steps_per_env", env)
         self.assertIn("_action_lpf_alpha_per_env", env)
         self.assertIn("_collective_efficiency", env)
         self.assertIn("_moment_efficiency", env)
+
+    def test_policy_history_uses_last_transmitted_clamped_ctbr(self):
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("self._last_transmitted_actions", env)
+        self.assertIn("self._last_transmitted_actions = self._raw_actions.clone()", env)
+        self.assertEqual(env.count("self._last_transmitted_actions, # 17-20"), 2)
+
+    def test_gap_audit_covers_identifiability_sensitive_ranges(self):
+        env = ENV_PATH.read_text(encoding="utf-8")
+        for key in (
+            '"enable_real_hover_gap"',
+            '"uav_mass_scale_range"',
+            '"rope_length_range"',
+            '"payload_mass_range"',
+            '"enable_wind"',
+            '"wind_ou_sigma"',
+            '"enable_startup_gust"',
+            '"enable_payload_downwash"',
+            '"enable_payload_sensor_gap"',
+            '"payload_sensor_nominal_delay_s"',
+            '"payload_sensor_valid_probability"',
+            '"action_lpf_alpha_range"',
+            '"collective_efficiency_range"',
+            '"moment_efficiency_range"',
+            '"ctbr_rate_time_constant_range_s"',
+            '"residual_accel_norm_max"',
+            '"observation_history_action_source": "last_transmitted_clamped_ctbr"',
+        ):
+            self.assertIn(key, env)
 
     def test_env_applies_and_inverts_measured_quadratic_thrust_curve(self):
         cfg = CFG_PATH.read_text(encoding="utf-8")
@@ -226,6 +323,49 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         ):
             self.assertIn(key, source)
         self.assertIn("residual_accel_norm(3)", source)
+
+    def test_collect_supports_labeled_position_history_mixture(self):
+        source = COLLECT_PATH.read_text(encoding="utf-8")
+        self.assertIn('"--position_history_ratio"', source)
+        self.assertIn('"--position_precondition_sec"', source)
+        self.assertIn("compute_position_hold_ctbr", source)
+        self.assertIn("position_precondition_steps", source)
+        self.assertIn("step_count == position_precondition_steps", source)
+        self.assertIn("feat[position_history_mask, 17:21]", source)
+        self.assertNotIn(
+            "actions_to_step[position_history_mask] = position_actions[position_history_mask]",
+            source,
+        )
+        self.assertIn('"history_source"', source)
+        self.assertIn('"position_history_ratio_requested"', source)
+        self.assertIn('"position_history_ratio_realized"', source)
+
+    def test_collect_never_saves_partially_refilled_histories_after_reset(self):
+        source = COLLECT_PATH.read_text(encoding="utf-8")
+        self.assertIn("history_fill_count", source)
+        self.assertIn("valid_history_mask = history_fill_count >= history_len", source)
+        self.assertIn("history_fill_count[done_mask] = 0", source)
+        self.assertIn("torch.cat(shard_inputs, dim=0)", source)
+        self.assertNotIn("torch.stack(shard_inputs, dim=0)", source)
+
+    def test_position_history_controller_keeps_ctbr_contract(self):
+        cfg = CFG_PATH.read_text(encoding="utf-8")
+        source = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("position_history_attitude_kp = (0.8, 0.8, 1.0)", cfg)
+        self.assertIn("position_history_rate_limit_rps = (0.45, 0.35, 0.30)", cfg)
+        self.assertIn(
+            "position_history_rate_bias_center_rps = (-0.0634, -0.0234, 0.1880)",
+            cfg,
+        )
+        self.assertIn("position_history_rate_bias_jitter_rps = (0.08, 0.08, 0.04)", cfg)
+        self.assertIn("def compute_position_hold_ctbr", source)
+        self.assertIn(
+            "roll_des = torch.atan2(accel_cmd_w[:, 1], vertical_accel)", source
+        )
+        self.assertIn("self._thrust_ratio_to_collective_signal", source)
+        self.assertIn("self._ctbr_rate_sign", source)
+        self.assertIn("self._decode_px4_ctbr_action", source)
+        self.assertIn("self._position_history_rate_bias_px4", source)
 
 
 if __name__ == "__main__":

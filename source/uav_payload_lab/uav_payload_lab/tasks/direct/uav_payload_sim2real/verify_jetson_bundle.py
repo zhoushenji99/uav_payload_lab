@@ -50,8 +50,55 @@ def verify_checksums(bundle_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def verify_manifest(bundle_dir: str | Path) -> dict[str, Any]:
+    root = Path(bundle_dir).resolve()
+    manifest_path = root / "config" / "manifest.json"
+    if not manifest_path.is_file():
+        return {
+            "passed": False,
+            "missing_artifacts": ["config/manifest.json"],
+            "unexpected_student_checkpoints": [],
+        }
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = [str(name) for name in manifest.get("artifacts", [])]
+    missing = [name for name in artifacts if not (root / name).is_file()]
+    expected_student = str(manifest.get("student_source", ""))
+    unexpected = []
+    models_dir = root / "models"
+    if models_dir.is_dir():
+        for path in models_dir.rglob("*.pth"):
+            relative = path.relative_to(root).as_posix()
+            if relative == expected_student:
+                continue
+            lowered = path.name.lower()
+            if "student" in lowered or "last_checkpoint" in lowered:
+                unexpected.append(relative)
+    topic = manifest.get("observation_21", {}).get("topic")
+    passed = (
+        not missing
+        and not unexpected
+        and expected_student == "models/source_student_best.pth"
+        and topic == "/uav_payload/observation21"
+    )
+    return {
+        "passed": passed,
+        "missing_artifacts": missing,
+        "unexpected_student_checkpoints": sorted(unexpected),
+        "student_source": expected_student,
+        "observation_topic": topic,
+        "flight_approved": bool(
+            manifest.get("safety", {}).get("flight_approved", False)
+        ),
+        "deployment_status": manifest.get("safety", {}).get(
+            "deployment_status", "unknown"
+        ),
+    }
+
+
 def _load_vectors(bundle_dir: Path) -> dict[str, np.ndarray]:
-    path = bundle_dir / "parity_vectors.npz"
+    path = bundle_dir / "verification" / "parity_vectors.npz"
+    if not path.is_file():
+        path = bundle_dir / "parity_vectors.npz"
     if not path.is_file():
         raise FileNotFoundError(f"Missing parity vectors: {path}")
     with np.load(path, allow_pickle=False) as archive:
@@ -65,6 +112,7 @@ def verify_torchscript(
     tolerance: float = 1.0e-6,
 ) -> dict[str, Any]:
     root = Path(bundle_dir).resolve()
+    models_root = root / "models" if (root / "models").is_dir() else root
     vectors = _load_vectors(root)
     device_value = torch.device(device)
     cases = {
@@ -76,7 +124,7 @@ def verify_torchscript(
     with torch.inference_mode():
         for name, (input_key, expected_key) in cases.items():
             module = torch.jit.load(
-                str(root / f"{name}.ts"), map_location=device_value
+                str(models_root / f"{name}.ts"), map_location=device_value
             ).eval()
             value = torch.from_numpy(vectors[input_key]).to(device_value)
             expected = torch.from_numpy(vectors[expected_key]).to(device_value)
@@ -103,6 +151,7 @@ def verify_onnx(
     tolerance: float = 1.0e-5,
 ) -> dict[str, Any]:
     root = Path(bundle_dir).resolve()
+    models_root = root / "models" if (root / "models").is_dir() else root
     vectors = _load_vectors(root)
     cases = {
         "slow_encoder": ("history", "slow_expected"),
@@ -116,7 +165,7 @@ def verify_onnx(
         backend = "onnxruntime"
         for name, (input_key, expected_key) in cases.items():
             session = ort.InferenceSession(
-                str(root / f"{name}.onnx"), providers=["CPUExecutionProvider"]
+                str(models_root / f"{name}.onnx"), providers=["CPUExecutionProvider"]
             )
             input_name = session.get_inputs()[0].name
             output = np.asarray(
@@ -136,7 +185,7 @@ def verify_onnx(
 
         backend = "onnx_reference"
         for name, (input_key, expected_key) in cases.items():
-            evaluator = ReferenceEvaluator(str(root / f"{name}.onnx"))
+            evaluator = ReferenceEvaluator(str(models_root / f"{name}.onnx"))
             input_name = evaluator.input_names[0]
             output = np.asarray(
                 evaluator.run(None, {input_name: vectors[input_key]})[0]
@@ -167,7 +216,10 @@ def main() -> None:
     args = parser.parse_args()
 
     root = Path(args.bundle).resolve()
-    report: dict[str, Any] = {"checksums": verify_checksums(root)}
+    report: dict[str, Any] = {
+        "checksums": verify_checksums(root),
+        "manifest": verify_manifest(root),
+    }
     if args.backend in ("torchscript", "all"):
         report["torchscript"] = verify_torchscript(root, device=args.device)
     if args.backend in ("onnx", "all"):

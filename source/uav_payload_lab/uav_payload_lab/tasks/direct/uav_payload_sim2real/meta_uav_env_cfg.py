@@ -97,13 +97,14 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     debug_vis = True
 
     # ---------------------------------------------------------------------
-    # Real Hover Gap v1: measured UAV rigid-body properties
+    # First-flight Gap v3: measured, identifiable central training domain.
+    # Wide/unmeasured tails belong in evaluation, not in Teacher training.
     # The 3.100 kg bare-airframe measurement excludes the gimbal. One measured
     # half of the 63.5 g two-stage gimbal is fixed to the UAV root; the other
     # half is included in payload_fixed_moving_mass_kg below.
     # They are applied through the PhysX tensor API; the source USD is kept intact.
     # ---------------------------------------------------------------------
-    real_hover_gap_profile = "real_hover_gap_v1"
+    real_hover_gap_profile = "first_flight_gap_v3"
     enable_real_hover_gap = True
     uav_bare_mass_kg = 3.100
     uav_fixed_gimbal_mass_kg = 0.03175
@@ -112,9 +113,9 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # The raw measured Izz=0.160 violates Izz <= Ixx + Iyy. 0.150 is the
     # nearest conservative physical diagonal used for simulation.
     uav_inertia_diag_kg_m2 = (0.0763, 0.0762, 0.1500)
-    uav_mass_scale_range = (0.975, 1.025)
-    uav_com_offset_range_m = (-0.005, 0.005)
-    uav_inertia_scale_range = (0.90, 1.10)
+    uav_mass_scale_range = (0.99, 1.01)
+    uav_com_offset_range_m = (-0.002, 0.002)
+    uav_inertia_scale_range = (0.95, 1.05)
 
     # 这里先设为 None，实际的 window 类在 env 文件里定义好以后，
     # 会在那里做：UavPayloadLabEnvCfg.ui_window_class_type = UavPayloadLabEnvWindow
@@ -167,6 +168,10 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     measured_voltage_range_v = (23.5, 25.2)
     measured_current_range_a = (0.22, 13.6)
     ctbr_body_rate_limit = (2.5, 2.5, 1.5)
+    # First-order PX4 body-rate closed-loop uncertainty. The 0.935 s first-flight
+    # window suggests roughly 0.10-0.16 s lag but is too short for a point
+    # estimate, so training spans a deliberately wider per-axis interval.
+    ctbr_rate_time_constant_range_s = ((0.08, 0.25), (0.08, 0.25), (0.12, 0.45))
     ctbr_rate_kp = (0.35, 0.35, 0.08)
     ctbr_moment_limit = (1.0, 1.0, 0.25)
     ctbr_px4_to_isaac_rate_sign = (1.0, -1.0, -1.0)
@@ -211,17 +216,17 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     wind_axis = "xy"                    # "xy"：只水平风；"xyz"：允许垂直扰动（一般先别开）
 
     # 风扰用“等效加速度”建模（更稳：不同质量不会被同一牛顿力吹飞）
-    wind_mean_accel_max = 0.2           # episode-constant mean wind accel 最大值 (m/s^2)
-    wind_gust_accel_max = 0.7           # gust 加速度幅值 (m/s^2)，每段随机方向/正负
-    wind_total_accel_max = 1.5          # 总风加速度限幅 (m/s^2)
+    wind_mean_accel_max = 0.1           # indoor central-domain mean acceleration (m/s^2)
+    wind_gust_accel_max = 0.3           # identifiable, mild piecewise gust (m/s^2)
+    wind_total_accel_max = 0.6          # total ambient-wind acceleration clamp (m/s^2)
 
     # gust 分段常值持续时间（秒）
-    wind_gust_dt_min = 0.0
-    wind_gust_dt_max = 2.0
+    wind_gust_dt_min = 1.0
+    wind_gust_dt_max = 3.0
 
     # OU 平滑噪声参数：dx = -theta*x*dt + sigma*sqrt(dt)*N(0,1)
     wind_ou_theta = 1.0                 # (1/s) 越大越“拉回 0”，变化更快但更平滑
-    wind_ou_sigma = 1.0                 # (m/s^2 / sqrt(s)) 噪声强度
+    wind_ou_sigma = 0.2                 # reduce unpredictable high-frequency target motion
 
     # UAV vs payload 受风比例（同一风向，力度不同）
     wind_scale_uav = 0.4
@@ -230,21 +235,21 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # Smooth one-shot perturbation that represents Position-mode handover
     # with an already moving payload. It avoids non-physical joint teleporting.
     enable_startup_gust = True
-    startup_gust_accel_range_mps2 = (0.5, 1.5)
-    startup_gust_duration_range_s = (0.4, 1.0)
-    startup_gust_uav_scale = 0.4
+    startup_gust_accel_range_mps2 = (0.3, 0.8)
+    startup_gust_duration_range_s = (0.4, 0.8)
+    startup_gust_uav_scale = 0.2
     startup_gust_payload_scale = 1.0
 
     # Payload-only horizontal force in the UAV body frame. This is kept
     # separate from ambient wind because rotor downwash is platform-relative.
     enable_payload_downwash = True
     downwash_bias_force_range_n = (0.0, 0.8)
-    downwash_ou_sigma_n_sqrt_s = 0.15
+    downwash_ou_sigma_n_sqrt_s = 0.03
     downwash_ou_theta = 1.0
-    downwash_force_clip_n = 1.2
+    downwash_force_clip_n = 0.9
 
     # Privileged residual = ambient/startup acceleration + downwash force / m.
-    residual_accel_norm_max = 5.5
+    residual_accel_norm_max = 4.5
 
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
@@ -312,30 +317,48 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # ---------------------------------------------------------------------
     # Observation noise (Sim2Real)
     # ---------------------------------------------------------------------
-    enable_obs_noise = False
+    enable_obs_noise = True
 
-    # 对应 obs 的 17 维里这些块
-    obs_noise_e_load_std_m = 0.02      # e_load (m)
-    obs_noise_tilt_std_deg = 0.5       # theta_x, theta_y (deg)
+    # Conservative per-frame noise. The measured 9.6 mm / 4.61 deg frame
+    # changes include real payload motion and therefore are upper bounds, not
+    # Gaussian standard deviations.
+    obs_noise_e_load_std_m = 0.003     # e_load (m)
+    obs_noise_tilt_std_deg = 0.75      # theta_x, theta_y (deg)
     obs_theta_dot_lpf_alpha = 0.5
-    obs_noise_v_b_std_mps = 0.05       # body linear velocity (m/s)
-    obs_noise_w_b_std_rps = 0.03       # body angular velocity (rad/s)
+    obs_noise_v_b_std_mps = 0.01       # body linear velocity (m/s)
+    obs_noise_w_b_std_rps = 0.005      # body angular velocity (rad/s)
 
-    # Payload camera/pose pipeline. Most episodes match the measured 25+ FPS
-    # operating region; a small tail covers startup and temporary degradation.
+    # Payload camera/pose pipeline. Train on the measured active-hover central
+    # domain; P95+ outages are handled by the deployment safety state machine
+    # and separate stress evaluation.
     enable_payload_sensor_gap = True
-    payload_sensor_tail_probability = 0.15
-    payload_sensor_nominal_hz = (12.0, 30.0)
-    payload_sensor_tail_hz = (5.0, 12.0)
-    payload_sensor_nominal_delay_s = (0.03, 0.15)
-    payload_sensor_tail_delay_s = (0.15, 0.30)
-    payload_sensor_valid_probability = (0.92, 0.98)
-    payload_sensor_hold_cap_s = 0.50
-    payload_position_bias_range_m = (-0.02, 0.02)
-    payload_angle_bias_range_deg = (-3.0, 3.0)
+    payload_sensor_tail_probability = 0.05
+    payload_sensor_nominal_hz = (8.0, 20.0)
+    payload_sensor_tail_hz = (5.0, 8.0)
+    payload_sensor_nominal_delay_s = (0.03, 0.20)
+    payload_sensor_tail_delay_s = (0.20, 0.30)
+    payload_sensor_valid_probability = (0.93, 0.99)
+    payload_sensor_hold_cap_s = 0.25
+    payload_position_bias_range_m = (-0.01, 0.01)
+    payload_angle_bias_range_deg = (-1.5, 1.5)
     attitude_trim_bias_range_deg = (-1.0, 1.0)
-    linear_velocity_bias_range_mps = (-0.03, 0.03)
-    body_rate_bias_range_rps = (-0.01, 0.01)
+    linear_velocity_bias_range_mps = (-0.015, 0.015)
+    body_rate_bias_range_rps = (-0.005, 0.005)
+
+    # Position-style CTBR token generator used only to augment Phase-II history.
+    # PPO Teacher actions continue to drive the simulated dynamics.
+    position_history_pos_kp = (1.2, 1.2, 1.6)
+    position_history_vel_kd = (1.8, 1.8, 2.0)
+    # Calibrated conservatively against the delivered Position 50H CTBR range;
+    # higher gains over-produced saturated roll-rate prefixes in simulation.
+    position_history_attitude_kp = (0.8, 0.8, 1.0)
+    position_history_accel_limit_mps2 = (1.0, 1.0, 1.0)
+    # The delivered real Position 50H defines the action-prefix center and
+    # conservative caps. These values augment Student history only; they never
+    # drive the simulated rigid-body dynamics.
+    position_history_rate_limit_rps = (0.45, 0.35, 0.30)
+    position_history_rate_bias_center_rps = (-0.0634, -0.0234, 0.1880)
+    position_history_rate_bias_jitter_rps = (0.08, 0.08, 0.04)
 
     # ==========================================
     # [新增] Sim2Real: 延迟与动力学建模
@@ -344,10 +367,13 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # values are retained as compatibility fallbacks when this profile is off.
     action_delay_steps: int = 0
     action_lpf_alpha: float = 1.0
-    action_delay_steps_range = (0, 2)
-    action_lpf_alpha_range = (0.35, 1.0)
-    collective_efficiency_range = (0.85, 1.05)
-    moment_efficiency_range = (0.90, 1.10)
+    action_delay_steps_range = (0, 1)
+    action_lpf_alpha_range = (0.75, 1.0)
+    # The measured thrust curve is the nominal model. Independent efficiency
+    # randomization is disabled because it is not separately identifiable from
+    # payload mass in a 21-D history.
+    collective_efficiency_range = (1.0, 1.0)
+    moment_efficiency_range = (1.0, 1.0)
 
     # ==========================================
     # [修改] 动作惩罚项

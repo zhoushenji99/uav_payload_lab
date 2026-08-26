@@ -8,6 +8,57 @@ from collections.abc import Sequence
 import torch
 
 
+def normalize_physical_context(
+    payload_mass_kg: torch.Tensor | float,
+    rope_length_m: torch.Tensor | float,
+    *,
+    payload_mass_range_kg: Sequence[float] | torch.Tensor,
+    rope_length_range_m: Sequence[float] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize the hard-explicit mass and rope-length context to [0, 1]."""
+    mass = torch.as_tensor(payload_mass_kg)
+    if not mass.is_floating_point():
+        mass = mass.to(dtype=torch.float32)
+    length = torch.as_tensor(rope_length_m, device=mass.device, dtype=mass.dtype)
+    mass_bounds = torch.as_tensor(
+        payload_mass_range_kg, device=mass.device, dtype=mass.dtype
+    )
+    length_bounds = torch.as_tensor(
+        rope_length_range_m, device=mass.device, dtype=mass.dtype
+    )
+    if (
+        mass_bounds.shape != (2,)
+        or length_bounds.shape != (2,)
+        or not torch.isfinite(mass_bounds).all()
+        or not torch.isfinite(length_bounds).all()
+        or mass_bounds[1] <= mass_bounds[0]
+        or length_bounds[1] <= length_bounds[0]
+    ):
+        raise ValueError("physical context ranges must be finite increasing pairs")
+    z0 = ((mass - mass_bounds[0]) / (mass_bounds[1] - mass_bounds[0])).clamp(0.0, 1.0)
+    z1 = ((length - length_bounds[0]) / (length_bounds[1] - length_bounds[0])).clamp(0.0, 1.0)
+    return z0, z1
+
+
+def rate_gain_from_time_constant(
+    inertia_diag_kg_m2: torch.Tensor,
+    time_constant_s: torch.Tensor,
+) -> torch.Tensor:
+    """Return the proportional moment gain that realizes I * dw/dt = Kp * e."""
+    inertia = torch.as_tensor(inertia_diag_kg_m2)
+    tau = torch.as_tensor(time_constant_s, device=inertia.device, dtype=inertia.dtype)
+    if inertia.shape != tau.shape or inertia.shape[-1:] != (3,):
+        raise ValueError("inertia and time constant must have matching (..., 3) shapes")
+    if (
+        not torch.isfinite(inertia).all()
+        or not torch.isfinite(tau).all()
+        or torch.any(inertia <= 0.0)
+        or torch.any(tau <= 0.0)
+    ):
+        raise ValueError("inertia and time constant must be finite and positive")
+    return inertia / tau
+
+
 def compose_lumped_payload_mass(
     rope_length_m: torch.Tensor | float,
     ballast_mass_kg: torch.Tensor | float,

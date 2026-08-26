@@ -22,7 +22,9 @@ from .real_hover_gap import (
     diagonal_inertia_flat,
     half_sine_profile,
     inverse_normalized_quadratic_thrust_ratio,
+    normalize_physical_context,
     normalized_quadratic_thrust_ratio,
+    rate_gain_from_time_constant,
     select_delayed_actions,
     select_delayed_ring,
     validate_inertia_diagonal,
@@ -155,6 +157,9 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._prev_raw_actions = torch.zeros_like(self._actions)
         self._policy_actions = torch.zeros_like(self._actions)
         self._prev_policy_actions = torch.zeros_like(self._actions)
+        # Last CTBR actually transmitted across the deployment interface after
+        # command clipping, before unobservable actuator delay/LPF dynamics.
+        self._last_transmitted_actions = torch.zeros_like(self._actions)
 
         # Per-environment action transport: link delay, first-order actuator
         # response, and conservative thrust/moment effectiveness.
@@ -179,6 +184,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._filtered_actions = torch.zeros_like(self._actions)
         self._ctbr_body_rate_limit = torch.tensor(self.cfg.ctbr_body_rate_limit, dtype=torch.float, device=self.device)
         self._ctbr_rate_kp = torch.tensor(self.cfg.ctbr_rate_kp, dtype=torch.float, device=self.device)
+        self._ctbr_rate_kp_per_env = self._ctbr_rate_kp.unsqueeze(0).repeat(self.num_envs, 1)
+        self._ctbr_rate_time_constant_s = torch.zeros(self.num_envs, 3, device=self.device)
         self._ctbr_moment_limit = torch.tensor(self.cfg.ctbr_moment_limit, dtype=torch.float, device=self.device)
         self._ctbr_rate_sign = torch.tensor(self.cfg.ctbr_px4_to_isaac_rate_sign, dtype=torch.float, device=self.device)
         self._ctbr_action_scale = torch.cat(
@@ -188,6 +195,41 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._ctbr_rate_cmd = torch.zeros(self.num_envs, 3, device=self.device)
         self._ctbr_rate_meas = torch.zeros(self.num_envs, 3, device=self.device)
         self._ctbr_rate_error = torch.zeros(self.num_envs, 3, device=self.device)
+        self._position_history_rate_bias_px4 = torch.zeros(
+            self.num_envs, 3, device=self.device
+        )
+        self._sample_body_rate_dynamics(self._robot._ALL_INDICES)
+
+    def _sample_body_rate_dynamics(self, env_ids: torch.Tensor) -> None:
+        """Sample a per-axis first-order PX4 rate-loop approximation."""
+        count = int(env_ids.numel())
+        if count == 0:
+            return
+        ranges = torch.as_tensor(
+            getattr(self.cfg, "ctbr_rate_time_constant_range_s", ()),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if (
+            ranges.shape != (3, 2)
+            or not torch.isfinite(ranges).all()
+            or torch.any(ranges[:, 0] <= 0.0)
+            or torch.any(ranges[:, 1] < ranges[:, 0])
+        ):
+            raise ValueError(
+                "ctbr_rate_time_constant_range_s must contain three positive [low, high] pairs"
+            )
+        tau = ranges[:, 0].unsqueeze(0) + torch.rand(
+            count, 3, device=self.device
+        ) * (ranges[:, 1] - ranges[:, 0]).unsqueeze(0)
+        env_ids_cpu = env_ids.to(device="cpu", dtype=torch.long)
+        body_id = int(self._body_id[0])
+        inertia_flat = self._robot.root_physx_view.get_inertias()[env_ids_cpu, body_id]
+        inertia_diag = inertia_flat[:, [0, 4, 8]].to(self.device)
+        self._ctbr_rate_time_constant_s[env_ids] = tau
+        self._ctbr_rate_kp_per_env[env_ids] = rate_gain_from_time_constant(
+            inertia_diag, tau
+        )
 
     def _apply_uav_physics(self, env_ids: torch.Tensor, *, randomize: bool) -> None:
         """Apply measured UAV mass, COM, and a physical diagonal inertia."""
@@ -264,6 +306,81 @@ class UavPayloadMetaEnv(DirectRLEnv):
         rate_sp_isaac = decoded[:, 1:4] * self._ctbr_rate_sign
         return decoded, thrust_body_z, rate_sp_isaac
 
+    def compute_position_hold_ctbr(self) -> torch.Tensor:
+        """Return a Position-style CTBR token for Phase-II history augmentation.
+
+        The Teacher Actor still drives the simulated dynamics. This token only
+        replaces history dimensions 17:21, so privileged labels remain exact
+        without trusting a simplified Position controller as the plant driver.
+        """
+        root_pos_w = self._robot.data.root_pos_w
+        root_vel_w = self._robot.data.root_lin_vel_w
+        root_quat_w = self._robot.data.root_quat_w
+        target_pos_w = self._terrain.env_origins + self._start_offset
+
+        pos_kp = torch.as_tensor(
+            self.cfg.position_history_pos_kp, device=self.device, dtype=root_pos_w.dtype
+        )
+        vel_kd = torch.as_tensor(
+            self.cfg.position_history_vel_kd, device=self.device, dtype=root_pos_w.dtype
+        )
+        accel_limit = torch.as_tensor(
+            self.cfg.position_history_accel_limit_mps2,
+            device=self.device,
+            dtype=root_pos_w.dtype,
+        )
+        accel_cmd_w = pos_kp * (target_pos_w - root_pos_w) - vel_kd * root_vel_w
+        accel_cmd_w = torch.clamp(accel_cmd_w, -accel_limit, accel_limit)
+
+        w, x, y, z = root_quat_w.unbind(dim=-1)
+        roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x.square() + y.square()))
+        pitch = torch.asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0))
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+
+        vertical_accel = (self._gravity_magnitude + accel_cmd_w[:, 2]).clamp_min(1.0)
+        # This USD's +roll produces +world-y acceleration under the existing
+        # PX4-to-Isaac action convention (verified by closed-loop trace).
+        roll_des = torch.atan2(accel_cmd_w[:, 1], vertical_accel)
+        pitch_des = torch.atan2(
+            accel_cmd_w[:, 0],
+            torch.sqrt(vertical_accel.square() + accel_cmd_w[:, 1].square()),
+        )
+        yaw_error = torch.atan2(torch.sin(-yaw), torch.cos(-yaw))
+        attitude_error = torch.stack((roll_des - roll, pitch_des - pitch, yaw_error), dim=-1)
+        attitude_kp = torch.as_tensor(
+            self.cfg.position_history_attitude_kp,
+            device=self.device,
+            dtype=root_pos_w.dtype,
+        )
+        rate_sp_isaac = torch.clamp(
+            attitude_kp * attitude_error,
+            -self._ctbr_body_rate_limit,
+            self._ctbr_body_rate_limit,
+        )
+
+        total_mass = self._robot_weight / max(self._gravity_magnitude, 1e-6)
+        specific_force_w = accel_cmd_w.clone()
+        specific_force_w[:, 2] += self._gravity_magnitude
+        required_force = total_mass * torch.linalg.norm(specific_force_w, dim=-1)
+        thrust_ratio = (
+            required_force / (float(self._F_max) * self._collective_efficiency)
+        ).clamp(0.0, 1.0)
+
+        actions = torch.zeros(self.num_envs, 4, device=self.device)
+        actions[:, 0] = -self._thrust_ratio_to_collective_signal(thrust_ratio)
+        rate_sp_px4 = rate_sp_isaac / self._ctbr_rate_sign
+        rate_sp_px4 = rate_sp_px4 + self._position_history_rate_bias_px4
+        position_rate_limit = torch.as_tensor(
+            self.cfg.position_history_rate_limit_rps,
+            device=self.device,
+            dtype=root_pos_w.dtype,
+        )
+        actions[:, 1:4] = torch.clamp(
+            rate_sp_px4, -position_rate_limit, position_rate_limit
+        )
+        decoded, _, _ = self._decode_px4_ctbr_action(actions)
+        return decoded
+
     def _collective_signal_to_thrust_ratio(self, signal: torch.Tensor) -> torch.Tensor:
         """Map normalized PX4 collective signal to realized thrust ratio."""
         model = str(getattr(self.cfg, "ctbr_thrust_model", "linear"))
@@ -296,6 +413,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # 2. 记录当前网络输出，并按 PX4 CTBR 执行边界截断
         self._policy_actions = actions.clone()
         self._raw_actions, _, _ = self._decode_px4_ctbr_action(self._policy_actions)
+        self._last_transmitted_actions = self._raw_actions.clone()
 
         # 3. Per-environment link delay.
         self._action_queue = torch.roll(self._action_queue, shifts=-1, dims=1)
@@ -321,7 +439,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         rate_meas_b = self._robot.data.root_ang_vel_b
         rate_error = rate_sp_isaac - rate_meas_b
-        moment_cmd = self._ctbr_rate_kp * rate_error * self._moment_efficiency
+        moment_cmd = self._ctbr_rate_kp_per_env * rate_error * self._moment_efficiency
         self._moment[:, 0, :] = torch.clamp(moment_cmd, -self._ctbr_moment_limit, self._ctbr_moment_limit)
         self._ctbr_rate_cmd = rate_sp_isaac
         self._ctbr_rate_meas = rate_meas_b
@@ -724,7 +842,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 root_quat_w_obs,  # 7-10
                 v_b_obs,          # 11-13
                 w_b_obs,          # 14-16
-                self._prev_actions, # 17-20: [新增] 上一帧动作 a_{t-1}
+                self._last_transmitted_actions, # 17-20: last transmitted clamped CTBR
             ],
             dim=-1,
         )
@@ -738,7 +856,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 root_quat_w,   # 7-10
                 v_b,           # 11-13
                 w_b,           # 14-16
-                self._prev_actions, # 17-20: [新增] 上一帧动作 a_{t-1}
+                self._last_transmitted_actions, # 17-20: last transmitted clamped CTBR
             ],
             dim=-1,
         )
@@ -746,16 +864,14 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # --- Oracle: append true payload mass / rope length / wind ---
         if getattr(self.cfg, "use_oracle_mass_obs", False):
             # A. Mass
-            lo_m, hi_m = self.cfg.payload_mass_range
-            denom_m = max(float(hi_m) - float(lo_m), 1e-6)
-            m_norm = (self._payload_mass - float(lo_m)) / denom_m
-            m_norm = torch.clamp(m_norm, 0.0, 1.0).unsqueeze(-1)
-
-            # B. Rope length
-            lo_l, hi_l = self.cfg.rope_length_range
-            denom_l = max(float(hi_l) - float(lo_l), 1e-6)
-            l_norm = (self._rope_lengths - float(lo_l)) / denom_l
-            l_norm = torch.clamp(l_norm, 0.0, 1.0).unsqueeze(-1)
+            m_norm, l_norm = normalize_physical_context(
+                self._payload_mass,
+                self._rope_lengths,
+                payload_mass_range_kg=self.cfg.payload_mass_range,
+                rope_length_range_m=self.cfg.rope_length_range,
+            )
+            m_norm = m_norm.unsqueeze(-1)
+            l_norm = l_norm.unsqueeze(-1)
 
             # C. Control-relevant residual acceleration in the UAV body frame.
             # It includes ambient/startup acceleration and payload-only downwash.
@@ -973,6 +1089,21 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._moment_efficiency[env_ids] = torch.empty(count, 1, device=self.device).uniform_(
             float(moment_lo), float(moment_hi)
         )
+        position_bias_center = torch.as_tensor(
+            self.cfg.position_history_rate_bias_center_rps,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        position_bias_jitter = torch.as_tensor(
+            self.cfg.position_history_rate_bias_jitter_rps,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._position_history_rate_bias_px4[env_ids] = (
+            position_bias_center.unsqueeze(0)
+            + (2.0 * torch.rand(count, 3, device=self.device) - 1.0)
+            * position_bias_jitter.unsqueeze(0)
+        )
 
     def _fill_action_transport(self, env_ids: torch.Tensor, hover_actions: torch.Tensor) -> None:
         """Initialize every selected queue slot and filter state at hover."""
@@ -993,6 +1124,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # Episode-level UAV property randomization around the measured nominal.
         self._apply_uav_physics(env_ids, randomize=True)
+        self._sample_body_rate_dynamics(env_ids)
 
         # 2. 获取默认状态
         joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
@@ -1148,6 +1280,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._prev_raw_actions[env_ids] = hover_actions
         self._policy_actions[env_ids] = hover_actions
         self._prev_policy_actions[env_ids] = hover_actions
+        self._last_transmitted_actions[env_ids] = hover_actions
 
         self._fill_action_transport(env_ids, hover_actions)
         self._actions[env_ids] = hover_actions
@@ -1216,30 +1349,97 @@ class UavPayloadMetaEnv(DirectRLEnv):
             value = getattr(self.cfg, name, default)
             return [float(item) for item in value]
 
+        def _scalar(name: str, default: float) -> float:
+            return float(getattr(self.cfg, name, default))
+
         audit = {
             "real_hover_gap_profile": str(
                 getattr(self.cfg, "real_hover_gap_profile", "disabled")
             ),
+            "enable_real_hover_gap": bool(
+                getattr(self.cfg, "enable_real_hover_gap", False)
+            ),
+            "observation_history_action_source": "last_transmitted_clamped_ctbr",
             "uav_mass_kg": float(getattr(self.cfg, "uav_mass_kg", self._uav_mass)),
             "uav_com_m": _list("uav_com_m", (0.0, 0.0, 0.0)),
             "uav_inertia_diag_kg_m2": _list(
                 "uav_inertia_diag_kg_m2", (0.0, 0.0, 0.0)
             ),
+            "uav_mass_scale_range": _list("uav_mass_scale_range", (1.0, 1.0)),
+            "uav_com_offset_range_m": _list("uav_com_offset_range_m", (0.0, 0.0)),
+            "uav_inertia_scale_range": _list("uav_inertia_scale_range", (1.0, 1.0)),
+            "wind_mean_accel_max": _scalar("wind_mean_accel_max", 0.0),
+            "wind_gust_accel_max": _scalar("wind_gust_accel_max", 0.0),
+            "wind_total_accel_max": _scalar("wind_total_accel_max", 0.0),
+            "wind_gust_duration_s": [
+                _scalar("wind_gust_dt_min", 0.0),
+                _scalar("wind_gust_dt_max", 0.0),
+            ],
+            "wind_ou_theta": _scalar("wind_ou_theta", 0.0),
+            "wind_ou_sigma": _scalar("wind_ou_sigma", 0.0),
+            "enable_wind": bool(getattr(self.cfg, "enable_wind", False)),
             "payload_sensor_nominal_hz": _list(
                 "payload_sensor_nominal_hz", (60.0, 60.0)
             ),
             "payload_sensor_tail_hz": _list(
                 "payload_sensor_tail_hz", (60.0, 60.0)
             ),
+            "payload_sensor_tail_probability": _scalar(
+                "payload_sensor_tail_probability", 0.0
+            ),
+            "payload_sensor_nominal_delay_s": _list(
+                "payload_sensor_nominal_delay_s", (0.0, 0.0)
+            ),
+            "payload_sensor_tail_delay_s": _list(
+                "payload_sensor_tail_delay_s", (0.0, 0.0)
+            ),
+            "payload_sensor_valid_probability": _list(
+                "payload_sensor_valid_probability", (1.0, 1.0)
+            ),
+            "payload_sensor_hold_cap_s": _scalar("payload_sensor_hold_cap_s", 0.0),
+            "enable_payload_sensor_gap": bool(
+                getattr(self.cfg, "enable_payload_sensor_gap", False)
+            ),
+            "payload_position_bias_range_m": _list(
+                "payload_position_bias_range_m", (0.0, 0.0)
+            ),
+            "payload_angle_bias_range_deg": _list(
+                "payload_angle_bias_range_deg", (0.0, 0.0)
+            ),
+            "attitude_trim_bias_range_deg": _list(
+                "attitude_trim_bias_range_deg", (0.0, 0.0)
+            ),
+            "linear_velocity_bias_range_mps": _list(
+                "linear_velocity_bias_range_mps", (0.0, 0.0)
+            ),
+            "body_rate_bias_range_rps": _list(
+                "body_rate_bias_range_rps", (0.0, 0.0)
+            ),
             "startup_gust_accel_range_mps2": _list(
                 "startup_gust_accel_range_mps2", (0.0, 0.0)
+            ),
+            "enable_startup_gust": bool(
+                getattr(self.cfg, "enable_startup_gust", False)
+            ),
+            "startup_gust_duration_range_s": _list(
+                "startup_gust_duration_range_s", (0.0, 0.0)
             ),
             "downwash_bias_force_range_n": _list(
                 "downwash_bias_force_range_n", (0.0, 0.0)
             ),
+            "enable_payload_downwash": bool(
+                getattr(self.cfg, "enable_payload_downwash", False)
+            ),
+            "downwash_ou_sigma_n_sqrt_s": _scalar(
+                "downwash_ou_sigma_n_sqrt_s", 0.0
+            ),
+            "downwash_force_clip_n": _scalar("downwash_force_clip_n", 0.0),
+            "residual_accel_norm_max": _scalar("residual_accel_norm_max", 1.0),
             "payload_ballast_mass_range": _list(
                 "payload_ballast_mass_range", (0.0, 0.0)
             ),
+            "payload_mass_range": _list("payload_mass_range", (0.0, 0.0)),
+            "rope_length_range": _list("rope_length_range", (0.0, 0.0)),
             "payload_fixed_moving_mass_kg": float(
                 getattr(self.cfg, "payload_fixed_moving_mass_kg", 0.0)
             ),
@@ -1248,16 +1448,38 @@ class UavPayloadMetaEnv(DirectRLEnv):
             "ctbr_thrust_curve_coeffs": _list(
                 "ctbr_thrust_curve_coeffs", (0.0, 1.0, 0.0)
             ),
+            "ctbr_rate_time_constant_range_s": [
+                [float(item) for item in pair]
+                for pair in getattr(self.cfg, "ctbr_rate_time_constant_range_s", ())
+            ],
             "action_delay_steps_range": [
                 int(item)
                 for item in getattr(self.cfg, "action_delay_steps_range", (0, 0))
             ],
+            "action_lpf_alpha_range": _list("action_lpf_alpha_range", (1.0, 1.0)),
+            "collective_efficiency_range": _list(
+                "collective_efficiency_range", (1.0, 1.0)
+            ),
+            "moment_efficiency_range": _list(
+                "moment_efficiency_range", (1.0, 1.0)
+            ),
             "realized": {
                 "payload_sensor_hz_mean": float(
                     (1.0 / self._payload_sensor_period_s.clamp_min(1e-6)).mean().item()
                 ),
+                "payload_sensor_hz_min": float(
+                    (1.0 / self._payload_sensor_period_s.clamp_min(1e-6)).min().item()
+                ),
+                "payload_sensor_hz_max": float(
+                    (1.0 / self._payload_sensor_period_s.clamp_min(1e-6)).max().item()
+                ),
                 "payload_sensor_delay_s_mean": float(
                     self._payload_sensor_delay_s.mean().item()
+                ),
+                "payload_sensor_delay_s_min": float(self._payload_sensor_delay_s.min().item()),
+                "payload_sensor_delay_s_max": float(self._payload_sensor_delay_s.max().item()),
+                "payload_sensor_valid_probability_mean": float(
+                    self._payload_sensor_valid_probability.mean().item()
                 ),
                 "payload_sensor_valid_updates": int(
                     self._payload_sensor_valid_updates.sum().item()
@@ -1274,6 +1496,18 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 "action_lpf_alpha_mean": float(self._action_lpf_alpha_per_env.mean().item()),
                 "collective_efficiency_mean": float(self._collective_efficiency.mean().item()),
                 "moment_efficiency_mean": float(self._moment_efficiency.mean().item()),
+                "ctbr_rate_time_constant_mean_s": [
+                    float(item)
+                    for item in self._ctbr_rate_time_constant_s.mean(dim=0).tolist()
+                ],
+                "ctbr_rate_time_constant_min_s": [
+                    float(item)
+                    for item in self._ctbr_rate_time_constant_s.min(dim=0).values.tolist()
+                ],
+                "ctbr_rate_time_constant_max_s": [
+                    float(item)
+                    for item in self._ctbr_rate_time_constant_s.max(dim=0).values.tolist()
+                ],
                 "payload_ballast_mass_mean_kg": float(
                     self._payload_ballast_mass.mean().item()
                 ),
