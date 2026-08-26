@@ -320,12 +320,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         return decoded, thrust_body_z, rate_sp_isaac
 
     def compute_position_hold_ctbr(self) -> torch.Tensor:
-        """Return a Position-style CTBR token for Phase-II history augmentation.
-
-        The Teacher Actor still drives the simulated dynamics. This token only
-        replaces history dimensions 17:21, so privileged labels remain exact
-        without trusting a simplified Position controller as the plant driver.
-        """
+        """Return the Position CTBR target that can directly drive the plant."""
         root_pos_w = self._robot.data.root_pos_w
         root_vel_w = self._robot.data.root_lin_vel_w
         root_quat_w = self._robot.data.root_quat_w

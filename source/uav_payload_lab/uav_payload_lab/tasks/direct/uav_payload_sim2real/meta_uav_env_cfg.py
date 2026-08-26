@@ -351,8 +351,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     linear_velocity_bias_range_mps = (-0.015, 0.015)
     body_rate_bias_range_rps = (-0.005, 0.005)
 
-    # Position-style CTBR token generator used only to augment Phase-II history.
-    # PPO Teacher actions continue to drive the simulated dynamics.
+    # Causal Position controller used to drive both the plant and Phase-II history.
     position_history_pos_kp = (1.2, 1.2, 1.6)
     position_history_vel_kd = (1.8, 1.8, 2.0)
     # Calibrated conservatively against the delivered Position 50H CTBR range;
@@ -360,8 +359,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     position_history_attitude_kp = (0.8, 0.8, 1.0)
     position_history_accel_limit_mps2 = (1.0, 1.0, 1.0)
     # The delivered real Position 50H defines the action-prefix center and
-    # conservative caps. These values augment Student history only; they never
-    # drive the simulated rigid-body dynamics.
+    # conservative caps used by the simulated Position closed loop.
     position_history_rate_limit_rps = (0.45, 0.35, 0.30)
     position_history_rate_bias_center_rps = (-0.0634, -0.0234, 0.1880)
     position_history_rate_bias_jitter_rps = (0.08, 0.08, 0.04)

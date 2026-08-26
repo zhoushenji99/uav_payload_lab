@@ -338,11 +338,9 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("compute_position_hold_ctbr", source)
         self.assertIn("position_precondition_steps", source)
         self.assertIn("step_count == position_precondition_steps", source)
-        self.assertIn("feat[position_history_mask, 17:21]", source)
-        self.assertNotIn(
-            "actions_to_step[position_history_mask] = position_actions[position_history_mask]",
-            source,
-        )
+        self.assertIn("select_control_actions", source)
+        self.assertIn("active_position_mask", source)
+        self.assertNotIn("feat[position_history_mask, 17:21]", source)
         self.assertIn('"history_source"', source)
         self.assertIn('"position_history_ratio_requested"', source)
         self.assertIn('"position_history_ratio_realized"', source)

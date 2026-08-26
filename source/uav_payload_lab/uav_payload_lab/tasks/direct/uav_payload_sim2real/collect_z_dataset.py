@@ -54,9 +54,8 @@ parser.add_argument(
     type=float,
     default=0.0,
     help=(
-        "Fraction of fully labeled Teacher trajectories whose previous-action "
-        "history is augmented with Position-style CTBR tokens. Use 0.4 for the "
-        "first-flight 60/40 Teacher/Position-prefix mixture."
+        "Fraction of fully labeled trajectories physically driven by the "
+        "causal Position controller after preconditioning."
     ),
 )
 parser.add_argument(
@@ -64,8 +63,8 @@ parser.add_argument(
     type=float,
     default=3.0,
     help=(
-        "Teacher stabilization time before Position-prefix environments clear "
-        "and refill a fresh deployable history."
+        "Teacher stabilization time before Position-controlled environments "
+        "switch plant control and refill a fresh deployable history."
     ),
 )
 parser.add_argument(
@@ -94,6 +93,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import isaaclab_tasks  # noqa: F401
 import uav_payload_lab.tasks  # noqa: F401
 from uav_payload_lab.tasks.direct.uav_payload_sim2real.audit_z_dataset import audit_shard_tensors
+from uav_payload_lab.tasks.direct.uav_payload_sim2real.phase2_control_sources import (
+    select_control_actions,
+)
 
 
 def _safe_load_model_only(runner: OnPolicyRunner, ckpt_path: str):
@@ -317,12 +319,6 @@ def main(env_cfg, agent_cfg):
     while simulation_app.is_running():
         start_time = time.time()
         with torch.inference_mode():
-            # Match deployment: first stabilize under Teacher control, then
-            # start a fresh history window with Position-style action tokens.
-            if position_history_count > 0 and step_count == position_precondition_steps:
-                obs_history[position_history_mask] = 0.0
-                history_fill_count[position_history_mask] = 0
-
             # ---- 0) compute teacher action from current obs(t) ----
             actions_raw = policy(obs)                                   # (N,4)
             actions_exec = _clip_actions_to_bounds(actions_raw, action_low, action_high)
@@ -343,15 +339,20 @@ def main(env_cfg, agent_cfg):
                 actions_to_step[:, 3] = 0.0
                 actions_to_step = _clip_actions_to_bounds(actions_to_step, action_low, action_high)
 
+            active_position_mask = position_history_mask & (
+                step_count >= position_precondition_steps
+            )
+            if position_history_count > 0:
+                position_actions = base_env.compute_position_hold_ctbr()
+                actions_to_step = select_control_actions(
+                    actions_to_step,
+                    position_actions,
+                    active_position_mask,
+                )
+
             # ---- 2) build history input from obs(t) and last_action(t-1) ----
             obs_tensor = _get_obs_tensor(obs)      # (N,26)
             feat = obs_tensor[:, :input_dim].clone()       # (N,21)
-            # Keep the Teacher closed loop physically coherent, but expose the
-            # Student to the Position-mode previous-action prefix seen before
-            # real handover. Every sample still owns exact privileged labels.
-            if position_history_count > 0 and step_count >= position_precondition_steps:
-                position_actions = base_env.compute_position_hold_ctbr()
-                feat[position_history_mask, 17:21] = position_actions[position_history_mask]
 
             obs_history = torch.roll(obs_history, shifts=-1, dims=1)
             obs_history[:, -1, :] = feat
@@ -424,6 +425,13 @@ def main(env_cfg, agent_cfg):
 
             # ---- 5) step env ONCE using actions_to_step ----
             obs, _, dones, _ = env.step(actions_to_step)
+
+            # First let Position drive one physical transition, then clear its
+            # history. The next loop begins with the actual previous Position
+            # command naturally present in observation dimensions 17:21.
+            if position_history_count > 0 and step_count == position_precondition_steps:
+                obs_history[position_history_mask] = 0.0
+                history_fill_count[position_history_mask] = 0
 
             # ---- 6) update last_actions & reset buffers for done envs ----
             done_mask = dones.to(dtype=torch.bool).reshape(-1)
@@ -570,8 +578,8 @@ def main(env_cfg, agent_cfg):
                     "position_precondition_sec": float(args_cli.position_precondition_sec),
                     "position_precondition_steps": int(position_precondition_steps),
                     "history_source_encoding": {
-                        "0": "teacher_rl_closed_loop",
-                        "1": "teacher_state_with_position_ctbr_history_augmentation",
+                        "0": "teacher_closed_loop",
+                        "1": "causal_position_closed_loop",
                     },
                     "uav_mass_kg": float(getattr(env_cfg, "uav_mass_kg", 0.0)),
                     "payload_sensor_nominal_hz": list(
