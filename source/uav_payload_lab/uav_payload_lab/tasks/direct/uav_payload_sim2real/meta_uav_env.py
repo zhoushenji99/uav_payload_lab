@@ -21,6 +21,7 @@ from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
 from .ctbr_command_contract import CtbrLimits, shape_ctbr_torch
 from .hover_reward_terms import normalized_ctbr_terms, uav_tilt_rad_wxyz
 from .real_hover_gap import (
+    compose_delayed_payload_world_position,
     compose_lumped_payload_mass,
     diagonal_inertia_flat,
     half_sine_profile,
@@ -30,6 +31,7 @@ from .real_hover_gap import (
     rate_gain_from_time_constant,
     select_delayed_actions,
     select_delayed_ring,
+    update_payload_rate_lpf,
     validate_inertia_diagonal,
 )
 
@@ -538,8 +540,11 @@ class UavPayloadMetaEnv(DirectRLEnv):
             float(getattr(self.cfg, "payload_sensor_tail_delay_s", (0.0, 0.0))[1]),
         )
         self._payload_ring_len = max(2, int(math.ceil(max_delay_s / self.step_dt)) + 2)
+        # Camera latency applies to the relative Payload geometry. The delayed
+        # relative vector is composed with the current UAV pose, matching the
+        # deployed Jetson observation builder.
         self._payload_clean_ring = torch.zeros(
-            self.num_envs, self._payload_ring_len, 5, device=self.device
+            self.num_envs, self._payload_ring_len, 3, device=self.device
         )
         self._payload_ring_step = torch.full(
             (self.num_envs, self._payload_ring_len),
@@ -666,17 +671,17 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
     def _transport_payload_observation(
         self,
-        e_load: torch.Tensor,
-        tilt_deg: torch.Tensor,
+        current_uav_pos_w: torch.Tensor,
+        current_uav_quat_w: torch.Tensor,
+        current_uav_to_payload_b: torch.Tensor,
+        desired_payload_pos_w: torch.Tensor,
+        rope_length_m: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply camera timing, latency, dropout, hold, and fixed episode bias."""
-        if not self._payload_sensor_enabled:
-            return e_load, tilt_deg, self._tilt_vel_deg
+        """Apply camera transport to relative geometry, then rebuild world observations."""
 
         rows = torch.arange(self.num_envs, device=self.device)
         write_idx = self._payload_ring_write_idx
-        clean = torch.cat([e_load, tilt_deg], dim=-1)
-        self._payload_clean_ring[rows, write_idx] = clean
+        self._payload_clean_ring[rows, write_idx] = current_uav_to_payload_b
         current_step = torch.round(self._payload_sensor_elapsed_s / self.step_dt).to(torch.long)
         self._payload_ring_step[rows, write_idx] = current_step
         self._payload_sensor_elapsed_s += self.step_dt
@@ -701,10 +706,33 @@ class UavPayloadMetaEnv(DirectRLEnv):
         source_unavailable = source_step < 0
         first = ~self._payload_sensor_initialized
         use_current = first | source_unavailable
-        delayed = torch.where(use_current.unsqueeze(-1), clean, delayed)
+        delayed_uav_to_payload_b = torch.where(
+            use_current.unsqueeze(-1),
+            current_uav_to_payload_b,
+            delayed,
+        )
         source_step = torch.where(use_current, current_step, source_step)
 
-        measured = delayed.clone()
+        measured_payload_pos_w = compose_delayed_payload_world_position(
+            current_uav_pos_w,
+            current_uav_quat_w,
+            delayed_uav_to_payload_b,
+        )
+        measured_e_load = desired_payload_pos_w - measured_payload_pos_w
+        measured_payload_to_uav_w = current_uav_pos_w - measured_payload_pos_w
+        safe_rope_length = rope_length_m.clamp_min(1e-3)
+        measured_tilt_deg = torch.stack(
+            [
+                torch.asin(
+                    (measured_payload_to_uav_w[:, 0] / safe_rope_length).clamp(-1.0, 1.0)
+                ),
+                torch.asin(
+                    (measured_payload_to_uav_w[:, 1] / safe_rope_length).clamp(-1.0, 1.0)
+                ),
+            ],
+            dim=-1,
+        ) * (180.0 / math.pi)
+        measured = torch.cat([measured_e_load, measured_tilt_deg], dim=-1)
         measured[:, :3] += self._payload_position_bias
         measured[:, 3:5] += self._payload_angle_bias
         if getattr(self.cfg, "enable_obs_noise", False):
@@ -724,8 +752,15 @@ class UavPayloadMetaEnv(DirectRLEnv):
             / source_delta_s.clamp_min(1e-6).unsqueeze(-1),
             torch.zeros_like(self._payload_sensor_held_rate),
         )
+        filtered_rate = update_payload_rate_lpf(
+            previous_filtered_rate=self._payload_sensor_held_rate,
+            raw_rate=new_rate,
+            initialized=self._payload_sensor_initialized,
+            update=update,
+            alpha=float(self.cfg.obs_theta_dot_lpf_alpha),
+        )
         self._payload_sensor_held[update] = measured[update]
-        self._payload_sensor_held_rate[update] = new_rate[update]
+        self._payload_sensor_held_rate.copy_(filtered_rate)
         self._payload_sensor_last_source_step[update] = source_step[update]
         self._payload_sensor_last_valid_s[update] = self._payload_sensor_elapsed_s[update]
         self._payload_sensor_initialized[update] = True
@@ -760,6 +795,13 @@ class UavPayloadMetaEnv(DirectRLEnv):
         p_uav_w = body_pos_w[:, self._body_id[0], :]  # (num_envs, 3)
         # payload 位置
         p_load_w = body_pos_w[:, self._payload_id, :]  # (num_envs, 3)
+        # Current UAV attitude is intentionally combined with a delayed held
+        # body-relative Payload measurement in the policy sensor path.
+        root_quat_w = self._robot.data.root_quat_w  # (num_envs, 4), wxyz
+        uav_to_payload_b = self._quat_rotate_inverse(
+            root_quat_w,
+            p_load_w - p_uav_w,
+        )
 
         # payload 到 UAV 的向量（世界系），用于计算摆角
         r_load_uav = p_uav_w - p_load_w  # (num_envs, 3)
@@ -808,9 +850,6 @@ class UavPayloadMetaEnv(DirectRLEnv):
         self._has_prev_tilt[:] = True
 
         # --- 3) UAV 姿态 + 线速度 + 角速度 -------------------------------
-        # 姿态四元数（世界系）
-        root_quat_w = self._robot.data.root_quat_w  # (num_envs, 4)
-
         # 线速度、角速度（机体系）
         v_b = self._robot.data.root_lin_vel_b  # (num_envs, 3)
         w_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
@@ -819,7 +858,11 @@ class UavPayloadMetaEnv(DirectRLEnv):
         # Policy-only sensor transport. Reward and critic stay on clean state.
         if self._payload_sensor_enabled:
             e_load_obs, tilt_deg_obs, w_deg_obs = self._transport_payload_observation(
-                e_load, tilt_deg
+                current_uav_pos_w=p_uav_w,
+                current_uav_quat_w=root_quat_w,
+                current_uav_to_payload_b=uav_to_payload_b,
+                desired_payload_pos_w=self._desired_pos_w,
+                rope_length_m=L,
             )
             trim_quat = self._quat_from_roll_pitch(self._attitude_trim_bias_rad)
             root_quat_w_obs = self._quat_multiply(root_quat_w, trim_quat)

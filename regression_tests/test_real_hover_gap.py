@@ -285,6 +285,17 @@ class RealHoverGapStaticIntegrationTests(unittest.TestCase):
         self.assertIn("def _transport_payload_observation", env)
         self.assertIn("def _reset_payload_sensor_gap", env)
 
+    def test_payload_transport_uses_relative_geometry_and_measurement_lpf(self):
+        env = ENV_PATH.read_text(encoding="utf-8")
+        self.assertIn("compose_delayed_payload_world_position", env)
+        self.assertIn("update_payload_rate_lpf", env)
+        self.assertIn("self.num_envs, self._payload_ring_len, 3", env)
+        self.assertIn("delayed_uav_to_payload_b", env)
+        self.assertIn("current_uav_pos_w", env)
+        self.assertIn("current_uav_quat_w", env)
+        self.assertIn("alpha=float(self.cfg.obs_theta_dot_lpf_alpha)", env)
+        self.assertNotIn("clean = torch.cat([e_load, tilt_deg], dim=-1)", env)
+
     def test_config_and_env_use_randomized_body_rate_time_constants(self):
         cfg = CFG_PATH.read_text(encoding="utf-8")
         env = ENV_PATH.read_text(encoding="utf-8")
