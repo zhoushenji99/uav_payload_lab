@@ -19,6 +19,7 @@ from isaaclab.utils.math import subtract_frame_transforms
 
 from .meta_uav_env_cfg import UavPayloadMetaEnvCfg
 from .ctbr_command_contract import CtbrLimits, shape_ctbr_torch
+from .hover_reward_terms import normalized_ctbr_terms, uav_tilt_rad_wxyz
 from .real_hover_gap import (
     compose_lumped_payload_mass,
     diagonal_inertia_flat,
@@ -70,6 +71,11 @@ class UavPayloadMetaEnv(DirectRLEnv):
                 "theta_deg",     # payload 合摆角（deg）
                 "swing_deg_s",   # payload 合角速度（deg/s）
                 "r_action_raw",
+                "r_action_l2",
+                "r_action_smooth",
+                "r_action_jerk",
+                "r_uav_tilt",
+                "r_actual_rate",
                 "action_raw_sum",
                 "E_hat_mean",  # [新增] 摆能量(归一化)的时间积分，用于TB里做E_hat_mean
             ]
@@ -972,16 +978,32 @@ class UavPayloadMetaEnv(DirectRLEnv):
             swing_deg_s / self.cfg.sigma_swing_deg_s
         ) ** 2
 
-        # === 5) 动作惩罚 ===
-        policy_action_norm = self._policy_actions / self._ctbr_action_scale
-        prev_policy_action_norm = self._prev_policy_actions / self._ctbr_action_scale
+        # === 5) 机体状态与实际发送动作惩罚 ===
+        tilt_deg_uav = torch.rad2deg(uav_tilt_rad_wxyz(self._robot.data.root_quat_w))
+        actual_rate_norm = self._robot.data.root_ang_vel_b / self._ctbr_body_rate_limit
+        r_uav_tilt = -float(self.cfg.uav_tilt_penalty_scale) * torch.square(
+            tilt_deg_uav / float(self.cfg.uav_tilt_normalization_deg)
+        )
+        r_actual_rate = -float(self.cfg.actual_body_rate_penalty_scale) * torch.sum(
+            actual_rate_norm.square(), dim=1
+        )
 
-        # [修改] 惩罚原始动作跳变；CTBR 下先按动作物理量纲归一化
-        delta_raw_action = policy_action_norm - prev_policy_action_norm
-        r_action_smooth = -float(self.cfg.action_smooth_penalty_scale) * torch.sum(delta_raw_action ** 2, dim=1)
-
-        # [新增] 惩罚绝对输出过大；CTBR 下先按动作物理量纲归一化
-        r_action_l2 = -float(self.cfg.action_l2_penalty_scale) * torch.sum(policy_action_norm ** 2, dim=1)
+        transmitted_jerk = self._transmitted_delta - self._prev_transmitted_delta
+        sent_norm, delta_norm, jerk_norm = normalized_ctbr_terms(
+            self._last_transmitted_actions,
+            self._transmitted_delta,
+            transmitted_jerk,
+            self._ctbr_action_scale,
+        )
+        r_action_l2 = -float(self.cfg.action_l2_penalty_scale) * torch.sum(
+            sent_norm.square(), dim=1
+        )
+        r_action_smooth = -float(self.cfg.action_smooth_penalty_scale) * torch.sum(
+            delta_norm.square(), dim=1
+        )
+        r_action_jerk = -float(self.cfg.action_jerk_penalty_scale) * torch.sum(
+            jerk_norm.square(), dim=1
+        )
 
         a0_low_excess = torch.relu(-1.0 - self._policy_actions[:, 0])
         a0_high_excess = torch.relu(self._policy_actions[:, 0])
@@ -990,7 +1012,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
         raw_excess = torch.cat((a0_low_excess.unsqueeze(1), a0_high_excess.unsqueeze(1), rate_excess), dim=1)
         r_action_raw_val = -float(self.cfg.action_raw_excess_penalty_scale) * torch.sum(torch.square(raw_excess), dim=1)
 
-        r_action_total = r_action_l2 + r_action_smooth + r_action_raw_val
+        r_action_total = r_action_l2 + r_action_smooth + r_action_jerk + r_action_raw_val
 
         # === 6) 死亡惩罚 ===
         root_pos = self._robot.data.root_pos_w
@@ -1000,7 +1022,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
         rel_pos = root_pos - env_origins
         out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
 
-        died = torch.logical_or(height_fail, out_of_box)
+        tilt_fail = tilt_deg_uav > float(self.cfg.uav_tilt_termination_deg)
+        died = torch.logical_or(torch.logical_or(height_fail, out_of_box), tilt_fail)
         death_penalty_vec = -1.0 * float(self.cfg.death_penalty) * died.float()
 
         # === 7) 自旋惩罚 ===
@@ -1024,6 +1047,8 @@ class UavPayloadMetaEnv(DirectRLEnv):
             + death_penalty_vec
             + r_action_total
             + r_spin_val
+            + r_uav_tilt
+            + r_actual_rate
         )
 
         # === 9) Logging ===
@@ -1034,6 +1059,11 @@ class UavPayloadMetaEnv(DirectRLEnv):
             "r_swing": r_swing_val,
             "death_penalty": death_penalty_vec,
             "r_action_raw": r_action_raw_val,
+            "r_action_l2": r_action_l2,
+            "r_action_smooth": r_action_smooth,
+            "r_action_jerk": r_action_jerk,
+            "r_uav_tilt": r_uav_tilt,
+            "r_actual_rate": r_actual_rate,
             "action_raw_sum": torch.sum(torch.abs(self._raw_actions), dim=1),
             "action_policy_raw_sum": torch.sum(torch.abs(self._policy_actions), dim=1),
             "dist": dist,
@@ -1050,6 +1080,7 @@ class UavPayloadMetaEnv(DirectRLEnv):
 
         # === 10) 更新 smoothness 历史动作 ===
         self._prev_actions = self._actions.clone()
+        self._prev_transmitted_delta = self._transmitted_delta.clone()
 
         return reward
 
@@ -1071,8 +1102,13 @@ class UavPayloadMetaEnv(DirectRLEnv):
             rel_pos = root_pos - env_origins                              # 以各自 env 原点为参考
             out_of_box = torch.any(torch.abs(rel_pos) > 6.0, dim=1)
 
-            # died = 高度越界 或 出盒子
-            died = torch.logical_or(height_fail, out_of_box)
+            tilt_deg_uav = torch.rad2deg(
+                uav_tilt_rad_wxyz(self._robot.data.root_quat_w)
+            )
+            tilt_fail = tilt_deg_uav > float(self.cfg.uav_tilt_termination_deg)
+
+            # died = 高度越界、出盒子或机体倾角超过安全边界
+            died = torch.logical_or(torch.logical_or(height_fail, out_of_box), tilt_fail)
 
             return died, time_out
 
