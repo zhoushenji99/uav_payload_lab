@@ -167,6 +167,10 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 import isaaclab_tasks  # noqa: F401
 import uav_payload_lab.tasks  # noqa: F401
+from uav_payload_lab.tasks.direct.uav_payload_sim2real.ctbr_command_contract import (
+    CtbrLimits,
+    shape_ctbr_torch,
+)
 from uav_payload_lab.tasks.direct.uav_payload_sim2real.fastslow_runtime import (
     causal_ema_alpha,
     compute_action_band_energy,
@@ -411,6 +415,9 @@ def main(env_cfg, agent_cfg):
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     base_env = env.unwrapped
     action_low, action_high = _get_action_bounds(base_env, env.device)
+    ctbr_limits = CtbrLimits.from_contract(
+        _REPO_ROOT / "configs" / "v89_training_acceptance_contract.json"
+    )
     print(f"[INFO] action_low={action_low.detach().cpu().tolist()} action_high={action_high.detach().cpu().tolist()}")
     # if hasattr(base_env, "episode_length_buf"):
     #     base_env.episode_length_buf[:] = 0
@@ -584,6 +591,8 @@ def main(env_cfg, agent_cfg):
         "control_source",
         # UAV / payload / goal positions
         "uav_px","uav_py","uav_pz",
+        "uav_qw","uav_qx","uav_qy","uav_qz",
+        "actual_body_rate_x","actual_body_rate_y","actual_body_rate_z",
         "payload_px","payload_py","payload_pz",
         "goal_px","goal_py","goal_pz",
         # payload error (also obs[0:3])
@@ -837,6 +846,14 @@ def main(env_cfg, agent_cfg):
                 if not torch.equal(precontrol_active, clipped_precontrol_active):
                     raise RuntimeError("precontrol masks disagree")
 
+            # The logged and executed command uses the same absolute and slew
+            # contract as training, DAgger, Jetson, and the PX4 gateway.
+            actions = shape_ctbr_torch(
+                actions_raw,
+                base_env._last_transmitted_actions,
+                ctbr_limits,
+            )
+
             # Counterfactual refresh diagnostic: under the same observation and
             # current fast context, compare old cache vs newly refreshed raw target.
             # These two extra Actor calls are deliberately outside profiled latency.
@@ -882,6 +899,10 @@ def main(env_cfg, agent_cfg):
             # ---- 5) LOG at time t (BEFORE env.step) ----
             # state (t): from base_env (aligned with obs_tensor)
             uav_pos = base_env._robot.data.root_pos_w[e].detach().cpu().numpy().tolist()
+            uav_quat = base_env._robot.data.root_quat_w[e].detach().cpu().numpy().tolist()
+            actual_body_rate = (
+                base_env._robot.data.root_ang_vel_b[e].detach().cpu().numpy().tolist()
+            )
             payload_pos = base_env._robot.data.body_pos_w[e, base_env._payload_id, :].detach().cpu().numpy().tolist()
             goal_pos = base_env._desired_pos_w[e].detach().cpu().numpy().tolist()
 
@@ -953,6 +974,8 @@ def main(env_cfg, agent_cfg):
                 args_cli.mode,
                 control_source,
                 *uav_pos,
+                *uav_quat,
+                *actual_body_rate,
                 *payload_pos,
                 *goal_pos,
                 *payload_err,
