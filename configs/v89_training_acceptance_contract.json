@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0.0",
+  "version_name": "V8.9_因果Position50H_DAgger_安全CTBR重训",
+  "base": {
+    "branch": "agent/v8.8-first-flight-gap-v3-position50h",
+    "commit": "889b6c70ec8bde576947c463644e974b7cce5591",
+    "tag": "v8.8_首次真机GapV3与Position50H接管"
+  },
+  "target": {
+    "branch": "agent/v8.9-causal-position-dagger-safe-ctbr",
+    "tag": "v8.9_因果Position50H_DAgger_安全CTBR重训",
+    "resume_old_teacher": false,
+    "resume_old_student": false
+  },
+  "immutable_observation_contract": {
+    "shape": [50, 21],
+    "rate_hz": 60.0,
+    "history_update": "left_shift_then_append_current_observation",
+    "observation_order": [
+      "payload_position_error_nwu_x_m",
+      "payload_position_error_nwu_y_m",
+      "payload_position_error_nwu_z_m",
+      "payload_swing_forward_deg",
+      "payload_swing_right_deg",
+      "payload_swing_rate_forward_deg_s",
+      "payload_swing_rate_right_deg_s",
+      "uav_quaternion_nwu_w",
+      "uav_quaternion_nwu_x",
+      "uav_quaternion_nwu_y",
+      "uav_quaternion_nwu_z",
+      "uav_body_velocity_frd_x_m_s",
+      "uav_body_velocity_frd_y_m_s",
+      "uav_body_velocity_frd_z_m_s",
+      "uav_body_rate_frd_roll_rad_s",
+      "uav_body_rate_frd_pitch_rad_s",
+      "uav_body_rate_frd_yaw_rad_s",
+      "previous_sent_thrust_body_z",
+      "previous_sent_roll_rate_rad_s",
+      "previous_sent_pitch_rate_rad_s",
+      "previous_sent_yaw_rate_rad_s"
+    ],
+    "goal_definition": {
+      "uav_root_goal_nwu_m": [0.0, 0.0, 1.5],
+      "payload_goal_nwu_m": [0.0, 0.0, "1.5 - rope_length_m"],
+      "task_yaw_rad": 0.0
+    },
+    "previous_action_semantics": "previous clamped and slew-limited CTBR command sent by the active controller",
+    "position_source": "causal simulated Position controller that also drives the simulated plant",
+    "rl_source": "previous Student or Teacher CTBR command that also drove the simulated plant"
+  },
+  "slow_context_contract": {
+    "z0": "normalized total moving suspended mass",
+    "z0_min_kg": 0.31265,
+    "z0_max_kg": 0.93265,
+    "z1": "normalized rope length",
+    "z1_min_m": 0.25,
+    "z1_max_m": 0.8,
+    "real_rope_length_m": 0.6004,
+    "real_rope_length_normalized": 0.637090909090909,
+    "actor_and_student_semantics_must_match": true
+  },
+  "ctbr_execution_contract": {
+    "order": [
+      "thrust_body_z",
+      "roll_rate_rad_s",
+      "pitch_rate_rad_s",
+      "yaw_rate_rad_s"
+    ],
+    "absolute_low": [-1.0, -1.2, -1.2, -0.6],
+    "absolute_high": [0.0, 1.2, 1.2, 0.6],
+    "max_delta_per_60hz_step": [0.03, 0.25, 0.25, 0.1],
+    "max_slew_per_second": [1.8, 15.0, 15.0, 6.0],
+    "initial_action": "per-environment physical hover command plus zero body-rate",
+    "apply_identically_in": [
+      "Teacher training",
+      "simulated Position control",
+      "Student closed-loop collection",
+      "Student evaluation",
+      "Jetson runtime",
+      "PX4 Offboard gateway"
+    ]
+  },
+  "teacher_reward_contract": {
+    "payload_position_weight": 0.3,
+    "payload_swing_weight": 0.15,
+    "uav_tilt_weight": 0.3,
+    "uav_tilt_normalization_deg": 15.0,
+    "actual_body_rate_weight": 0.08,
+    "action_l2_weight": 0.05,
+    "action_delta_weight": 0.15,
+    "action_jerk_weight": 0.05,
+    "raw_action_excess_weight": 0.05,
+    "yaw_spin_weight": 0.15,
+    "termination_uav_tilt_deg": 50.0
+  },
+  "dynamics_gap_contract": {
+    "action_delay_steps_range": [0, 2],
+    "action_lpf_alpha_range": [0.35, 0.85],
+    "roll_rate_time_constant_s": [0.08, 0.25],
+    "pitch_rate_time_constant_s": [0.08, 0.25],
+    "yaw_rate_time_constant_s": [0.12, 0.45],
+    "moment_efficiency_range": [0.85, 1.15],
+    "collective_efficiency_range": [1.0, 1.0],
+    "collective_efficiency_note": "Keep fixed because independent thrust efficiency and physical mass are not separately identifiable in the fixed five-dimensional context. Battery and voltage sensitivity are evaluated as OOD, not silently relabeled as mass.",
+    "payload_sensor_nominal_hz": [8.0, 30.0],
+    "payload_sensor_nominal_delay_s": [0.03, 0.2],
+    "payload_sensor_tail_probability": 0.05,
+    "payload_sensor_tail_hz": [5.0, 8.0],
+    "payload_sensor_tail_delay_s": [0.2, 0.5],
+    "payload_sensor_hold_cap_s": 0.5
+  },
+  "dataset_contract": {
+    "history_len": 50,
+    "position_precondition_sec": 3.0,
+    "base_source_weights": {
+      "teacher_closed_loop": 0.5,
+      "causal_position_closed_loop": 0.5
+    },
+    "dagger_rounds": 2,
+    "dagger_round_1_source_weights": {
+      "teacher_closed_loop": 0.35,
+      "causal_position_closed_loop": 0.35,
+      "student_dagger_round_1": 0.3
+    },
+    "dagger_round_2_source_weights": {
+      "teacher_closed_loop": 0.3,
+      "causal_position_closed_loop": 0.3,
+      "student_dagger_round_1_and_2": 0.4
+    },
+    "train_seeds": [42, 43, 44, 45],
+    "validation_seeds": [101, 202, 303],
+    "validation_split": "whole held-out episodes and seeds only",
+    "forbid_temporal_tail_split": true
+  },
+  "evaluation_matrix": {
+    "seeds": [42, 101, 202, 303, 404],
+    "student_control_duration_s": 30.0,
+    "scenarios": [
+      "no_ambient_wind",
+      "training_wind_and_downwash",
+      "strong_wind_1p25x",
+      "payload_sensor_nominal_gap",
+      "payload_sensor_tail_gap",
+      "body_rate_fast_bound",
+      "body_rate_slow_bound",
+      "direct_position_to_student_handover",
+      "real_position_history_replay"
+    ]
+  },
+  "hard_acceptance_gates": {
+    "all_seeds_and_scenarios_must_pass": true,
+    "no_nan_or_inf": true,
+    "no_early_termination": true,
+    "payload_position_rmse_nominal_max_m": 0.08,
+    "payload_position_rmse_strong_wind_max_m": 0.15,
+    "uav_height_mean_abs_error_max_m": 0.08,
+    "uav_tilt_p95_max_deg": 10.0,
+    "uav_tilt_absolute_max_deg": 20.0,
+    "actual_body_rate_p95_max_rad_s": 1.0,
+    "actual_body_rate_absolute_max_rad_s": 2.0,
+    "command_rate_p95_abs_max_rad_s": [0.8, 0.8, 0.4],
+    "command_saturation_fraction_max": 0.001,
+    "command_total_variation_mean_per_step_max": 0.15,
+    "command_high_frequency_5_30hz_fraction_max": 0.25,
+    "context_z0_rmse_max": 0.1,
+    "context_z1_rmse_max": 0.1,
+    "context_fast_rmse_max": 0.2,
+    "context_severe_out_of_range_fraction_max": 0.0
+  },
+  "real_position_replay_gates": {
+    "rope_z1_expected": 0.637090909090909,
+    "rope_z1_median_abs_error_max": 0.15,
+    "roll_rate_p95_abs_max_rad_s": 0.8,
+    "pitch_rate_p95_abs_max_rad_s": 0.8,
+    "yaw_rate_p95_abs_max_rad_s": 0.4,
+    "any_action_saturation_allowed": false,
+    "candidate_must_be_finite": true,
+    "candidate_must_respect_delta_contract": true
+  },
+  "export_contract": {
+    "flight_approved": false,
+    "deployment_status": "shadow_only_until_jetson_parity_and_new_hardware_recovery",
+    "required_hashes": [
+      "Teacher checkpoint",
+      "Student checkpoint",
+      "Actor ONNX and TorchScript",
+      "Slow Encoder ONNX and TorchScript",
+      "Fast Encoder ONNX and TorchScript",
+      "manifest.json",
+      "CTBR command-shaper runtime"
+    ],
+    "onnx_max_abs_parity_error": 1e-5,
+    "torchscript_max_abs_parity_error": 1e-6
+  }
+}
