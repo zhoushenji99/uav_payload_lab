@@ -250,16 +250,11 @@ def compose_delayed_payload_world_position(
             "uav position, quaternion, and relative payload must have matching "
             "(..., 3), (..., 4), and (..., 3) shapes"
         )
-    if (
-        not torch.isfinite(uav_pos).all()
-        or not torch.isfinite(uav_quat).all()
-        or not torch.isfinite(relative_b).all()
-    ):
-        raise ValueError("payload pose composition inputs must be finite")
-    quat_norm = torch.linalg.norm(uav_quat, dim=-1, keepdim=True)
-    if torch.any(quat_norm <= 1e-8):
-        raise ValueError("UAV quaternion norm must be positive")
-    uav_quat = uav_quat / quat_norm
+    # Avoid data-dependent Python checks here: this helper runs every policy
+    # step on CUDA and a tensor-to-bool conversion would synchronize all envs.
+    uav_quat = uav_quat / torch.linalg.norm(
+        uav_quat, dim=-1, keepdim=True
+    ).clamp_min(1e-8)
     qw = uav_quat[..., 0:1]
     qv = uav_quat[..., 1:4]
     cross_term = 2.0 * torch.cross(qv, relative_b, dim=-1)
@@ -299,8 +294,6 @@ def update_payload_rate_lpf(
     alpha_value = float(alpha)
     if not math.isfinite(alpha_value) or not 0.0 <= alpha_value <= 1.0:
         raise ValueError("payload angular-rate LPF alpha must be finite and in [0, 1]")
-    if not torch.isfinite(previous).all() or not torch.isfinite(raw).all():
-        raise ValueError("payload angular rates must be finite")
     filtered = alpha_value * previous + (1.0 - alpha_value) * raw
     candidate = torch.where(
         initialized_mask.unsqueeze(-1),
