@@ -87,9 +87,9 @@
     "uav_tilt_normalization_deg": 15.0,
     "actual_body_rate_weight": 0.08,
     "action_l2_weight": 0.05,
-    "action_delta_weight": 0.15,
-    "action_jerk_weight": 0.05,
-    "raw_action_excess_weight": 0.05,
+    "action_delta_weight": 1.0,
+    "action_jerk_weight": 0.3,
+    "raw_action_excess_weight": 0.2,
     "yaw_spin_weight": 0.15,
     "termination_uav_tilt_deg": 50.0
   },

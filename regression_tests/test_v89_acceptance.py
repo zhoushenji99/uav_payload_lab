@@ -1,3 +1,4 @@
+import ast
 import json
 import importlib.util
 from pathlib import Path
@@ -14,6 +15,10 @@ EVALUATOR_PATH = (
 SELECTOR_PATH = (
     REPO_ROOT
     / "source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_sim2real/select_v89_checkpoint.py"
+)
+ENV_CFG_PATH = (
+    REPO_ROOT
+    / "source/uav_payload_lab/uav_payload_lab/tasks/direct/uav_payload_sim2real/meta_uav_env_cfg.py"
 )
 
 
@@ -73,6 +78,44 @@ def test_v89_contract_is_exact_and_internally_consistent():
     assert cfg["ctbr_execution_contract"]["absolute_high"] == [0.0, 1.2, 1.2, 0.6]
     assert cfg["ctbr_execution_contract"]["max_delta_per_60hz_step"] == [0.03, 0.25, 0.25, 0.1]
     assert abs(cfg["slow_context_contract"]["real_rope_length_normalized"] - 0.637090909090909) < 1e-12
+
+
+def test_teacher_reward_contract_uses_anti_chatter_weights():
+    contract = json.loads(
+        (REPO_ROOT / "configs/v89_training_acceptance_contract.json").read_text()
+    )["teacher_reward_contract"]
+    expected = {
+        "action_smooth_penalty_scale": 1.0,
+        "action_jerk_penalty_scale": 0.30,
+        "action_raw_excess_penalty_scale": 0.20,
+    }
+    contract_names = {
+        "action_smooth_penalty_scale": "action_delta_weight",
+        "action_jerk_penalty_scale": "action_jerk_weight",
+        "action_raw_excess_penalty_scale": "raw_action_excess_weight",
+    }
+    assert {
+        source_name: contract[contract_name]
+        for source_name, contract_name in contract_names.items()
+    } == expected
+
+    tree = ast.parse(ENV_CFG_PATH.read_text(encoding="utf-8"))
+    cfg_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "UavPayloadMetaEnvCfg"
+    )
+    realized = {}
+    for node in cfg_class.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id in expected:
+            realized[target.id] = ast.literal_eval(node.value)
+    assert realized == expected
 
 
 def test_one_failed_seed_rejects_checkpoint_even_if_mean_passes():

@@ -279,11 +279,11 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     actual_body_rate_penalty_scale = 0.08
     uav_tilt_termination_deg = 50.0
     action_l2_penalty_scale = 0.05
-    action_raw_excess_penalty_scale = 0.05
-    action_jerk_penalty_scale = 0.05
+    action_raw_excess_penalty_scale = 0.20
+    action_jerk_penalty_scale = 0.30
     spin_weight = 0.15   # 【新增】自旋惩罚权重
     heading_weight = 0.5     # 【新增】航向对齐权重，用于抑制 Yaw 角度 (P控制)
-    action_smooth_penalty_scale = 0.15
+    action_smooth_penalty_scale = 1.0
     # === 悬停任务（相对每个 env 的原点，ENU）===
     # UAV 根节点固定从 1.5 m 出生。
     start_pos_w = (0.0, 0.0, 1.5)
@@ -383,7 +383,7 @@ class UavPayloadMetaEnvCfg(DirectRLEnvCfg):
     # [修改] 动作惩罚项
     # ==========================================
     # 必须大幅提高平滑惩罚，逼迫网络输出低频平滑曲线
-    action_smooth_penalty_scale: float = 0.15
+    action_smooth_penalty_scale: float = 1.0
     action_l2_penalty_scale: float = 0.05
-    action_jerk_penalty_scale: float = 0.05
-    action_raw_excess_penalty_scale: float = 0.05
+    action_jerk_penalty_scale: float = 0.30
+    action_raw_excess_penalty_scale: float = 0.20
